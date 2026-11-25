@@ -2231,7 +2231,7 @@ fn output_buffer_limits(ctx: &Ctx) -> String {
     limits.to_config_string()
 }
 
-/// [`config_rows`] with each secret as it is set now, where `CONFIG GET`
+/// [`config_rows`] with each secret's current value where `CONFIG GET`
 /// shows `**redacted**`: what `CONFIG REWRITE` writes, and what a `CONFIG
 /// SET` of several settings puts back when one of them is refused. Never a
 /// reply to a client.
@@ -5660,6 +5660,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     } else {
                         Vec::new()
                     };
+                    // `requirepass` is put back exactly: the default user's
+                    // passwords as they were (`ACL SETUSER default >...`
+                    // may have given it several), and the text kept for
+                    // `CONFIG REWRITE`.
+                    let auth_before = (settings.len() > 1).then(|| {
+                        let user = ctx
+                            .acl_store
+                            .read()
+                            .get("default")
+                            .map(|u| (u.nopass, u.passwords.clone()));
+                        (user, ctx.repl_state.requirepass())
+                    });
                     for (i, (param, value)) in settings.iter().enumerate() {
                         let mut reply = config_set_one(ctx, param, value);
                         // Redis's own reply to a setting it does not know
@@ -5682,6 +5694,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             }
                             for (param, _) in &settings[..i] {
                                 match before.iter().find(|(known, _)| known == param) {
+                                    Some(_) if param == "requirepass" => {}
                                     Some((_, old)) => {
                                         config_set_one(ctx, param, old);
                                     }
@@ -5689,6 +5702,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                         REMEMBERED_CONFIG.lock().remove(param);
                                     }
                                 }
+                            }
+                            if let Some((user, text)) = auth_before.as_ref()
+                                && settings[..i].iter().any(|(p, _)| p == "requirepass")
+                            {
+                                if let Some((nopass, passwords)) = user
+                                    && let Some(default) = ctx.acl_store.write().get_mut("default")
+                                {
+                                    default.nopass = *nopass;
+                                    default.passwords.clone_from(passwords);
+                                }
+                                ctx.repl_state.set_requirepass(text);
                             }
                             return Some(reply);
                         }
@@ -5728,7 +5752,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 "REWRITE" => {
                     use crate::config::RewriteError;
                     let rows = config_rows_with_secrets(ctx);
-                    match ctx.config.with_values(&rows).rewrite_with(&rows) {
+                    let mut config = ctx.config.with_values(&rows);
+                    config.users = crate::acl::config_lines(ctx.acl_store);
+                    match config.rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",
@@ -5741,6 +5767,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
+                        Err(RewriteError::DirectorySync(e)) => Some(resp_error(&format!(
+                            "ERR Rewriting config file: the file was replaced, but its \
+                             directory could not be synced: {e}"
+                        ))),
                     }
                 }
                 "HELP" => Some(help(

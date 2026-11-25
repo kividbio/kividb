@@ -356,7 +356,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             match crate::acl::load_acl_file(
                 &ctx.config.aclfile,
                 ctx.acl_store,
-                &ctx.config.requirepass,
+                &ctx.repl_state.requirepass(),
             ) {
                 Ok(_) => Some(resp_simple("OK")),
                 Err(e) => Some(resp_error(&format!(

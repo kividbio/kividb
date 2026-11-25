@@ -659,6 +659,72 @@ pub fn load_acl_file(path: &str, store: &AclStore, requirepass: &str) -> Result<
     Ok(())
 }
 
+/// The users the config file's `user` lines define (`lines`, each a whole
+/// `user <name> <rule>...` line, read as a line of an ACL file is read), in
+/// place of those in `store`: all of them, or, on an error, none. `default`
+/// is the user its line describes, or, without one, the one `requirepass`
+/// describes: a `user default` line wins over `requirepass`, as in Redis.
+pub fn load_config_users(
+    lines: &[String],
+    store: &AclStore,
+    requirepass: &str,
+) -> Result<(), String> {
+    let users = parse_acl_file(lines.join("\n"), requirepass)
+        .map_err(|e| format!("the config file's user lines: {e}"))?;
+    *store.write() = users;
+    acl_changed();
+    Ok(())
+}
+
+/// The users as `CONFIG REWRITE` writes them into the config file, as Redis
+/// 8.10 does when no `aclfile` is set: a `user` line each, `default` first,
+/// then by name, the passwords as `#<sha256>`. The line is
+/// [`AclUser::to_acl_line`]'s; a word that would not read back as itself
+/// (it begins with a quote, or holds a byte that is not printable ASCII) is
+/// written in double quotes, with `\"`, `\\` and `\xHH`, as an ACL file's
+/// quoted words are read ([`file_words`]). So the file stays one line per
+/// user, and UTF-8.
+pub fn config_lines(store: &AclStore) -> Vec<String> {
+    let map = store.read();
+    let mut names: Vec<&String> = map.keys().collect();
+    names.sort_by_key(|n| (n.as_str() != "default", n.as_str()));
+    names
+        .into_iter()
+        .filter_map(|name| map.get(name))
+        .map(|user| {
+            let line = user.to_acl_line();
+            let rest = &line[format!("user {} ", user.name).len()..];
+            let mut out = format!("user {}", user.name);
+            for word in rest.split(|&b| b == b' ').filter(|w| !w.is_empty()) {
+                out.push(' ');
+                out.push_str(&quote_word(word));
+            }
+            out
+        })
+        .collect()
+}
+
+/// `word` as a line of an ACL file reads it back ([`file_words`]).
+fn quote_word(word: &[u8]) -> String {
+    let plain = !word.is_empty()
+        && !matches!(word[0], b'"' | b'\'')
+        && word.iter().all(|&b| b.is_ascii_graphic());
+    if plain {
+        return String::from_utf8_lossy(word).into_owned();
+    }
+    let mut out = String::from("\"");
+    for &b in word {
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b' '..=b'~' => out.push(b as char),
+            _ => out.push_str(&format!("\\x{b:02x}")),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Save all users to the ACL file atomically (write to .tmp then rename).
 pub fn save_acl_file(path: &str, store: &AclStore) -> std::io::Result<()> {
     let tmp = format!("{path}.tmp");
@@ -1615,6 +1681,39 @@ pub fn clear_restriction_counters(key_restricted: &mut bool, cmd_restricted: &mu
 
 #[cfg(test)]
 mod tests {
+    /// `config_lines` writes each user as one line that reads back to the
+    /// same user, patterns that need quoting included.
+    #[test]
+    fn config_lines_read_back_to_the_same_users() {
+        let store = super::new_acl_store("");
+        {
+            let mut map = store.write();
+            let mut user = super::AclUser::new("q");
+            for rule in [
+                &b"on"[..],
+                b">a b",
+                b"~\"q*",
+                b"~'s*",
+                b"%R~\xff\x01*",
+                b"~\xc3\xa9*",
+                b"&#c",
+                b"+get",
+                b"(~sel:* +set)",
+            ] {
+                super::apply_rule(&mut user, rule).unwrap();
+            }
+            map.insert("q".into(), user);
+        }
+        let lines = super::config_lines(&store);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("user default "), "{lines:?}");
+        assert!(lines.iter().all(|l| !l.contains(['\n', '\r'])), "{lines:?}");
+        let read = super::parse_acl_file(lines.join("\n"), "").unwrap();
+        let map = store.read();
+        for (name, user) in map.iter() {
+            assert_eq!(read[name].to_acl_line(), user.to_acl_line(), "{lines:?}");
+        }
+    }
     /// An entry as `AclLog::push` is given one, at `ms`.
     fn event(object: &str, client: &str, ms: u64) -> super::AclLogEntry {
         super::AclLogEntry {

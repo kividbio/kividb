@@ -10,9 +10,10 @@
 #            has been promoted, then let go: it comes back as a master, and
 #            Sentinel turns it into a replica;
 #   passwords  `requirepass` and `masterauth` are changed at run time on
-#            every node (CONFIG SET, then CONFIG REWRITE; the Sentinels are
-#            given the new one with SENTINEL SET auth-pass), and then the
-#            master is killed and started again, as in a kill round.
+#            every node (CONFIG SET), and an ACL user is added (ACL SETUSER),
+#            then CONFIG REWRITE; the Sentinels are given the new password
+#            with SENTINEL SET auth-pass. The master is killed and started
+#            again, as in a kill round, and has the ACL user after.
 #
 # A kill round runs for each client; the manual, pause and passwords rounds
 # run with the first. In every round:
@@ -66,6 +67,7 @@ WORK=$(cd "$WORK" && pwd)
 PASSWORD=sentinel-test-password
 SENTINEL_PASSWORD=sentinel-test-sentinels-password
 MASTER=m
+ACL_USER=sentinel-test-reader
 NODES=(17101 17102 17103)
 SENTINEL_PORTS=(27101 27102 27103)
 SENTINELS=$(printf '127.0.0.1:%s,' "${SENTINEL_PORTS[@]}")
@@ -299,6 +301,10 @@ change_passwords() {
     cli "$p" "$PASSWORD" CONFIG SET requirepass "$new" >/dev/null || fail "CONFIG SET requirepass on $p"
   done
   PASSWORD=$new
+  for p in "${NODES[@]}"; do
+    cli "$p" "$PASSWORD" ACL SETUSER "$ACL_USER" on ">$ACL_USER-password" "~sentinel-test:*" +@read >/dev/null ||
+      fail "ACL SETUSER on $p"
+  done
   for s in "${SENTINEL_PORTS[@]}"; do
     cli "$s" "$SENTINEL_PASSWORD" SENTINEL SET "$MASTER" auth-pass "$new" >/dev/null ||
       fail "SENTINEL SET auth-pass on $s"
@@ -354,6 +360,10 @@ round() {
   pause) say "letting the old master on $old go on" && resume_node "$old" ;;
   esac
   wait_for 60 "$old back as a replica of $new" replica_of "$old" "$new"
+  if [ "$how" = passwords ]; then
+    [ "$(cli "$old" "" AUTH "$ACL_USER" "$ACL_USER-password" ";;" GET "sentinel-test:$client" | head -n 1)" = OK ] ||
+      fail "$old, restarted, does not let $ACL_USER in"
+  fi
   n=$(cli "$new" "$PASSWORD" GET "sentinel-test:$client")
   wait_for 30 "$old holding $client's writes" holds "$old" "sentinel-test:$client" "$n"
 

@@ -381,6 +381,11 @@ pub struct Config {
     /// server on the host) loaded it, `replicaof` and all (#442).
     #[arg(skip)]
     pub configfile_loaded: bool,
+    /// The config file's `user <name> <rule>...` lines, each whole, read as
+    /// a line of an ACL file is: the users the server starts with, when no
+    /// `aclfile` is set. `CONFIG REWRITE` writes the users in effect here.
+    #[arg(skip)]
+    pub users: Vec<String>,
 
     /// Whether `--configfile` was given on the command line. A server that
     /// read `/etc/kividb/kividb.conf` only because it is the default path
@@ -824,6 +829,7 @@ impl Default for Config {
             bind_explicit: false,
             enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
+            users: Vec::new(),
             configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
@@ -976,6 +982,7 @@ impl Config {
             bind_explicit: false,
             enable_debug_command: DebugCommand::No,
             configfile_loaded: false,
+            users: Vec::new(),
             configfile_named: false,
             cluster_bus_secret: String::new(),
             cluster_config_file: "nodes.conf".into(),
@@ -1004,6 +1011,16 @@ impl Config {
     /// it is a parameter so both outcomes are testable from one build.
     pub fn validate(&self, tls_compiled: bool) -> Result<Vec<String>, String> {
         let mut warnings = Vec::new();
+
+        // As Redis refuses it: one place for the users, not two.
+        if !self.users.is_empty() && !self.aclfile.is_empty() {
+            return Err(
+                "the config file has 'user' lines and 'aclfile' is set too: define the \
+                 users either in the ACL file or with 'user' lines in the config file, \
+                 not both"
+                    .into(),
+            );
+        }
 
         // Checked here too for `--databases 0`: the config file's directive
         // is checked as it is read, the command line's was not.
@@ -1251,16 +1268,12 @@ impl Config {
 
     /// This configuration with `values` applied over it: CONFIG GET's names
     /// and values, which are what is in effect now. CONFIG REWRITE writes
-    /// that; it used to write the configuration the server started with,
-    /// and lose whatever CONFIG SET had changed since. A value that does not
-    /// read back as a directive leaves its setting as it was, and so does
-    /// one shown as `**redacted**`.
+    /// that. A value that does not read back as a directive leaves its
+    /// setting as it was. A secret is taken as given: the caller passes the
+    /// values in effect, not `CONFIG GET`'s `**redacted**`.
     pub fn with_values(&self, values: &[(String, String)]) -> Config {
         let mut config = self.clone();
         for (name, value) in values {
-            if value == "**redacted**" {
-                continue;
-            }
             // A password or a user name is taken whole, spaces, quotes and
             // all; empty unsets it.
             let secret = match name.to_ascii_lowercase().as_str() {
@@ -1272,6 +1285,9 @@ impl Config {
             };
             if let Some(field) = secret {
                 field.clone_from(value);
+                continue;
+            }
+            if value == "**redacted**" {
                 continue;
             }
             let args: Vec<String> = value.split_whitespace().map(String::from).collect();
@@ -1390,7 +1406,10 @@ impl Config {
         ));
         out.push_str(&format!("databases {}\n", self.databases));
         out.push_str(&format!("maxmemory {}\n", self.maxmemory));
-        out.push_str(&format!("maxmemory-policy {}\n", self.maxmemory_policy));
+        out.push_str(&format!(
+            "maxmemory-policy {}\n",
+            quote(&self.maxmemory_policy)
+        ));
         out.push_str(&format!("maxmemory-samples {}\n", self.maxmemory_samples));
         out.push_str(&format!("lfu-log-factor {}\n", self.lfu_log_factor));
         out.push_str(&format!("lfu-decay-time {}\n", self.lfu_decay_time));
@@ -1438,12 +1457,12 @@ impl Config {
                 "no"
             }
         ));
-        out.push_str(&format!("loglevel {}\n", self.loglevel));
+        out.push_str(&format!("loglevel {}\n", quote(&self.loglevel)));
         if !self.logfile.is_empty() {
             out.push_str(&format!("logfile {}\n", quote(&self.logfile)));
         }
         if self.log_format != "text" {
-            out.push_str(&format!("log-format {}\n", self.log_format));
+            out.push_str(&format!("log-format {}\n", quote(&self.log_format)));
         }
         // A directive with nothing after it is an error when the file is
         // read back, so an unset option is left out.
@@ -1452,6 +1471,15 @@ impl Config {
         }
         if !self.aclfile.is_empty() {
             out.push_str(&format!("aclfile {}\n", quote(&self.aclfile)));
+        }
+        // The ACL users, when no ACL file holds them (`ACL SAVE` writes
+        // that one), as Redis writes them: a `user` line each, which a
+        // start reads after `requirepass`, so `user default` wins.
+        if self.aclfile.is_empty() {
+            for line in &self.users {
+                out.push_str(line);
+                out.push('\n');
+            }
         }
         // Off is written -1, as it is set.
         match self.slowlog_log_slower_than {
@@ -1495,13 +1523,19 @@ impl Config {
         }
         out.push_str(&format!("repl-backlog-size {}\n", self.repl_backlog_size));
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
-        out.push_str(&format!("repl-diskless-load {}\n", self.repl_diskless_load));
-        out.push_str(&format!("hll-write-format {}\n", self.hll_write_format));
+        out.push_str(&format!(
+            "repl-diskless-load {}\n",
+            quote(&self.repl_diskless_load)
+        ));
+        out.push_str(&format!(
+            "hll-write-format {}\n",
+            quote(&self.hll_write_format)
+        ));
         out.push_str(&format!(
             "search-resp3-reply {}\n",
-            self.search_resp3_reply.to_ascii_lowercase()
+            quote(&self.search_resp3_reply.to_ascii_lowercase())
         ));
-        out.push_str(&format!("appendfsync {}\n", self.appendfsync));
+        out.push_str(&format!("appendfsync {}\n", quote(&self.appendfsync)));
         out.push_str(&format!("repl-timeout {}\n", self.repl_timeout));
         out.push_str(&format!("shutdown-timeout {}\n", self.shutdown_timeout));
         out.push_str(&format!("replica-priority {}\n", self.replica_priority));
@@ -1543,7 +1577,7 @@ impl Config {
         }
         out.push_str(&format!(
             "cluster-preferred-endpoint-type {}\n",
-            self.cluster_preferred_endpoint_type
+            quote(&self.cluster_preferred_endpoint_type)
         ));
         if self.cluster_announce_port != 0 {
             out.push_str(&format!(
@@ -1688,7 +1722,10 @@ impl Config {
             ));
         }
         if self.tls_auth_clients != "yes" {
-            out.push_str(&format!("tls-auth-clients {}\n", self.tls_auth_clients));
+            out.push_str(&format!(
+                "tls-auth-clients {}\n",
+                quote(&self.tls_auth_clients)
+            ));
         }
         if self.tls_cluster {
             out.push_str("tls-cluster yes\n");
@@ -1714,10 +1751,11 @@ impl Config {
                 continue;
             }
             // A list (`latency-tracking-info-percentiles 50 99 99.9`) is
-            // written as its words, as Redis writes it; a secret
-            // (`tls-key-file-pass`) as one quoted value.
+            // written as its words, as Redis writes it, each quoted where it
+            // needs it; a secret (`tls-key-file-pass`) as one quoted value.
             if value.contains(char::is_whitespace) && !is_secret(&name) {
-                out.push_str(&format!("{name} {value}\n"));
+                let words: Vec<String> = value.split_whitespace().map(quote).collect();
+                out.push_str(&format!("{name} {}\n", words.join(" ")));
             } else {
                 out.push_str(&format!("{name} {}\n", quote(value)));
             }
@@ -1749,18 +1787,44 @@ impl Config {
         let file = options.open(&tmp).map_err(RewriteError::Io)?;
         // From here on, a failure leaves the old file as it is, and the
         // temporary one is removed.
-        let written = Self::fill_and_replace(file, &tmp, path, out.as_bytes());
-        if written.is_err() {
-            let _ = std::fs::remove_file(&tmp);
+        match Self::fill_and_replace(file, &tmp, path, out.as_bytes()) {
+            Ok(()) => Ok(()),
+            Err((true, e)) => Err(RewriteError::DirectorySync(e)),
+            Err((false, e)) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(RewriteError::Io(e))
+            }
         }
-        written.map_err(RewriteError::Io)
     }
 
     /// The rest of [`Config::rewrite_with`]: `out` written to `file`, which
     /// was just created at `tmp`, in the old file's mode and owner; synced;
     /// renamed to `path`; and `path`'s directory synced, so that the rename
-    /// is kept too.
+    /// is kept too. The error says whether the file was replaced by then.
     fn fill_and_replace(
+        file: std::fs::File,
+        tmp: &std::path::Path,
+        path: &std::path::Path,
+        out: &[u8],
+    ) -> Result<(), (bool, std::io::Error)> {
+        Self::fill_and_rename(file, tmp, path, out).map_err(|e| (false, e))?;
+        // The rename is an entry in the directory: synced, so that after a
+        // crash the directory names the new file.
+        #[cfg(unix)]
+        {
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => std::path::Path::new("."),
+            };
+            std::fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .map_err(|e| (true, e))?;
+        }
+        Ok(())
+    }
+
+    /// `out` written to `file` at `tmp`, synced, and renamed to `path`.
+    fn fill_and_rename(
         mut file: std::fs::File,
         tmp: &std::path::Path,
         path: &std::path::Path,
@@ -1784,18 +1848,7 @@ impl Config {
         std::io::Write::write_all(&mut file, out)?;
         file.sync_all()?;
         drop(file);
-        std::fs::rename(tmp, path)?;
-        // The rename is an entry in the directory: synced, so that after a
-        // crash the directory names the new file.
-        #[cfg(unix)]
-        {
-            let dir = match path.parent() {
-                Some(dir) if !dir.as_os_str().is_empty() => dir,
-                _ => std::path::Path::new("."),
-            };
-            std::fs::File::open(dir)?.sync_all()?;
-        }
-        Ok(())
+        std::fs::rename(tmp, path)
     }
 
     /// Load the config file and apply its directives.
@@ -1855,6 +1908,17 @@ impl Config {
         let mut warnings = Vec::new();
         for (index, line) in contents.lines().enumerate() {
             let number = index + 1;
+            // `user <name> <rule>...`: read as a line of an ACL file is, and
+            // checked now; the users are made at startup.
+            let trimmed = line.trim();
+            let first = trimmed.split_whitespace().next().unwrap_or_default();
+            if first.eq_ignore_ascii_case("user") {
+                let user_line = format!("user{}", &trimmed[first.len()..]);
+                crate::acl::parse_acl_file(&user_line, "")
+                    .map_err(|e| format!("line {number}: {}", e.trim_start_matches("line 1: ")))?;
+                self.users.push(user_line);
+                continue;
+            }
             let words = split_config_line(line).map_err(|e| format!("line {number}: {e}"))?;
             let Some((key, args)) = words.split_first() else {
                 continue;
@@ -2687,6 +2751,9 @@ pub enum RewriteError {
     /// (#475).
     DefaultConfigFile(String),
     Io(std::io::Error),
+    /// The new file replaced the old one, but its directory could not be
+    /// synced.
+    DirectorySync(std::io::Error),
 }
 
 /// `host:port` as a socket address is written: an IPv6 address in brackets
@@ -2779,6 +2846,7 @@ mod config_file_tests {
             assert_eq!(line_of(&text, name), [name, value], "{text}");
         }
 
+        // A secret is taken as given, whatever its text.
         let unset = config.with_values(&[
             ("requirepass".into(), String::new()),
             ("masterauth".into(), String::new()),
@@ -2786,7 +2854,65 @@ mod config_file_tests {
         ]);
         assert_eq!(unset.requirepass, "");
         assert_eq!(unset.masterauth, "");
-        assert_eq!(unset.cluster_bus_secret, odd);
+        assert_eq!(unset.cluster_bus_secret, "**redacted**");
+    }
+
+    /// No value a client can set (a remembered setting, a path, a user name,
+    /// a password) puts a second directive into the rewritten file, whatever
+    /// CR, LF or `#` it holds: every line reads back as one directive, each
+    /// directive once.
+    #[test]
+    fn rewrite_writes_one_directive_per_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kividb.conf");
+        std::fs::write(&path, "").unwrap();
+        let config = Config {
+            configfile: path.to_str().unwrap().to_string(),
+            configfile_loaded: true,
+            configfile_named: true,
+            logfile: "log\nrequirepass injected".into(),
+            masteruser: "u\r\nmasterauth injected".into(),
+            requirepass: "# p\nq".into(),
+            users: vec!["user default on nopass ~* &* +@all".into()],
+            ..Config::default()
+        };
+        let rows: Vec<(String, String)> = [
+            ("tls-ciphersuites", "a\nrequirepass injected"),
+            ("tls-protocols", "#b c\r\nmasterauth injected"),
+            ("locale-collate", "d e # f\rg"),
+        ]
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        assert!(config.rewrite_with(&rows).is_ok(), "the rewrite failed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for line in text.lines() {
+            let words = split_config_line(line).unwrap_or_else(|e| panic!("{e}: {line:?}"));
+            let name = words[0].clone();
+            assert!(seen.insert(name.clone()), "{name} twice:\n{text}");
+        }
+        assert_eq!(
+            line_of(&text, "tls-ciphersuites"),
+            ["tls-ciphersuites", "a", "requirepass", "injected"]
+        );
+        assert_eq!(line_of(&text, "requirepass"), ["requirepass", "# p\nq"]);
+        assert_eq!(
+            line_of(&text, "logfile"),
+            ["logfile", "log\nrequirepass injected"]
+        );
+        assert!(!seen.contains("masterauth"), "{text}");
+    }
+
+    /// The config file's `user` lines are kept whole, read as an ACL file's
+    /// lines are, the keyword in any case; a rule that is not one is an
+    /// error, with its line.
+    #[test]
+    fn user_lines_are_read_as_acl_lines() {
+        let (c, _) = load("user alice on >p ~* +@all\nUSER bob off\n").unwrap();
+        assert_eq!(c.users, ["user alice on >p ~* +@all", "user bob off"]);
+        let err = load("port 1\nuser carol on notarule\n").unwrap_err();
+        assert!(err.starts_with("line 2:"), "{err}");
     }
 
     /// The rewritten file replaces the old one whole, and nothing is left

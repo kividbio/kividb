@@ -18,8 +18,9 @@ four ways:
 - **paused** (SIGSTOP) until a replica has been promoted, then let go: it
   comes back as a master, and Sentinel turns it into a replica;
 - **killed after the passwords are changed at run time** on every node
-  (see "Changing the passwords" below), and started again from the file
-  `CONFIG REWRITE` wrote.
+  (see "Changing the passwords" below) and an ACL user is added with
+  `ACL SETUSER`, and started again from the file `CONFIG REWRITE` wrote:
+  the user is there after the restart.
 
 Each time, the test checks these things:
 
@@ -82,8 +83,10 @@ same one. The clients need it too (below).
 `masterauth` first, then the new `requirepass` (`CONFIG SET`); give the
 Sentinels the new one (`SENTINEL SET <master-name> auth-pass <password>`);
 then `CONFIG REWRITE` on every node. Links already up stay up, and
-`CONFIG REWRITE` writes both passwords as they are set now, so a node
-restarted from its file uses the new ones.
+`CONFIG REWRITE` writes the current `requirepass`, `masterauth` and
+`masteruser`, quoted as Redis quotes them, so a node restarted from its
+file uses the new ones. ACL users made with `ACL SETUSER` are written as
+`user` lines too, unless an `aclfile` is set (then `ACL SAVE` keeps them).
 
 **Choosing the replica to promote.** `replica-priority` works as in Redis:
 Sentinel promotes the replica with the lowest priority first, and never one

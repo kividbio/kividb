@@ -227,7 +227,7 @@ pub struct ReplState {
     /// `(masteruser, masterauth)` — what this node authenticates with when it
     /// connects to a master as a replica.
     master_credentials: RwLock<(String, String)>,
-    /// `requirepass` as it is set now: the configuration's, then the last
+    /// The current `requirepass`: the configuration's, then the last
     /// `CONFIG SET requirepass`. A password is checked against the default
     /// user in the ACL store, which keeps only its hash; this is the text
     /// `CONFIG REWRITE` writes, as Redis writes `requirepass`.
@@ -1012,7 +1012,7 @@ impl ReplState {
         self.master_credentials.write().1 = password.to_string();
     }
 
-    /// `requirepass` as it is set now (empty: none).
+    /// The current `requirepass` (empty: none).
     pub fn requirepass(&self) -> String {
         self.requirepass.read().clone()
     }
