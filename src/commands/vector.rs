@@ -623,21 +623,44 @@ fn row_key(row: &Row) -> &str {
 
 /// Rows of the documents of `def`, in the order the documents were written
 /// (as Redis gives them, by its document ids); by key where they are
-/// numbered alike, and for an index that numbers none.
-fn rows_as_written(def: &crate::vector::IndexDef, rows: &mut [Row]) {
-    if rows.len() < 2 {
+/// numbered alike. An index that numbers none leaves them as they are.
+fn rows_as_written(def: &crate::vector::IndexDef, rows: &mut Vec<Row>) {
+    if rows.len() < 2 || !def.gives_ids() {
         return;
     }
-    rows.sort_by(|a, b| row_key(a).cmp(row_key(b)));
-    if !def.gives_ids() {
-        return;
+    // Each row's number, and its place: sorted, then the rows moved there.
+    let mut order: Vec<(u64, u32)> = {
+        let p = def.postings.read();
+        rows.iter()
+            .enumerate()
+            .map(|(at, row)| {
+                let key = crate::commands::aggregate_pipeline::text_of(row_key(row));
+                let number = p.id(&key).map_or(u64::MAX, |id| p.written(id));
+                (number, at as u32)
+            })
+            .collect()
+    };
+    order.sort_unstable();
+    // Those numbered alike, by key.
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && order[end].0 == order[start].0 {
+            end += 1;
+        }
+        if end - start > 1 {
+            order[start..end].sort_unstable_by(|a, b| {
+                row_key(&rows[a.1 as usize]).cmp(row_key(&rows[b.1 as usize]))
+            });
+        }
+        start = end;
     }
-    let p = def.postings.read();
-    // Stable: those numbered alike keep their keys' order.
-    rows.sort_by_cached_key(|row| {
-        let key = crate::commands::aggregate_pipeline::text_of(row_key(row));
-        p.id(&key).map_or(u64::MAX, |id| p.written(id))
-    });
+    let mut taken: Vec<Option<Row>> = std::mem::take(rows).into_iter().map(Some).collect();
+    rows.extend(
+        order
+            .into_iter()
+            .filter_map(|(_, at)| taken[at as usize].take()),
+    );
 }
 
 pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {

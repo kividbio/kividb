@@ -1396,7 +1396,10 @@ impl KeyOrder {
                 }
                 found
             };
-        let mut look_up = (need as u128) * (places as u128) >= (of as u128) * (of as u128);
+        // Looking up costs a look at each of `ids` and a sort of the `need`
+        // first: for many of them (all, for FT.AGGREGATE), the walk is less.
+        let sort = (need as u128) * u128::from(usize::BITS - need.leading_zeros());
+        let mut look_up = (need as u128) * (places as u128) >= (of as u128) * (of as u128 + sort);
         if !look_up {
             lists.push(walk(
                 &self.sorted,
