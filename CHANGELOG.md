@@ -818,6 +818,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   place (master: 37,467 µs every call). Suite 53 of
   `benchmarks/1.3.0/regressions` gates these and the `SETBIT` and
   `BITFIELD` rows at 64 MiB against v1.2.2 (38,110 µs an `APPEND` there).
+- **`SETRANGE` and `BITFIELD` write where the string is kept (part of
+  #1016).** Both go through the same in-place string edit as `SETBIT`:
+  when nothing but its key holds the string and the result still fits
+  where it is kept, the new bytes are written there and the string is not
+  copied. Otherwise (a string that outgrows its block, or one shared with
+  another key since a `COPY`, being read by a `DUMP`, or captured by a
+  `BGSAVE`, an AOF rewrite or a replica's full sync) it is copied once, and
+  a holder keeps the bytes from before. The time to live is kept. A
+  `SETRANGE` with an empty value writes nothing and does not create a
+  missing key. `BITFIELD` runs its operations in order, each seeing the
+  ones before it, over a scratch of only the bytes they write (one buffer
+  of at most 32 MiB when the writes are close together, a map of the
+  written bytes when they are far apart), then writes them as one patch,
+  or nothing if the bytes end as they were. A `BITFIELD` that changes bits
+  and puts them back now counts as a write (`WATCH`, the dirty count, the
+  AOF and replication), as in Redis; as before, one whose writes all fail
+  or change nothing is not logged or replicated, and an `OVERFLOW FAIL`
+  write that fails does not grow the string.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
