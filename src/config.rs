@@ -1265,6 +1265,10 @@ impl Config {
                 // Set to empty at runtime: unset, not left at what the
                 // server started with.
                 match name.to_ascii_lowercase().as_str() {
+                    // `REPLICAOF NO ONE`: a master now. Left as it started,
+                    // the file named the old master, and a promoted replica
+                    // restarted from it followed that master again.
+                    "replicaof" | "slaveof" => config.replicaof = None,
                     "cluster-announce-ip" => config.cluster_announce_ip.clear(),
                     "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
                     "cluster-announce-client-ipv4" => config.cluster_announce_client_ipv4.clear(),
@@ -1288,6 +1292,20 @@ impl Config {
     /// a config file (see [`Config::configfile_loaded`]); an io::Error if
     /// the write fails.
     pub fn rewrite_to_disk(&self) -> Result<(), RewriteError> {
+        self.rewrite_with(&[])
+    }
+
+    /// [`Config::rewrite_to_disk`], with `values` (`CONFIG GET *`'s rows)
+    /// written after this configuration's own lines: each setting not
+    /// written already, under its own name ([`setting_name`]), unless
+    /// [`NOT_REWRITTEN`] says why not. A
+    /// setting KiviDB keeps without acting on it
+    /// ([`crate::redis_settings::remembered_defaults`]) is written only when
+    /// it is not at its default, since the file then warns of it at every
+    /// start. Empty and redacted values are left out: an empty one reads
+    /// back as a missing argument, and the secrets are this configuration's
+    /// own lines.
+    pub fn rewrite_with(&self, values: &[(String, String)]) -> Result<(), RewriteError> {
         if !self.configfile_loaded {
             return Err(RewriteError::NoConfigFile);
         }
@@ -1646,6 +1664,31 @@ impl Config {
         }
         if self.tls_replication {
             out.push_str("tls-replication yes\n");
+        }
+
+        let written: std::collections::HashSet<String> = out
+            .lines()
+            .filter_map(|line| line.split_whitespace().next())
+            .map(str::to_string)
+            .collect();
+        for (name, value) in values {
+            let name = name.to_ascii_lowercase();
+            if written.contains(&name)
+                || setting_name(&name) != name
+                || NOT_REWRITTEN.iter().any(|(n, _)| *n == name)
+                || value.is_empty()
+                || value == "**redacted**"
+                || crate::redis_settings::remembered_default(&name).as_deref() == Some(value)
+            {
+                continue;
+            }
+            // A list (`latency-tracking-info-percentiles 50 99 99.9`) is
+            // written as its words, as Redis writes it.
+            if value.contains(char::is_whitespace) {
+                out.push_str(&format!("{name} {value}\n"));
+            } else {
+                out.push_str(&format!("{name} {}\n", quote(value)));
+            }
         }
 
         // The new file keeps the old one's mode, and its owner where the
@@ -2521,6 +2564,58 @@ fn parse_yes_no(s: &str) -> Result<bool, String> {
         other => Err(format!("expected 'yes' or 'no', got '{other}'")),
     }
 }
+
+/// A setting's own name, for one Redis also takes under an older one
+/// (`CONFIG SET`, `CONFIG GET`, `CONFIG REWRITE`).
+pub fn setting_name(name: &str) -> &str {
+    match name {
+        "cluster-slave-no-failover" => "cluster-replica-no-failover",
+        "slave-lazy-flush" => "replica-lazy-flush",
+        "slave-serve-stale-data" => "replica-serve-stale-data",
+        "slave-read-only" => "replica-read-only",
+        "slave-ignore-maxmemory" => "replica-ignore-maxmemory",
+        "slave-announce-ip" => "replica-announce-ip",
+        "cluster-slave-validity-factor" => "cluster-replica-validity-factor",
+        "list-max-ziplist-size" => "list-max-listpack-size",
+        "slave-priority" => "replica-priority",
+        "slave-announce-port" => "replica-announce-port",
+        "repl-ping-slave-period" => "repl-ping-replica-period",
+        "min-slaves-to-write" => "min-replicas-to-write",
+        "min-slaves-max-lag" => "min-replicas-max-lag",
+        "lua-time-limit" => "busy-reply-threshold",
+        "hash-max-ziplist-entries" => "hash-max-listpack-entries",
+        "zset-max-ziplist-entries" => "zset-max-listpack-entries",
+        "hash-max-ziplist-value" => "hash-max-listpack-value",
+        "zset-max-ziplist-value" => "zset-max-listpack-value",
+        "slaveof" => "replicaof",
+        other => other,
+    }
+}
+
+/// The settings `CONFIG GET` lists that `CONFIG REWRITE` does not write,
+/// and why. Every other one is written ([`Config::rewrite_with`]); a test
+/// checks the list against `CONFIG GET *`, so a setting added later is
+/// written, or added here with its reason.
+pub const NOT_REWRITTEN: &[(&str, &str)] = &[
+    ("appendonly", "written as `aof`"),
+    (
+        "auto-aof-rewrite-percentage",
+        "written as `aof-rewrite-percentage`",
+    ),
+    (
+        "auto-aof-rewrite-min-size",
+        "written as `aof-rewrite-min-size`",
+    ),
+    (
+        "dbfilename",
+        "always `dump.kdb`: the setting cannot change it",
+    ),
+    (
+        "appendfilename",
+        "always `appendonly.aof`: the setting cannot change it",
+    ),
+    ("tcp-backlog", "always 511: the setting cannot change it"),
+];
 
 /// Error returned by `Config::rewrite_to_disk`.
 pub enum RewriteError {

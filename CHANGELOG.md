@@ -2348,13 +2348,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **`CONFIG REWRITE` writes `dir`, `io-model`, `replica-announced-port`,
-  `preload-file` and the TLS settings.** It left them out, so a server
-  restarted from the file it wrote opened the directory it was started
-  from, without its data, and served without TLS. Redis Sentinel sends
-  `CONFIG REWRITE` after every `REPLICAOF` it gives, so one failover was
-  enough: the old master or a repointed replica, restarted, came up empty
-  or waited on another node's `kividb.lock`. TLS lines are written only
+- **`CONFIG REWRITE` writes every setting the server runs with, and no
+  `replicaof` after `REPLICAOF NO ONE`.** It wrote its own list, and left
+  out the rest, `dir`, `io-model`, `replica-announced-port`, `preload-file`,
+  the TLS settings, `maxclients`, `hz`, `rdbcompression` and the search,
+  stream and probabilistic settings among them. It also kept the
+  `replicaof` the file started with after the server became a master.
+  Redis Sentinel sends `CONFIG REWRITE` after every `REPLICAOF` it gives,
+  so after one failover a node restarted from its file opened the
+  directory it was started from, without its data, served without TLS, or
+  followed its old master again. It now writes each setting `CONFIG GET`
+  lists, except the ones `config::NOT_REWRITTEN` gives a reason for (older
+  names, and file names that cannot change); a setting KiviDB keeps without
+  acting on only when it is not at its default; and the TLS lines only
   where they are set, so a build without TLS reads its own file back.
 
 - **Vectors written at once into an empty HNSW index all link into its

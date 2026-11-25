@@ -424,6 +424,181 @@ fn test_config_rewrite_with_configfile() {
     let _ = std::fs::remove_file(&tmp);
 }
 
+/// Starts the binary from `conf`, in `cwd`, and connects to it.
+fn start_from_file(
+    conf: &std::path::Path,
+    cwd: &std::path::Path,
+    port: u16,
+) -> std::process::Child {
+    let server = std::process::Command::new(
+        std::env::var("CARGO_BIN_EXE_kividb").unwrap_or_else(|_| "target/debug/kividb".into()),
+    )
+    .current_dir(cwd)
+    .args(["--configfile", conf.to_str().unwrap()])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .expect("failed to start kividb");
+    drop(Conn::connect(port));
+    server
+}
+
+/// `CONFIG GET *`, by name.
+fn config_get_all(c: &mut Conn) -> std::collections::BTreeMap<String, String> {
+    let reply = c.cmds(&["CONFIG", "GET", "*"]);
+    let text = |v: &RespValue| match v {
+        RespValue::BulkStr(s) | RespValue::SimpleStr(s) => s.clone(),
+        other => panic!("not a string: {other:?}"),
+    };
+    reply
+        .as_array()
+        .chunks(2)
+        .map(|pair| (text(&pair[0]), text(&pair[1])))
+        .collect()
+}
+
+/// `CONFIG REWRITE` writes every setting the server was started with: a
+/// server restarted from the file it wrote, in another directory, gives the
+/// same `CONFIG GET *`. It used to leave out `dir`, `io-model`,
+/// `replica-announced-port`, `preload-file`, the TLS settings and every
+/// setting not in its own list (`maxclients`, `hz`, `rdbcompression`, the
+/// search and stream settings, ...). Redis Sentinel sends `CONFIG REWRITE`
+/// after each `REPLICAOF`, so a failover was enough to lose them, and a node
+/// restarted after one opened the directory it was started from, without
+/// its data.
+///
+/// Then every name `CONFIG GET *` lists is checked against the file: it is
+/// written, or it is an older name of one that is, or it is empty, or it is
+/// one KiviDB keeps without acting on and is at its default, or
+/// `NOT_REWRITTEN` says why not. A setting added later fails here until the
+/// rewrite writes it or the list gives the reason.
+#[test]
+fn config_rewrite_round_trip_keeps_every_setting() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let data = tmp.path().join("data dir");
+    std::fs::create_dir(&data).unwrap();
+    let preload =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/redis-7.4.rdb");
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port}\n\
+             dir \"{}\"\n\
+             io-model tokio\n\
+             replica-announced-port 7100\n\
+             preload-file rdb:{}\n\
+             maxmemory-samples 7\n\
+             maxclients 500\n\
+             hz 20\n\
+             rdbcompression yes\n\
+             lua-time-limit 7000\n\
+             search-default-dialect 2\n\
+             stream-node-max-entries 50\n\
+             hash-max-ziplist-entries 99\n\
+             tracking-table-max-keys 5000\n\
+             latency-tracking-info-percentiles 50 90\n",
+            data.display(),
+            preload.display(),
+        ),
+    )
+    .unwrap();
+
+    let first_cwd = tmp.path().join("first");
+    std::fs::create_dir(&first_cwd).unwrap();
+    let mut server = start_from_file(&conf, &first_cwd, port);
+    let mut c = Conn::connect(port);
+    let before = config_get_all(&mut c);
+    assert_eq!(
+        std::path::Path::new(&before["dir"]),
+        data.canonicalize().unwrap(),
+        "{before:?}"
+    );
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    assert!(reply.is_ok(), "CONFIG REWRITE: {reply:?}");
+    drop(c);
+    server.kill().unwrap();
+    let _ = server.wait();
+
+    // Another working directory: a file without `dir` would start there.
+    let second_cwd = tmp.path().join("second");
+    std::fs::create_dir(&second_cwd).unwrap();
+    let mut server = start_from_file(&conf, &second_cwd, port);
+    let mut c = Conn::connect(port);
+    let after = config_get_all(&mut c);
+    drop(c);
+    server.kill().unwrap();
+    let _ = server.wait();
+    let written = std::fs::read_to_string(&conf).unwrap();
+    for (name, value) in &before {
+        assert_eq!(
+            after.get(name),
+            Some(value),
+            "{name} after a restart from the rewritten file:\n{written}"
+        );
+    }
+
+    let in_file = |name: &str| {
+        written
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some(name))
+    };
+    let left_out: Vec<String> = after
+        .iter()
+        .filter(|(name, value)| {
+            !(in_file(name)
+                || kividb::config::setting_name(name) != name.as_str()
+                || value.is_empty()
+                || kividb::config::NOT_REWRITTEN.iter().any(|(n, _)| n == name)
+                || kividb::redis_settings::remembered_default(name).as_ref() == Some(*value))
+        })
+        .map(|(name, value)| format!("{name} = {value}"))
+        .collect();
+    assert!(
+        left_out.is_empty(),
+        "CONFIG REWRITE leaves these out, and NOT_REWRITTEN does not say why: {left_out:?}\n{written}"
+    );
+}
+
+/// `REPLICAOF NO ONE` makes the server a master, and `CONFIG REWRITE` after
+/// it writes no `replicaof`. It used to keep the line the file started with:
+/// a replica Sentinel promoted (`REPLICAOF NO ONE`, then `CONFIG REWRITE`)
+/// followed its old master again when it restarted.
+#[test]
+fn config_rewrite_after_replicaof_no_one_drops_replicaof() {
+    let port = free_port();
+    let master = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port}\ndir {}\nreplicaof 127.0.0.1 {master}\n",
+            tmp.path().display()
+        ),
+    )
+    .unwrap();
+    let mut server = start_from_file(&conf, tmp.path(), port);
+    let mut c = Conn::connect(port);
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    assert!(reply.is_ok(), "CONFIG REWRITE: {reply:?}");
+    let written = std::fs::read_to_string(&conf).unwrap();
+    assert!(
+        written.contains(&format!("replicaof 127.0.0.1 {master}\n")),
+        "{written}"
+    );
+
+    assert!(c.cmds(&["REPLICAOF", "NO", "ONE"]).is_ok());
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    assert!(reply.is_ok(), "CONFIG REWRITE: {reply:?}");
+    let written = std::fs::read_to_string(&conf).unwrap();
+    assert!(!written.contains("replicaof"), "{written}");
+    drop(c);
+    server.kill().unwrap();
+    let _ = server.wait();
+}
+
 /// A server not started from a config file refuses `CONFIG REWRITE`, as
 /// Redis does, and writes nothing (#442). It used to create the file at its
 /// `--configfile` path (by default `/etc/kividb/kividb.conf`, which every
