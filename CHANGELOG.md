@@ -2391,7 +2391,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where they are set, so a build without TLS reads its own file back. A
   server restarted from the file opens the same data directory, serves
   TLS as it did and has the role it had: Redis Sentinel sends
-  `CONFIG REWRITE` after every `REPLICAOF` it gives.
+  `CONFIG REWRITE` after every `REPLICAOF` it gives. `requirepass`,
+  `masterauth` and `masteruser` are written as they are set now
+  (`CONFIG SET` included), quoted, as Redis writes them, and every value
+  that may hold spaces, quotes, `#` or non-ASCII is quoted so that it reads
+  back whole. The new file is synced before it replaces the old one, and
+  the directory after; when the new file cannot be made, the old one is
+  left as it is and the command replies with an error.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the

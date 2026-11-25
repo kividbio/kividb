@@ -566,9 +566,9 @@ fn config_rewrite_round_trip_keeps_every_setting() {
     );
 }
 
-/// A kividb started from `conf` in `cwd`, killed when dropped, once its port
-/// takes connections. (`start_from_file` sends `PING`, which a server with a
-/// password refuses before `AUTH`.)
+/// A kividb started from `conf` in `cwd`, killed when dropped, once it
+/// answers `PING`: with `PONG`, or, with a password, `NOAUTH` (which
+/// `start_from_file` does not take).
 fn spawn_from_file(conf: &std::path::Path, cwd: &std::path::Path, port: u16) -> Spawned {
     let server = Spawned(
         std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
@@ -579,9 +579,19 @@ fn spawn_from_file(conf: &std::path::Path, cwd: &std::path::Path, port: u16) -> 
             .spawn()
             .expect("start kividb"),
     );
+    let answers = || -> bool {
+        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+        let mut first = [0u8; 1];
+        stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+            && stream.read_exact(&mut first).is_ok()
+            && matches!(first[0], b'+' | b'-')
+    };
     let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(("127.0.0.1", port)).is_err() {
-        assert!(Instant::now() < deadline, "nothing on port {port}");
+    while !answers() {
+        assert!(Instant::now() < deadline, "no answer on port {port}");
         thread::sleep(Duration::from_millis(50));
     }
     server
@@ -693,7 +703,7 @@ fn config_rewrite_writes_passwords_as_set_now() {
     wait_for_link(&mut r);
     assert!(m.cmds(&["SET", "after-restart", "1"]).is_ok());
     let deadline = Instant::now() + Duration::from_secs(10);
-    while r.cmds(&["GET", "after-restart"]).as_str() != "1" {
+    while !matches!(r.cmds(&["GET", "after-restart"]), RespValue::BulkStr(v) if v == "1") {
         assert!(
             Instant::now() < deadline,
             "the write did not reach the replica"
