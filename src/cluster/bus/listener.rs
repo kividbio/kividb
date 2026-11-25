@@ -453,6 +453,25 @@ pub fn process_message(
                 {
                     owners.push(master);
                 }
+                // And the slots it claimed that came to its master after the
+                // epoch it claimed them at (`came_at`), at the epoch each
+                // came at: it stands for the others.
+                let moved = if crate::cluster::came_at::test_voter_skips() {
+                    Default::default()
+                } else {
+                    claims
+                        .as_deref()
+                        .map(|c| state.moved_claims_of(master_id, c))
+                        .unwrap_or_default()
+                };
+                if !moved.is_empty() {
+                    return Some(encode(&BusMessage::UpdateMoved {
+                        sender_id: state.myself(),
+                        owners,
+                        moved: moved.decisive,
+                        fallback: moved.fallback,
+                    }));
+                }
                 if owners.is_empty() {
                     return None;
                 }
@@ -468,6 +487,18 @@ pub fn process_message(
         BusMessage::Update { sender_id, owners } => {
             if sender_is_member(state, &sender_id) {
                 apply_update(state, sender_id, owners);
+            }
+            None
+        }
+        BusMessage::UpdateMoved {
+            sender_id,
+            owners,
+            moved,
+            fallback,
+        } => {
+            if sender_is_member(state, &sender_id) {
+                apply_update(state, sender_id, owners);
+                apply_moved(state, sender_id, &moved, &fallback);
             }
             None
         }
@@ -774,6 +805,65 @@ pub(crate) fn apply_update(
     }
     drop(forgotten);
     state.save_soon();
+}
+
+/// Take in the slots of this node's master that a voter says came to it
+/// after the epoch this node claimed them at, each at the epoch it came at
+/// (`came_at`): `moved`, whose coming the voter knows, are given up at
+/// once; `fallback`, which the voter takes to have come at their owner's
+/// epoch, once the masters that refused them leave this node no quorum for
+/// them (`ClusterState::moved_refusals_give_up`). A slot given up is a
+/// gain of the master at that epoch, held only if the master's stream
+/// confirms it (a `TAKEN` at that epoch or later that lists it, or an
+/// `ARRIVED` at that very epoch; `followed_imports::FollowedImports::note_gains`);
+/// this node stands for the others.
+pub(crate) fn apply_moved(
+    state: &ClusterState,
+    sender_id: NodeId,
+    moved: &[crate::cluster::bus::SlotClaim],
+    fallback: &[crate::cluster::bus::SlotClaim],
+) {
+    let Some(master) = state.my_master_id() else {
+        return;
+    };
+    let of_master = |claims: &[crate::cluster::bus::SlotClaim]| -> Vec<(u16, u64)> {
+        let slots = state.slots.read();
+        claims
+            .iter()
+            .flat_map(|c| {
+                (c.start..=c.end.min((crate::cluster::CLUSTER_SLOTS - 1) as u16))
+                    .map(|s| (s, c.epoch))
+            })
+            .filter(|&(slot, _)| slots[slot as usize] == Some(master))
+            .collect()
+    };
+    let (decisive, fallback_gains) = (of_master(moved), of_master(fallback));
+    if decisive.is_empty() && fallback_gains.is_empty() {
+        return;
+    }
+    let mut given_up = decisive;
+    if !fallback_gains.is_empty() {
+        given_up.extend(state.moved_refusals_give_up(sender_id, master, &fallback_gains));
+    }
+    let all: Vec<crate::cluster::bus::SlotClaim> = moved.iter().chain(fallback).cloned().collect();
+    log_info!(
+        "Cluster: {} answered this node's vote request: slots {} came to its master after the \
+         epoch this node claimed them at; {} given up, held only if its master's stream \
+         confirms them",
+        node_id_str(&sender_id),
+        crate::cluster::came_at::claims_text(&all),
+        if given_up.is_empty() {
+            "none".to_string()
+        } else {
+            crate::cluster::migration::ranges_text(&crate::cluster::migration::slot_runs(
+                given_up.iter().map(|(s, _)| *s),
+            ))
+        }
+    );
+    if !given_up.is_empty() {
+        state.followed_imports.note_gains(master, &given_up);
+        state.save_soon();
+    }
 }
 
 /// For the tests of a node that has not heard of a slot's new owner, and

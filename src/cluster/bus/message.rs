@@ -251,6 +251,20 @@ pub enum BusMessage {
         owners: Vec<OwnerUpdate>,
     },
 
+    /// An [`BusMessage::Update`] that also says which of the slots the
+    /// candidate claimed for its master came to the master after the epoch
+    /// it claimed them at, each at the epoch it came at (`came_at`): those
+    /// the sender knows the coming of (`moved`), and those it takes to have
+    /// come at their owner's epoch (`fallback`). On the wire, `UPDATE` with
+    /// one field more after the owners (`moved`), or two when `fallback` has
+    /// any; a node that does not know them leaves them over.
+    UpdateMoved {
+        sender_id: NodeId,
+        owners: Vec<OwnerUpdate>,
+        moved: Vec<SlotClaim>,
+        fallback: Vec<SlotClaim>,
+    },
+
     /// "Yes, you can take over." Sent by a master in response to a valid
     /// FailoverAuthRequest. The replying master records the epoch as its
     /// last_vote_epoch to prevent voting twice in the same epoch.
@@ -303,6 +317,7 @@ impl BusMessage {
             | BusMessage::Pong { sender_id, .. }
             | BusMessage::FailoverAuthRequest { sender_id, .. }
             | BusMessage::Update { sender_id, .. }
+            | BusMessage::UpdateMoved { sender_id, .. }
             | BusMessage::FailoverAuthAck { sender_id, .. }
             | BusMessage::Fail { sender_id, .. }
             | BusMessage::Publish { sender_id, .. }
@@ -460,17 +475,17 @@ pub fn encode(msg: &BusMessage) -> Vec<u8> {
         }
         // Flat, three fields an owner: the parser allows four levels of
         // arrays, and the claims take two.
-        BusMessage::Update { sender_id, owners } => {
-            let mut fields = vec![resp_bulk_str("UPDATE"), resp_bulk(sender_id)];
-            for o in owners {
-                fields.push(resp_bulk(&o.id));
-                fields.push(resp_bulk_str(&format_endpoint(
-                    &o.ip,
-                    o.client_port,
-                    o.cluster_port,
-                    o.config_epoch,
-                )));
-                fields.push(encode_slot_claims(&o.claims));
+        BusMessage::Update { sender_id, owners } => resp_array(update_fields(sender_id, owners)),
+        BusMessage::UpdateMoved {
+            sender_id,
+            owners,
+            moved,
+            fallback,
+        } => {
+            let mut fields = update_fields(sender_id, owners);
+            fields.push(encode_slot_claims(moved));
+            if !fallback.is_empty() {
+                fields.push(encode_slot_claims(fallback));
             }
             resp_array(fields)
         }
@@ -849,10 +864,39 @@ pub fn decode(buf: &[u8]) -> Result<Option<(BusMessage, usize)>, String> {
                 return Err(format!("UPDATE expects 2 fields, got {}", parts.len()));
             }
             let sender_id = parse_node_id(&parts[1]).ok_or("bad sender id")?;
+            // One or two fields more than three an owner: the slots that
+            // came to the candidate's master after its claim (`UpdateMoved`).
+            let rest = &parts[2..];
+            let extra = rest.len() % 3;
+            let claims_of = |field: &[u8]| {
+                (field.first() == Some(&b'*'))
+                    .then(|| parse_slot_claims(field).ok())
+                    .flatten()
+                    .filter(|c| valid_claims(c))
+            };
+            if extra >= 1
+                && let Some(moved) = claims_of(&rest[rest.len() - extra])
+                && let Some(fallback) = if extra == 2 {
+                    claims_of(&rest[rest.len() - 1])
+                } else {
+                    Some(Vec::new())
+                }
+                && !(moved.is_empty() && fallback.is_empty())
+            {
+                return Ok(Some((
+                    BusMessage::UpdateMoved {
+                        sender_id,
+                        owners: parse_owner_updates(&rest[..rest.len() - extra]),
+                        moved,
+                        fallback,
+                    },
+                    consumed,
+                )));
+            }
             Ok(Some((
                 BusMessage::Update {
                     sender_id,
-                    owners: parse_owner_updates(&parts[2..]),
+                    owners: parse_owner_updates(rest),
                 },
                 consumed,
             )))
@@ -1050,6 +1094,23 @@ fn parse_owner_report(buf: &[u8]) -> Option<OwnerReport> {
         return None;
     }
     OwnerReport::valid(masters, parse_slot_claims(claims).ok()?)
+}
+
+/// The fields of an `UPDATE`: its name, the sender, and three an owner.
+/// Flat: the parser allows four levels of arrays, and the claims take two.
+fn update_fields(sender_id: &NodeId, owners: &[OwnerUpdate]) -> Vec<Vec<u8>> {
+    let mut fields = vec![resp_bulk_str("UPDATE"), resp_bulk(sender_id)];
+    for o in owners {
+        fields.push(resp_bulk(&o.id));
+        fields.push(resp_bulk_str(&format_endpoint(
+            &o.ip,
+            o.client_port,
+            o.cluster_port,
+            o.config_epoch,
+        )));
+        fields.push(encode_slot_claims(&o.claims));
+    }
+    fields
 }
 
 /// The owners of an `UPDATE`, from its fields after the sender's id: three
@@ -2105,6 +2166,63 @@ mod tests {
             BusMessage::Update { owners, .. } => assert_eq!(owners, vec![owner]),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// An `UPDATE` that says when the slots it refuses came round-trips,
+    /// with the slots whose coming the sender knows and those it takes to
+    /// have come at their owner's epoch apart (one field more, or two); one
+    /// with neither reads as a plain `UPDATE`.
+    #[test]
+    fn an_update_with_the_slots_that_came_round_trips() {
+        let owner = OwnerUpdate {
+            id: generate_node_id(),
+            ip: "10.0.0.2".into(),
+            client_port: 7001,
+            cluster_port: 17001,
+            config_epoch: 12,
+            claims: vec![SlotClaim {
+                start: 0,
+                end: 100,
+                epoch: 12,
+            }],
+        };
+        let sender = generate_node_id();
+        let claim = |start, end, epoch| SlotClaim { start, end, epoch };
+        for (moved, fallback) in [
+            (vec![claim(0, 10, 9)], vec![]),
+            (vec![claim(0, 10, 9)], vec![claim(20, 30, 7)]),
+            (vec![], vec![claim(20, 30, 7)]),
+        ] {
+            let bytes = encode(&BusMessage::UpdateMoved {
+                sender_id: sender,
+                owners: vec![owner.clone()],
+                moved: moved.clone(),
+                fallback: fallback.clone(),
+            });
+            match decode(&bytes).unwrap().unwrap().0 {
+                BusMessage::UpdateMoved {
+                    sender_id,
+                    owners,
+                    moved: m,
+                    fallback: f,
+                } => {
+                    assert_eq!(sender_id, sender);
+                    assert_eq!(owners, vec![owner.clone()]);
+                    assert_eq!((m, f), (moved, fallback));
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let bytes = encode(&BusMessage::UpdateMoved {
+            sender_id: sender,
+            owners: vec![owner.clone()],
+            moved: vec![],
+            fallback: vec![],
+        });
+        assert!(matches!(
+            decode(&bytes).unwrap().unwrap().0,
+            BusMessage::Update { .. }
+        ));
     }
 
     /// The `vote-claims` token travels in a PING's flags and is skipped by
