@@ -230,6 +230,8 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_parallel_scripts, num_args = 1)]
     pub lua_parallel_scripts: ParallelScripts,
 
+    /// An int8 first pass in FLAT KNN scans over many candidates, re-scored
+    /// exactly: the same replies. See docs/CONFIGURATION.md.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pub search_flat_int8: bool,
 
