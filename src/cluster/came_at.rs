@@ -135,14 +135,14 @@ impl CameAt {
     }
 
     /// The owner of the slots `start..=end` that `owners` gives it claims
-    /// them at `epoch`: each `Lower` or `Fallback` one came at that claim's
-    /// epoch, and is `Heard` from now on. Any claim of the slot by its owner
-    /// will do: the owner claims it at its config epoch, which only grows
-    /// and is at or above the epoch it took the slot at; and a claim of the
-    /// slot by the owner reaches this node only once the owner has it (its
-    /// claims of the time before do not list the slot, the slot having
-    /// another owner then). One lock for the range, none while no slot is
-    /// `Lower` or `Fallback`.
+    /// them at `epoch`: each `Lower` or `Fallback` one whose note is at or
+    /// below that epoch came at the claim's epoch, and is `Heard` from now
+    /// on. The owner claims a slot at its config epoch, which only grows and
+    /// is at or above the epoch it took the slot at. A claim below the note
+    /// changes nothing: it can be one the owner sent in an earlier stay of
+    /// the slot with it, arriving late on another connection, and the note
+    /// is a bound of this stay. One lock for the range, none while no slot
+    /// is `Lower` or `Fallback`.
     pub(crate) fn owner_claimed(
         &self,
         owners: &[Option<NodeId>],
@@ -157,7 +157,10 @@ impl CameAt {
         let mut inner = self.inner.lock();
         let end = (end as usize).min(CLUSTER_SLOTS - 1);
         for i in start as usize..=end {
-            if inner.class[i] != Class::Heard && owners[i] == Some(owner) {
+            if inner.class[i] != Class::Heard
+                && owners[i] == Some(owner)
+                && epoch >= inner.epochs[i]
+            {
                 inner.epochs[i] = epoch;
                 inner.set_class(i, Class::Heard, &self.settling);
             }
@@ -701,8 +704,8 @@ mod tests {
         assert!(!Class::Fallback.decisive());
     }
 
-    /// A `Lower` or `Fallback` note is set by the owner's own claim, to its
-    /// epoch (above or below the note), once, and only for slots of that
+    /// A `Lower` or `Fallback` note is set by the owner's own claim at or
+    /// above it, to the claim's epoch, once, and only for slots of that
     /// owner; it is `Heard` from then on; the count follows.
     #[test]
     fn a_provisional_note_is_set_by_the_owners_claim() {
@@ -723,11 +726,12 @@ mod tests {
         c.owner_claimed(&owners, a, 0, 10, 7);
         assert_eq!(
             (c.get(1), c.get(3), c.get(4)),
-            ((7, Class::Heard), (4, Class::Lower), (7, Class::Heard)),
-            "only the owner's, to its claim's epoch"
+            ((7, Class::Heard), (4, Class::Lower), (9, Class::Lower)),
+            "only the owner's, and only from a claim at or above the note"
         );
         c.owner_claimed(&owners, a, 0, 10, 12);
         assert_eq!(c.get(1), (7, Class::Heard), "once");
+        assert_eq!(c.get(4), (12, Class::Heard));
         c.set([2], 5);
         c.owner_claimed(&owners, a, 2, 2, 8);
         assert_eq!(c.get(2), (5, Class::Heard));
