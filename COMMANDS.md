@@ -387,8 +387,12 @@ reply as Redis 8 does, a map, unless `search-resp3-reply` or the client says val
 the RESP2 layout on a RESP3 connection for `FT.SEARCH` (the count, then each key and its fields as a
 flat array), `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`; `FT.HYBRID` is the count, then
 each row as a flat array, with no `warnings` or `execution_time`. The `ON_TIMEOUT` warning is not in
-it, and a KNN `WITHSCORES` gives the distance where valkey-search gives 0. `FT.PROFILE`,
+it, and a KNN `WITHSCORES` gives the distance where valkey-search gives 0. `FT.INFO` keeps a vector
+field's dimensions, metric, data type and algorithm in an `index` list there, and `FT.PROFILE` is
+the array valkey-glide converts (the search's reply, then a flat list of names and numbers).
 `FT.SPELLCHECK`, `FT.CONFIG GET`, `FT.TAGVALS` and the alias list keep the Redis shape in every mode.
+An index that does not exist is `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 says,
+and `Index with name '<name>' not found in database <n>` in that shape, as valkey-search says.
 valkey-glide, which reads nothing else, is answered in valkey-search's when it has named itself with
 `CLIENT SETINFO LIB-NAME`. The setting is per node (in a cluster, set every node alike); see
 [docs/CONFIGURATION.md](docs/CONFIGURATION.md#search-reply-shape-over-resp3). RESP2 is the same in

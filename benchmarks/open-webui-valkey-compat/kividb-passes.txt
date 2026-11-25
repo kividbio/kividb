@@ -1,0 +1,20 @@
+# The checks KiviDB passes in this harness (Open WebUI's Valkey vector store, valkey.py at the pinned commit): all 17,
+# as valkey/valkey-bundle 9.2.0 does. Redis fails every one (it has no valkey_version and 8.x is below the 9.0.1 the
+# client asks for), so the job holds KiviDB to this list (benchmarks/README.md).
+open-webui-valkey.init::ValkeyClient() passes its version and module checks
+open-webui-valkey.collection::has_collection is False for an index that does not exist
+open-webui-valkey.collection::insert creates the index and stores the items
+open-webui-valkey.collection::has_collection is True once the index exists
+open-webui-valkey.search::nearest neighbour of a stored vector is that document
+open-webui-valkey.search::filtered search keeps to the documents of one file
+open-webui-valkey.search::filtered search with $in and $ne
+open-webui-valkey.search::search of a collection that does not exist is None
+open-webui-valkey.query::query by metadata filter returns the documents and their metadata
+open-webui-valkey.get::get returns every document of the collection
+open-webui-valkey.upsert::upsert replaces a document's text
+open-webui-valkey.delete::delete by ids removes those documents
+open-webui-valkey.delete::delete by filter removes the matching documents
+open-webui-valkey.delete::a deleted document is no longer found by search
+open-webui-valkey.collection::inserting vectors of another dimension is refused
+open-webui-valkey.collection::delete_collection drops the index and its documents
+open-webui-valkey.collection::reset drops every collection of the prefix
