@@ -991,14 +991,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it likes (BullMQ's and Sidekiq's scripts are of that kind). From the first
   run of such a script, which is alone, a command on a key without a tag
   takes that key's lock, shared: it waits for a script on the key, not for
-  other commands. Once no such script has run for a minute, or with
-  `lua-parallel-scripts no`, those locks are let go of again; `INFO stats`
-  says whether they are taken (`untagged_key_locks`) and how often that was
-  switched (`untagged_key_locks_on`, `untagged_key_locks_off`). Eviction and
-  active expiry leave a key whose lock a script running beside others holds
-  until it is done. See "Scripts that keep to their keys" in
+  other commands. Every key a command names is then locked, tagged or not,
+  wherever it comes among them. Once no such script has run for a minute,
+  or with `lua-parallel-scripts tags` or `no`, those locks are let go of
+  again, at a moment the command gate can be held alone for at most 2 ms;
+  `INFO stats` says whether they are taken (`untagged_key_locks`), how often
+  that was switched (`untagged_key_locks_on`, `untagged_key_locks_off`) and
+  how often the switch off waited for a later moment
+  (`untagged_key_locks_off_later`). Eviction and active expiry leave a key
+  whose lock a script running beside others holds until it is done;
+  eviction never leaves a key because a client's command is at it. See "Scripts that keep to their keys" in
   [docs/SCRIPTS.md](docs/SCRIPTS.md); regression suite 54 records
   yii2-redis's `Mutex` cycle.
+- **`lua-parallel-scripts` takes `yes`, `tags` or `no` (#1049).** `tags`
+  runs beside others only scripts whose `KEYS` all carry a hash tag, as
+  1.2.2 does, and never locks keys without a tag; `yes` (the default) adds
+  the scripts that keep to keys without a tag; `no` runs every script
+  alone. `true` and `false` are taken for `yes` and `no`, on the command
+  line, in the config file and by `CONFIG SET`; `CONFIG REWRITE` writes the
+  value set at run time. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 - **In a build with Lua, a command takes the lock of each tagged key it
   names whatever `lua-parallel-scripts` says (#1049).** The setting decides
   whether scripts run beside others; a script that started under the other

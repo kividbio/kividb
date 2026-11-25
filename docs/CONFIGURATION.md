@@ -117,6 +117,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+| `--lua-parallel-scripts <yes\|tags\|no>` | `yes` | Which scripts run beside other commands, in a build with Lua: `yes` a script whose `KEYS` all carry a hash tag, under its tags' locks, and a script that keeps to `KEYS` none of which has a tag, under those keys' locks; `tags` only the first kind, as 1.2.2 does; `no` none, every script alone, as in Redis. `true` and `false` are taken for `yes` and `no`. Changeable with `CONFIG SET`, written by `CONFIG REWRITE`. See [Scripts](SCRIPTS.md) |
 
 `DEBUG` is refused by default from 1.3.0, as in Redis 7 and later: `enable-debug-command`
 is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server

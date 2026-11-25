@@ -115,7 +115,7 @@ with or without the setting below.
 
 ```
 lua-parallel-scripts no           # in the configuration file
---lua-parallel-scripts false      # on the command line
+--lua-parallel-scripts no         # on the command line (`false` too)
 CONFIG SET lua-parallel-scripts no
 ```
 
@@ -130,6 +130,28 @@ has.
 Up to 1.0.5 this was the only way. Switch the setting off if a script that
 declares keys of one hash tag also touches a key outside it: see "What to
 know" below.
+
+In a build with Lua a command from a client takes the lock of each tagged
+key it names whatever the value, `no` included: a script that started under
+another value before a `CONFIG SET` may still be running, and finds the
+keys it holds locked all the same. On a key without a tag that costs a
+command one load more; on a tagged key, the lock.
+
+## With `lua-parallel-scripts tags`
+
+```
+lua-parallel-scripts tags         # in the configuration file
+--lua-parallel-scripts tags       # on the command line
+CONFIG SET lua-parallel-scripts tags
+```
+
+A script whose `KEYS` all carry a hash tag runs beside others under its
+tags' locks, as with `yes` below. Every other script runs alone, a script
+that keeps to keys without a tag among them, and keys without a tag are
+never locked. This is how 1.2.2 runs scripts. It is for a server whose
+commands on keys without a tag should not pay for those keys' locks (see
+"What `yes` costs other commands" below) and whose scripts on such keys are
+few.
 
 ## With `lua-parallel-scripts yes` (the default)
 
@@ -341,8 +363,9 @@ master could have run them one after another.
 
 ### Scripts that keep to their keys
 
-A script whose `KEYS` all lack a hash tag runs beside others too, held to
-its keys as a tagged script is held to its tags, when it is sent by `EVAL`
+With `lua-parallel-scripts yes` (the default), a script whose `KEYS` all
+lack a hash tag runs beside others too, held to its keys as a tagged script
+is held to its tags, when it is sent by `EVAL`
 or `EVALSHA` (not their `_RO` forms) and its source shows that it keeps to
 them. That is read from the script's text before it runs (once per thread
 and script), and holds when:
@@ -392,22 +415,53 @@ runs, before it starts, never part-way through.
 Such a script's keys are locked as tags are: each key stands for its own
 tag. A command from a client on one of them waits for the script, as a
 command on a script's tag does, and a script of the same key waits for it.
-These locks are taken shared by everything but such a script: commands,
-active expiry and eviction wait for a script on the key, not for each
-other. Eviction and active expiry leave a key a script holds until the
-script is done.
+These locks are taken shared by everything but such a script: commands and
+active expiry wait for a script on the key, not for each other. Eviction
+and active expiry leave a key a script holds until the script is done;
+eviction never leaves a key because a client's command is at it.
 
 So that a command on a key without a tag finds it locked when it needs to,
-commands lock keys without a tag too from the first run of such a script on.
-That run is alone, and it switches the locks on with every other command
-held back; a command asks whether to lock its keys only once it is in the
-command gate, so every command after the switch finds it made. Until then a
-command on a key without a tag makes one load more. Once no such script has
-run for a minute, or once `lua-parallel-scripts` is switched off, the next
-moment the gate is held alone and no script is running beside others, the
-locks are let go of again; `INFO stats` says whether they are taken
-(`untagged_key_locks:1`) and how many times they were switched on
-(`untagged_key_locks_on`) and off (`untagged_key_locks_off`).
+commands lock keys without a tag too from the first run of such a script on:
+every key a command names, tagged or not, wherever it comes among them
+(`MGET a b {t}:c` locks `a`, `b` and the tag `t`). That run is alone, and it
+switches the locks on with every other command held back; a command asks
+whether to lock its keys only once it is in the command gate, so every
+command after the switch finds it made. Until then a command on a key
+without a tag makes one load more. Once no such script has run for a
+minute, or once `lua-parallel-scripts` is set to `tags` or `no`, the locks
+are let go of again, at a moment the command gate can be held alone and no
+such script is running beside others: scripts on tagged keys running
+beside others do not hold that back. A thread looks for that moment every
+15 seconds; it tries for the gate for 2 ms at most, and does not try while
+clients are paused (`CLIENT PAUSE`) or a slot handoff holds writes, so it
+never holds commands back for longer than that. `INFO stats` says whether
+the locks are taken (`untagged_key_locks:1`), how many times they were
+switched on (`untagged_key_locks_on`) and off (`untagged_key_locks_off`),
+and how many times the switch off was left for later because the gate was
+busy (`untagged_key_locks_off_later`).
+
+#### What `yes` costs other commands
+
+While keys without a tag are locked, a command on such keys takes their
+locks, shared, as a command on a tagged key takes its tag's; with them not
+locked it makes one load more, and counts within a few instructions of what
+it did before #1049 (`scripts/perf/run.sh`). Measured on 2026-11-26 on the
+machine of the table below (the server pinned to 4 vCPUs, `--threads 4`;
+redis-benchmark on the other 4: 48 connections, pipelines of 16, random keys
+of 100,000; commands a second by the server's own count over 6 s, the
+median of 3 rounds with the servers in turn):
+
+| commands a second | `GET` | `SET` | `MGET` of 10 | `MGET` of 100 | `MSET` of 10 |
+|---|---:|---:|---:|---:|---:|
+| before #1049 | 3.44M | 2.83M | 969k | 105k | 609k |
+| `yes`, keys without a tag not locked | 3.36M | 2.81M | 973k | 105k | 611k |
+| `yes`, keys without a tag locked | 3.09M | 2.67M | 900k | 107k | 588k |
+| `tags` | 3.32M | 2.78M | 967k | 103k | 607k |
+
+So the locks cost a pipelined `GET` about a tenth, a `SET` or an `MGET` of 10
+6 to 7 %, for as long as they are on: from a script that keeps to its keys
+until a minute after the last one. A server where such scripts never run,
+or that runs with `tags`, never pays it.
 
 In a build with Lua a command takes the lock of each tagged key it names
 whatever `lua-parallel-scripts` says. The setting decides whether a script
@@ -424,13 +478,14 @@ the servers in turn (median):
 
 | | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
 |---|---:|---:|---:|
-| releases beside others (#1049) | 293,700 | 103 / 272 | 98 / 264 |
-| releases alone (before #1049) | 159,900 | 203 / 428 | 184 / 392 |
-| Redis 8.12 | 210,100 | 148 / 284 | 143 / 279 |
-| Valkey 8.1 | 235,500 | 129 / 279 | 131 / 280 |
+| releases beside others (#1049) | 299,600 | 101 / 260 | 96 / 254 |
+| releases alone (before #1049) | 163,700 | 198 / 421 | 180 / 386 |
+| Redis 8.12 | 212,400 | 146 / 281 | 141 / 277 |
+| Valkey 8.1 | 235,400 | 129 / 280 | 131 / 282 |
 
 Run alone, each release held the other commands back around it, and the
-four worker threads were 70 % busy; beside each other, they were at 99 %.
+four worker threads were 70 to 76 % busy; beside each other, they were at
+99 %.
 
 ### What to know
 
