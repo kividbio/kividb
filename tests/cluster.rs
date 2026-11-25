@@ -12242,8 +12242,7 @@ fn a_source_restarted_after_a_handover_refuses_a_replica_that_claims_the_slots_a
 /// only, with the votes of the others. D, back, owns the slots with every
 /// write, S's included.
 #[test]
-fn a_refusal_from_a_master_that_saw_the_slots_come_back_gives_them_up_whatever_the_others_grant()
- {
+fn a_refusal_from_a_master_that_saw_the_slots_come_back_gives_them_up_whatever_the_others_grant() {
     let (mut nodes, ranges) = form_cluster_of(vec![
         Node::start(&[]),
         Node::start(&["--appendonly", "yes"]),
@@ -12414,7 +12413,9 @@ fn a_replica_gives_up_slots_that_refusals_leave_no_quorum_for_among_the_masters_
     nodes[1].kill();
     let given_up = format!("{a}-{b} given up");
     assert!(
-        wait_until_or(Duration::from_secs(60), || replica.log().contains(&given_up)),
+        wait_until_or(Duration::from_secs(60), || replica
+            .log()
+            .contains(&given_up)),
         "the replica is to give D's slots up\n{}",
         replica.log()
     );
@@ -12428,17 +12429,17 @@ fn a_replica_gives_up_slots_that_refusals_leave_no_quorum_for_among_the_masters_
     }
     nodes[4].spawn();
     nodes[1].spawn();
-    wait_until(
-        "D, back, to own its slots",
-        Duration::from_secs(60),
-        || {
-            nodes
-                .iter()
-                .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
-        },
-    );
+    wait_until("D, back, to own its slots", Duration::from_secs(60), || {
+        nodes
+            .iter()
+            .all(|n| owner_in_view_of(n, a).as_deref() == Some(dst_id.as_str()))
+    });
     let absent = written.missing_on(&nodes[1]);
-    assert!(absent.is_empty(), "{} writes not on the owner", absent.len());
+    assert!(
+        absent.is_empty(),
+        "{} writes not on the owner",
+        absent.len()
+    );
 }
 
 /// A source killed while it waited to know whether the destination took

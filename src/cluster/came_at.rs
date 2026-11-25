@@ -562,9 +562,9 @@ impl ClusterState {
                 .iter()
                 .filter(|id| {
                     **id != master
-                        && nodes
-                            .get(id)
-                            .is_some_and(|n| !n.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL))
+                        && nodes.get(*id).is_some_and(|n| {
+                            !n.flags.intersects(NodeFlags::PFAIL | NodeFlags::FAIL)
+                        })
                 })
                 .count()
         };
