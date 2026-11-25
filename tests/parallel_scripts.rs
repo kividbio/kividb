@@ -3267,8 +3267,8 @@ fn half_scripts_and_readers(port: u16, clients: usize, readers: usize, secs: f64
 }
 
 /// While scripts on keys without a tag run beside others and readers read
-/// those keys, another connection switches `lua-parallel-scripts` off and on
-/// again and again: no read finds a script half done, whichever way each
+/// those keys, another connection switches `lua-parallel-scripts` between
+/// `yes`, `tags` and `no`, from each to each, again and again: no read finds a script half done, whichever way each
 /// script was decided before the command gate. The first switch of keys
 /// without a tag is made with the readers already queued at the gate. On
 /// both I/O loops.
@@ -3294,8 +3294,10 @@ fn setting_flips_under_load(io: &str) {
             // without a tag comes with commands at the gate.
             std::thread::sleep(Duration::from_millis(500));
             let mut flips = 0u64;
+            // Every value to every other: yes, no, tags, yes, tags, no.
+            let values = ["no", "tags", "yes", "tags", "no", "yes"];
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let to = if flips.is_multiple_of(2) { "no" } else { "yes" };
+                let to = values[flips as usize % values.len()];
                 assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", to]).ok());
                 flips += 1;
                 std::thread::sleep(Duration::from_millis(3));
@@ -3818,5 +3820,357 @@ fn a_migrate_of_a_key_scripts_check_and_set_loses_no_set() {
         ca.cmd(&["GET", "moved"]),
         V::Str(took.to_string()),
         "a set was lost"
+    );
+}
+
+/// `clients` connections running `HALF` on keys `h0`..`h3` beside others,
+/// and `readers` connections sending `read` (keys without a tag before or
+/// after a tagged one) for `secs`: how many replies found a script half
+/// done (must be 0) and how many scripts ran.
+fn half_scripts_and(
+    port: u16,
+    clients: usize,
+    readers: usize,
+    secs: f64,
+    read: &'static [&'static str],
+) -> (u64, u64) {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..clients)
+        .map(|client| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut ran = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let key = format!("h{}", (client + ran as usize) % 4);
+                    let value = format!("c{client}.{ran}");
+                    assert_eq!(c.cmd(&["EVAL", HALF, "1", &key, "300", &value]), V::Int(1));
+                    ran += 1;
+                }
+                ran
+            })
+        })
+        .collect();
+    let readers: Vec<_> = (0..readers)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut half = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let V::Arr(got) = c.cmd(read) else {
+                        panic!("{read:?}")
+                    };
+                    half += got.iter().filter(|v| **v == V::Str("tmp".into())).count() as u64;
+                }
+                half
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_secs_f64(secs));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    let half = readers.into_iter().map(|r| r.join().unwrap()).sum();
+    (half, ran)
+}
+
+/// A reader whose keys without a tag come before a tagged one (`MGET h0 h1
+/// h2 h3 {t}:x`) never finds a script that keeps to those keys half done
+/// beside it: once keys without a tag are locked, every key a command names
+/// is, from its first. Nor does one with the tagged key first.
+#[test]
+fn a_reader_naming_keys_before_a_tagged_one_never_sees_a_script_half_done() {
+    let server = Server::start(&[KEEP_FAST]);
+    let mut c = server.conn();
+    until_beside_others(&mut c, &["EVAL", HALF, "1", "h0", "300", "v"], &mut |_| {});
+    for read in [
+        &["MGET", "h0", "h1", "h2", "h3", "{t}:x"][..],
+        &["MGET", "{t}:x", "h0", "h1", "h2", "h3"][..],
+    ] {
+        let before = stat(&mut c, "scripts_run_beside_others");
+        let (half, ran) = half_scripts_and(server.port, 6, 4, 2.0, read);
+        let beside = stat(&mut c, "scripts_run_beside_others") - before;
+        eprintln!("{read:?}: {ran} scripts, {beside} beside others");
+        assert_eq!(half, 0, "{read:?} found a script half done");
+        assert!(beside > 0);
+    }
+}
+
+/// Keys without a tag stop being locked after the quiet time while scripts
+/// on tagged keys keep running beside others: only scripts under their keys'
+/// locks hold the switch off back.
+#[test]
+fn keys_stop_being_locked_while_tagged_scripts_keep_running() {
+    let server = Server::start(&[KEEP_FAST, "@env:KIVIDB_TEST_KEY_LOCKS_QUIET_MS=300"]);
+    let mut c = server.conn();
+    until_beside_others(
+        &mut c,
+        &["EVAL", SETS_A_KEY_DIRECT, "1", "q", "v"],
+        &mut |_| {},
+    );
+    until_tagged_beside_others(&mut c, &["EVAL", SETS_A_KEY_DIRECT, "1", "{t}:q", "v"]);
+    let port = server.port;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let tagged: Vec<_> = (0..8)
+        .map(|client| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let key = format!("{{t{client}}}:q");
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    assert!(c.cmd(&["EVAL", SETS_A_KEY_DIRECT, "1", &key, "v"]).ok());
+                }
+            })
+        })
+        .collect();
+    let before = stat(&mut c, "scripts_run_beside_others");
+    wait_until("the key locks to be switched off", 10, || {
+        c.info("stats", "untagged_key_locks") == "0"
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for t in tagged {
+        t.join().unwrap();
+    }
+    assert!(stat(&mut c, "scripts_run_beside_others") > before + 100);
+}
+
+/// The longest any of `n` connections waited for a `GET` of a key without a
+/// tag while `during` ran, but for the connection that waited longest: one
+/// on the thread a long script holds waits for it whatever the gate does.
+fn get_waits_during(port: u16, n: usize, during: impl FnOnce()) -> Duration {
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let getters: Vec<_> = (0..n)
+        .map(|_| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut longest = Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let (_, took) = timed(|| c.cmd(&["GET", "plain"]));
+                    longest = longest.max(took);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                longest
+            })
+        })
+        .collect();
+    during();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut waits: Vec<Duration> = getters.into_iter().map(|g| g.join().unwrap()).collect();
+    waits.sort();
+    waits[waits.len() - 2]
+}
+
+/// The switch of keys without a tag off does not wait for the command gate
+/// while a script beside others holds it for long (here 1.5 s, on a tagged
+/// key): it tries for a moment, leaves it for the next round, and commands
+/// on the other threads go on meanwhile. Once the script has ended the keys
+/// stop being locked.
+#[test]
+fn switching_key_locks_off_does_not_wait_for_a_long_script() {
+    let server = Server::start(&[
+        KEEP_FAST,
+        "@env:KIVIDB_TEST_KEY_LOCKS_QUIET_MS=300",
+        "@env:KIVIDB_TEST_SCRIPT_STALL_MS=1500",
+    ]);
+    let mut c = server.conn();
+    let held = "redis.call('SET', KEYS[1], 'x') redis.call('ECHO', ARGV[1]) return 1";
+    until_tagged_beside_others(&mut c, &["EVAL", held, "1", "{s}:k", "no-stall"]);
+    until_beside_others(
+        &mut c,
+        &["EVAL", SETS_A_KEY_DIRECT, "1", "q", "v"],
+        &mut |_| {},
+    );
+    assert_eq!(c.info("stats", "untagged_key_locks"), "1");
+    let port = server.port;
+    let stall = server.dir.join("script-stall.held");
+    let longest = get_waits_during(port, 6, || {
+        let script = std::thread::spawn(move || {
+            Conn::connect(port).cmd(&["EVAL", held, "1", "{s}:k", "script-stall:1"])
+        });
+        wait_until("the script to be held", 10, || stall.exists());
+        // The quiet time passes while the script is held.
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(c.info("stats", "untagged_key_locks"), "1");
+        assert_eq!(script.join().unwrap(), V::Int(1));
+    });
+    assert!(stat(&mut c, "untagged_key_locks_off_later") > 0);
+    assert!(
+        longest < Duration::from_millis(400),
+        "a GET waited {longest:?}"
+    );
+    wait_until("the key locks to be switched off", 10, || {
+        c.info("stats", "untagged_key_locks") == "0"
+    });
+}
+
+/// Nor while clients are paused: the switch waits for the pause to end,
+/// reads go on during it, and the keys stop being locked after it.
+#[test]
+fn switching_key_locks_off_waits_out_a_client_pause() {
+    let server = Server::start(&[KEEP_FAST, "@env:KIVIDB_TEST_KEY_LOCKS_QUIET_MS=300"]);
+    let mut c = server.conn();
+    until_beside_others(
+        &mut c,
+        &["EVAL", SETS_A_KEY_DIRECT, "1", "q", "v"],
+        &mut |_| {},
+    );
+    let port = server.port;
+    let longest = get_waits_during(port, 6, || {
+        assert!(c.cmd(&["CLIENT", "PAUSE", "1500", "WRITE"]).ok());
+        let write = std::thread::spawn(move || Conn::connect(port).cmd(&["SET", "w", "1"]));
+        std::thread::sleep(Duration::from_millis(1000));
+        assert_eq!(c.info("stats", "untagged_key_locks"), "1");
+        assert!(write.join().unwrap().ok());
+    });
+    assert!(
+        longest < Duration::from_millis(400),
+        "a GET waited {longest:?}"
+    );
+    wait_until("the key locks to be switched off", 10, || {
+        c.info("stats", "untagged_key_locks") == "0"
+    });
+}
+
+/// Runs `args`, a script on tagged keys, until a run of it is counted
+/// beside others: its first runs are on the pool, until it is seen to be
+/// quick.
+fn until_tagged_beside_others(c: &mut Conn, args: &[&str]) {
+    for _ in 0..30 {
+        let counted = moved(c, |c| {
+            c.cmd(args);
+        });
+        if counted == one(&["scripts_run_beside_others"]) {
+            return;
+        }
+    }
+    panic!("{args:?} never ran beside others");
+}
+
+/// A writer on one tag fills a server at its `maxmemory` while another
+/// connection reads a long list of that tag again and again, holding the
+/// tag's lock most of the time: eviction makes room under the writer as it
+/// does with nobody at the tag, though every key it may evict is of that
+/// tag. A client's command at a key is no reason to leave it.
+#[test]
+fn eviction_is_not_held_back_by_a_command_at_the_tag() {
+    let server = Server::start(&[
+        "--maxmemory",
+        "16mb",
+        "--maxmemory-policy",
+        "volatile-random",
+    ]);
+    let mut c = server.conn();
+    let items: Vec<String> = (0..2000).map(|n| format!("item{n}")).collect();
+    for _ in 0..50 {
+        let mut push = vec!["RPUSH", "{hot}:big"];
+        push.extend(items.iter().map(String::as_str));
+        assert!(matches!(c.cmd(&push), V::Int(_)));
+    }
+    let port = server.port;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let mut c = Conn::connect(port);
+            let mut reads = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                assert!(matches!(
+                    c.cmd(&["LRANGE", "{hot}:big", "0", "-1"]),
+                    V::Arr(_)
+                ));
+                reads += 1;
+            }
+            reads
+        })
+    };
+    let value = "x".repeat(2000);
+    let mut refused = 0;
+    for n in 0..12_000 {
+        match c.cmd(&["SET", &format!("{{hot}}:{n}"), &value, "EX", "1000"]) {
+            reply if reply.ok() => {}
+            V::Err(e) if e.starts_with("OOM") => refused += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let reads = reader.join().unwrap();
+    let evicted = stat(&mut c, "evicted_keys");
+    eprintln!("{reads} reads of the list, {evicted} evicted, {refused} refused");
+    assert_eq!(refused, 0, "writes refused for want of room");
+    assert!(evicted > 1000 && reads > 0);
+}
+
+/// A key a script beside others holds is not evicted while it runs, however
+/// much eviction there is meanwhile: the script reads back what it wrote.
+#[test]
+fn a_key_a_script_holds_is_not_evicted() {
+    let server = Server::start(&[
+        KEEP_FAST,
+        "@env:KIVIDB_TEST_SCRIPT_STALL_MS=1500",
+        "--maxmemory",
+        "16mb",
+        "--maxmemory-policy",
+        "allkeys-random",
+    ]);
+    let mut c = server.conn();
+    let held = "redis.call('SET', KEYS[1], 'mine') redis.call('ECHO', ARGV[1]) \
+                return redis.call('GET', KEYS[1])";
+    until_tagged_beside_others(&mut c, &["EVAL", held, "1", "{s}:k", "no-stall"]);
+    let port = server.port;
+    let stall = server.dir.join("script-stall.held");
+    let script = std::thread::spawn(move || {
+        Conn::connect(port).cmd(&["EVAL", held, "1", "{s}:k", "script-stall:1"])
+    });
+    wait_until("the script to be held", 10, || stall.exists());
+    let value = "x".repeat(10_000);
+    let before = stat(&mut c, "evicted_keys");
+    let mut n = 0u64;
+    while stall.exists() {
+        let reply = c.cmd(&["SET", &format!("fill:{n}"), &value]);
+        assert!(reply.ok(), "{reply:?}");
+        n += 1;
+    }
+    assert_eq!(script.join().unwrap(), V::Str("mine".into()));
+    assert!(stat(&mut c, "evicted_keys") > before + 100);
+}
+
+/// `lua-parallel-scripts tags`: a script on tagged keys runs beside others,
+/// one that keeps to keys without a tag runs alone, and keys without a tag
+/// are never locked. Switched to `yes`, the second kind runs beside others
+/// too; back to `tags`, alone again, and the keys stop being locked.
+#[test]
+fn with_tags_only_scripts_on_tagged_keys_run_beside_others() {
+    let server = Server::start(&[KEEP_FAST, "--lua-parallel-scripts", "tags"]);
+    let mut c = server.conn();
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "lua-parallel-scripts"]),
+        V::Arr(vec![
+            V::Str("lua-parallel-scripts".into()),
+            V::Str("tags".into())
+        ])
+    );
+    let keys_only = ["EVAL", SETS_A_KEY_DIRECT, "1", "q", "v"];
+    until_tagged_beside_others(&mut c, &["EVAL", SETS_A_KEY_DIRECT, "1", "{t}:q", "v"]);
+    for _ in 0..5 {
+        assert!(runs_alone_no_tag(&mut c, &keys_only));
+    }
+    assert_eq!(c.info("stats", "untagged_key_locks"), "0");
+    assert_eq!(stat(&mut c, "untagged_key_locks_on"), 0);
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+            .ok()
+    );
+    until_beside_others(&mut c, &keys_only, &mut |_| {});
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "tags"])
+            .ok()
+    );
+    assert_eq!(c.info("stats", "untagged_key_locks"), "0");
+    assert!(runs_alone_no_tag(&mut c, &keys_only));
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "maybe"])
+            .is_err()
     );
 }

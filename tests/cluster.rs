@@ -20392,3 +20392,88 @@ fn search_replies_over_resp3_take_the_clients_shape() {
     let two = search(&mut nodes[0].conn());
     assert_eq!(valkey_keys(&two), expected);
 }
+
+/// While keys without a tag are locked (a script that keeps to its keys has
+/// run) and an atomic slot migration's handoff holds writes for 1.5 s (the
+/// destination's `TAKEOVER` waits), the quiet time passes: the switch of
+/// those locks off waits for the handoff to end, reads of a slot that stays
+/// are answered meanwhile, and the keys stop being locked after it.
+#[cfg(feature = "lua")]
+#[test]
+fn switching_key_locks_off_waits_out_a_slot_handoff() {
+    let (nodes, ranges) = form_cluster_of(vec![
+        Node::start_with_env(
+            &[],
+            &[
+                ("KIVIDB_TEST_KEEP_FAST_SCRIPTS", "1"),
+                ("KIVIDB_TEST_KEY_LOCKS_QUIET_MS", "300"),
+            ],
+        ),
+        Node::start_with_env(&[], &[("KIVIDB_TEST_TAKEOVER_DELAY_MS", "1500")]),
+    ]);
+    let (src, dst) = (&nodes[0], &nodes[1]);
+    let mut c = src.conn();
+    let r = c.cmd(&[
+        "CONFIG",
+        "SET",
+        "cluster-slot-migration-write-pause-timeout",
+        "10000",
+    ]);
+    assert!(r.is_ok(), "{r:?}");
+    let staying = key_in(1001..=ranges[0].1, "keys");
+    let moving = key_in(0..=1000, "moving");
+    assert!(c.cmd(&["SET", &moving, "1"]).is_ok());
+    let locked = |c: &mut Conn| {
+        info_field(&c.cmd(&["INFO", "stats"]).text(), "untagged_key_locks").as_deref() == Some("1")
+    };
+    for _ in 0..30 {
+        let r = c.cmd(&[
+            "EVAL",
+            "return redis.call('SET', KEYS[1], ARGV[1])",
+            "1",
+            &staying,
+            "v",
+        ]);
+        assert!(r.is_ok(), "{r:?}");
+        if locked(&mut c) {
+            break;
+        }
+    }
+    assert!(locked(&mut c), "keys without a tag were never locked");
+    let port = src.port;
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let getters: Vec<_> = (0..6)
+        .map(|_| {
+            let stop = stop.clone();
+            let key = staying.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let mut longest = Duration::ZERO;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let started = Instant::now();
+                    let _ = c.cmd(&["GET", &key]);
+                    longest = longest.max(started.elapsed());
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                longest
+            })
+        })
+        .collect();
+    let task_id = dst
+        .conn()
+        .cmd(&["CLUSTER", "MIGRATION", "IMPORT", "0", "1000"])
+        .text();
+    wait_import_completed(dst, &task_id);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let mut waits: Vec<Duration> = getters.into_iter().map(|g| g.join().unwrap()).collect();
+    waits.sort();
+    assert!(
+        waits[waits.len() - 2] < Duration::from_millis(400),
+        "GETs of a slot that stays waited {waits:?}"
+    );
+    wait_until(
+        "the key locks to be switched off",
+        Duration::from_secs(10),
+        || !locked(&mut c),
+    );
+}

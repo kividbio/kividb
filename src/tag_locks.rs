@@ -92,12 +92,19 @@ use parking_lot::{RwLock, RwLockWriteGuard};
 use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 #[cfg(feature = "lua")]
+use std::sync::atomic::AtomicBool;
+#[cfg(feature = "lua")]
 use std::sync::atomic::AtomicU64;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-/// `lua-parallel-scripts`: whether scripts may run beside others.
-static PARALLEL: AtomicBool = AtomicBool::new(false);
+/// `lua-parallel-scripts`: which scripts may run beside others, as
+/// [`NO`], [`TAGS`] or [`YES`].
+static PARALLEL: AtomicU8 = AtomicU8::new(NO);
+
+const NO: u8 = 0;
+const TAGS: u8 = 1;
+const YES: u8 = 2;
 
 /// Whether a client's command locks the hash tags of the keys it names (and,
 /// once those are locked, its keys without one): always in a build with Lua,
@@ -114,7 +121,7 @@ pub fn enabled() -> bool {
     }
     #[cfg(not(feature = "lua"))]
     {
-        PARALLEL.load(Ordering::Relaxed)
+        PARALLEL.load(Ordering::Relaxed) != NO
     }
 }
 
@@ -126,7 +133,25 @@ pub fn enabled() -> bool {
 /// value. `SeqCst`, as the count is.
 #[inline]
 pub fn parallel_scripts() -> bool {
-    PARALLEL.load(Ordering::SeqCst)
+    PARALLEL.load(Ordering::SeqCst) != NO
+}
+
+/// Whether a script that keeps to its keys, none of which has a tag, may
+/// run beside others under its keys' locks: `lua-parallel-scripts yes`.
+/// Read as [`parallel_scripts`] is.
+#[cfg(feature = "lua")]
+#[inline]
+fn keys_beside() -> bool {
+    PARALLEL.load(Ordering::SeqCst) == YES
+}
+
+/// `lua-parallel-scripts`, for `CONFIG GET`.
+pub fn mode() -> crate::config::ParallelScripts {
+    match PARALLEL.load(Ordering::SeqCst) {
+        NO => crate::config::ParallelScripts::No,
+        TAGS => crate::config::ParallelScripts::Tags,
+        _ => crate::config::ParallelScripts::Yes,
+    }
 }
 
 /// `CONFIG SET lua-parallel-scripts` and the same at startup. `CONFIG SET`
@@ -134,15 +159,30 @@ pub fn parallel_scripts() -> bool {
 /// the old setting before the gate may still run after it: a script that
 /// runs beside others then finds the tags of its keys locked by every
 /// command all the same ([`enabled`]), and keys without a tag stay locked
-/// until no script runs beside others ([`try_clear_untagged`], tried here
-/// and again later). In a build without Lua it switches the locks of tags,
-/// as it always has; keys without a tag are never locked there.
-pub fn set_enabled(on: bool) {
-    PARALLEL.store(on, Ordering::SeqCst);
+/// until no script that keeps to such keys runs beside others
+/// ([`try_clear_untagged`], tried here and again later). In a build without
+/// Lua it switches the locks of tags (`tags` and `yes` alike), as it always
+/// has; keys without a tag are never locked there.
+pub fn set_mode(mode: crate::config::ParallelScripts) {
+    let value = match mode {
+        crate::config::ParallelScripts::No => NO,
+        crate::config::ParallelScripts::Tags => TAGS,
+        crate::config::ParallelScripts::Yes => YES,
+    };
+    PARALLEL.store(value, Ordering::SeqCst);
     #[cfg(feature = "lua")]
-    if !on && crate::command_gate::alone_on_this_thread() {
+    if value != YES && crate::command_gate::alone_on_this_thread() {
         try_clear_untagged();
     }
+}
+
+/// [`set_mode`]: `yes` or `no`.
+pub fn set_enabled(on: bool) {
+    set_mode(if on {
+        crate::config::ParallelScripts::Yes
+    } else {
+        crate::config::ParallelScripts::No
+    });
 }
 
 /// Keys without a hash tag are locked too, each as its own tag: from the
@@ -153,6 +193,39 @@ pub fn set_enabled(on: bool) {
 /// command gate held alone.
 #[cfg(feature = "lua")]
 static UNTAGGED: AtomicBool = AtomicBool::new(false);
+
+/// How many scripts under their keys' locks ([`ScriptTags::Key`],
+/// [`ScriptTags::Keys`]) run beside others, or are about to: see
+/// [`try_clear_untagged`].
+#[cfg(feature = "lua")]
+static KEYS_ONLY_BESIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held by a script under its keys' locks that runs beside others, from
+/// before it reads whether keys are locked ([`whole_keys`], again inside the
+/// command) until it has run: counted in [`KEYS_ONLY_BESIDE`].
+#[cfg(feature = "lua")]
+pub struct KeysOnlyBeside(());
+
+#[cfg(feature = "lua")]
+impl Drop for KeysOnlyBeside {
+    #[inline]
+    fn drop(&mut self) {
+        KEYS_ONLY_BESIDE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// For a script about to run beside others (`lua_vm_blocking`): counted in
+/// [`KEYS_ONLY_BESIDE`] if it is to run under its keys' locks, before the
+/// command reads again whether keys are locked. Nothing for one under its
+/// tags' locks.
+#[cfg(feature = "lua")]
+#[inline]
+pub fn count_keys_only(tags: &ScriptTags) -> Option<KeysOnlyBeside> {
+    tags.whole_keys().then(|| {
+        KEYS_ONLY_BESIDE.fetch_add(1, Ordering::SeqCst);
+        KeysOnlyBeside(())
+    })
+}
 
 /// Times [`UNTAGGED`] was switched on, and off, for `INFO`.
 #[cfg(feature = "lua")]
@@ -253,9 +326,7 @@ fn lock_id(key: &[u8], untagged: bool) -> Option<usize> {
 #[cold]
 #[inline(never)]
 pub fn lock_untagged_keys_for(cmd: &[&[u8]]) {
-    if crate::expiry::replaying()
-        || !crate::command_gate::alone_on_this_thread()
-        || !parallel_scripts()
+    if crate::expiry::replaying() || !crate::command_gate::alone_on_this_thread() || !keys_beside()
     {
         return;
     }
@@ -277,11 +348,13 @@ pub fn lock_untagged_keys_for(cmd: &[&[u8]]) {
 }
 
 /// With the command gate held alone: keys without a tag stop being locked,
-/// unless a script runs beside others, or is counted to (it may have read
-/// that they are). Which of the two the script sees is settled by the order
-/// of two steps on each side, all `SeqCst`: this clears the switch and then
-/// reads the count; a script is counted ([`run_beside_others`]) and then
-/// reads the switch ([`whole_keys`]). Either this sees the script, and puts
+/// unless a script under its keys' locks runs beside others, or is counted
+/// to (it may have read that they are): [`KEYS_ONLY_BESIDE`], which scripts
+/// under their tags' locks are not counted in, so that a stream of those
+/// does not keep keys locked. Which of the two the script sees is settled by
+/// the order of two steps on each side, all `SeqCst`: this clears the switch
+/// and then reads the count; a script is counted ([`count_keys_only`]) and
+/// then reads the switch ([`whole_keys`]). Either this sees the script, and puts
 /// the switch back, or the script sees the switch off, and runs alone. No
 /// client's command is in the gate meanwhile, and each one after it reads
 /// the switch as it is then. True if keys without a tag are not locked now.
@@ -291,7 +364,7 @@ fn try_clear_untagged() -> bool {
         return true;
     }
     UNTAGGED.store(false, Ordering::SeqCst);
-    if BESIDE.load(Ordering::SeqCst) != 0 {
+    if KEYS_ONLY_BESIDE.load(Ordering::SeqCst) != 0 {
         UNTAGGED.store(true, Ordering::SeqCst);
         return false;
     }
@@ -321,16 +394,27 @@ fn clear_untagged_if_quiet() {
     }
     let quiet = now_ms().saturating_sub(LAST_KEYS_ONLY.load(Ordering::Relaxed))
         >= quiet_for().as_millis() as u64;
-    if quiet || !parallel_scripts() {
+    if quiet || !keys_beside() {
         try_clear_untagged();
     }
 }
+
+/// How long [`watch_for_quiet`] tries for the command gate alone in a round,
+/// at most, before it leaves it for the next round.
+#[cfg(feature = "lua")]
+const WATCH_TRY: Duration = Duration::from_millis(2);
 
 /// A thread that, while keys without a tag are locked and no script that
 /// keeps to its keys has run for [`quiet_for`], holds the command gate
 /// alone for a moment to stop locking them ([`maybe_clear_untagged`]), so
 /// that a server where such scripts ran once does not lock every command's
 /// keys for good. Started once, with the first switch.
+///
+/// It never waits long for the gate: it tries for [`WATCH_TRY`] at most and,
+/// if something holds the gate longer (a script, a long command), leaves it
+/// for the next round. Nor does it try while clients are paused or a
+/// handoff pauses writes: the commands held back then are in the gate or
+/// waiting to get in, and the round after the pause does it.
 #[cfg(feature = "lua")]
 fn watch_for_quiet() {
     static STARTED_WATCH: std::sync::Once = std::sync::Once::new();
@@ -346,25 +430,43 @@ fn watch_for_quiet() {
                         continue;
                     }
                     let since = now_ms().saturating_sub(LAST_KEYS_ONLY.load(Ordering::Relaxed));
-                    if since < quiet_for().as_millis() as u64 && parallel_scripts() {
+                    if since < quiet_for().as_millis() as u64 && keys_beside() {
                         continue;
                     }
-                    let _alone = crate::command_gate::enter_alone();
+                    if crate::pause::active().is_some() || crate::pause::handoff() {
+                        continue;
+                    }
+                    let until = std::time::Instant::now() + WATCH_TRY;
+                    let Some(_alone) =
+                        crate::command_gate::enter_alone_unless(Duration::from_micros(500), || {
+                            std::time::Instant::now() >= until
+                        })
+                    else {
+                        WATCH_GAVE_UP.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    };
                     maybe_clear_untagged();
                 }
             });
     });
 }
 
-/// For `INFO stats`: whether keys without a tag are locked now, and how many
-/// times that was switched on and off.
+/// Rounds of [`watch_for_quiet`] that left the gate for the next one, for
+/// `INFO`.
+#[cfg(feature = "lua")]
+static WATCH_GAVE_UP: AtomicU64 = AtomicU64::new(0);
+
+/// For `INFO stats`: whether keys without a tag are locked now, how many
+/// times that was switched on and off, and how many times the switch off
+/// was left for later because the command gate was busy.
 #[cfg(feature = "lua")]
 pub fn key_locks_info(out: &mut String) {
     out.push_str(&format!(
-        "untagged_key_locks:{}\r\nuntagged_key_locks_on:{}\r\nuntagged_key_locks_off:{}\r\n",
+        "untagged_key_locks:{}\r\nuntagged_key_locks_on:{}\r\nuntagged_key_locks_off:{}\r\nuntagged_key_locks_off_later:{}\r\n",
         u8::from(UNTAGGED.load(Ordering::Relaxed)),
         SWITCHED_ON.load(Ordering::Relaxed),
         SWITCHED_OFF.load(Ordering::Relaxed),
+        WATCH_GAVE_UP.load(Ordering::Relaxed),
     ));
 }
 
@@ -758,9 +860,11 @@ pub fn script_tags<'a>(cmd: &[&'a [u8]]) -> Option<ScriptTags<'a>> {
 #[cfg(feature = "lua")]
 #[inline(never)]
 fn whole_keys<'a>(cmd: &[&'a [u8]], keys: &[&'a [u8]]) -> Option<ScriptTags<'a>> {
-    // `SeqCst`, after the script was counted (`run_beside_others`): see
-    // `try_clear_untagged`.
+    // `SeqCst`, after the script was counted (`count_keys_only`): see
+    // `try_clear_untagged`. And not once `lua-parallel-scripts` says
+    // otherwise, so that keys stop being locked soon after.
     if !UNTAGGED.load(Ordering::SeqCst)
+        || !keys_beside()
         || keys.iter().any(|key| tag_of(key).is_some())
         || !keys_only_script_may_run_beside(cmd)
     {
@@ -1312,10 +1416,10 @@ pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
 /// has it already (`arity::fits_with_shape`, from the lookup every
 /// command makes anyway): the table is then not looked up again (#889).
 ///
-/// Once keys without a tag are locked, a command none of whose keys has a
-/// `{` is looked at again out of line ([`untagged_named_keys`]); until then
-/// that costs it one load and one branch, at the one place every such
-/// command ends.
+/// Once keys without a tag are locked, every key the command names is,
+/// from its first, tagged or not ([`untagged_named_keys`]): a key without a
+/// tag before its first tagged one too. Until then that costs a command one
+/// load and one branch.
 #[cfg(feature = "lua")]
 #[inline(always)]
 pub(crate) fn named_keys_of(
@@ -1323,11 +1427,10 @@ pub(crate) fn named_keys_of(
     name: &str,
     cmd: &[&[u8]],
 ) -> Option<NamedKeys> {
-    let found = tagged_named_keys_of(shape, name, cmd);
-    if found.is_none() && untagged_keys_locked() {
-        return untagged_named_keys(cmd);
+    if untagged_keys_locked() {
+        return untagged_named_keys(shape, name, cmd);
     }
-    found
+    tagged_named_keys_of(shape, name, cmd)
 }
 
 /// [`named_keys_of`] in a build without Lua, which locks no key without a
@@ -1385,26 +1488,26 @@ fn tagged_named_keys_of(
     None
 }
 
-/// [`named_keys_of`] for a client's command none of whose keys has a `{`,
-/// once keys without a tag are locked too: all of them, as they are
-/// ([`command_locks_untagged_keys`]). Its name and how its keys are found
-/// are worked out again here, from `cmd`, so that the command's own path
-/// keeps nothing for this.
+/// [`named_keys_of`] once keys without a tag are locked too: every key
+/// the command names, from its first, as they are
+/// ([`command_locks_untagged_keys`]). `MIGRATE` locks only its tagged keys,
+/// as before (`script_may_touch` keeps a script off a key it moves).
 #[cfg(feature = "lua")]
 #[cold]
 #[inline(never)]
-fn untagged_named_keys(cmd: &[&[u8]]) -> Option<NamedKeys> {
-    let given = cmd.first()?;
-    let mut upper = [0u8; 32];
-    let room = upper.get_mut(..given.len())?;
-    for (to, from) in room.iter_mut().zip(given.iter()) {
-        *to = from.to_ascii_uppercase();
-    }
-    let name = std::str::from_utf8(room).ok()?;
+fn untagged_named_keys(
+    shape: Option<crate::keyspec::Shape>,
+    name: &str,
+    cmd: &[&[u8]],
+) -> Option<NamedKeys> {
     if name == "MIGRATE" {
-        return None;
+        return tagged_named_keys_of(shape, name, cmd);
     }
-    let Some((first, last, step)) = crate::keyspec::regular_key_positions(name, cmd) else {
+    let regular = match shape {
+        Some(shape) => crate::keyspec::regular_positions_of(shape, cmd),
+        None => crate::keyspec::regular_key_positions(name, cmd),
+    };
+    let Some((first, last, step)) = regular else {
         return Some(NamedKeys::Other(crate::keyspec::key_positions(name, cmd)));
     };
     (first <= last).then_some(NamedKeys::Regular {
@@ -1736,37 +1839,43 @@ fn try_take_patiently(id: usize) -> bool {
     }
 }
 
-/// Held by eviction while it deletes a key: the key's lock, as a client's
-/// command holds it (see [`try_hold_for_eviction`]).
-pub struct EvictionHold(Option<usize>);
+/// Held by eviction while it deletes a key: the turn of the key's lock among
+/// scripts ([`script_turn`]), if it was free (see [`try_hold_for_eviction`]).
+pub struct EvictionHold(#[allow(dead_code)] Option<tokio::sync::MutexGuard<'static, ()>>);
 
-impl Drop for EvictionHold {
-    fn drop(&mut self) {
-        if let Some(id) = self.0 {
-            // SAFETY: taken by `try_hold_for_eviction`, and not let go of.
-            unsafe { release(id) }
-        }
-    }
-}
-
-/// For eviction, about to delete `key`: the key's lock (its tag's, or its
-/// own once keys without a tag are locked), or `None` if that is held, by a
-/// script that runs beside others or a client's command on the tag â€” the
-/// key is then left, and another chosen. Eviction makes room from inside a
-/// write, a script's `redis.call` too, where it takes no key's order: so
-/// no key a script that runs beside others holds goes from under it, and no
-/// key is evicted part way through a command on its tag. Not waited for:
-/// the writer that makes room holds the write gate.
+/// For eviction, about to delete `key`: `None` if a script that runs beside
+/// others holds the key's lock (its tag's, or its own once keys without a
+/// tag are locked), or has its turn for it ([`script_turn`]) — the key is
+/// then left, and another chosen. Otherwise the turn, held until the key
+/// has gone, so that no such script starts on it meanwhile. Eviction makes
+/// room from inside a write, a script's `redis.call` too, where it takes no
+/// key's order: so no key a script that runs beside others holds goes from
+/// under it. A client's command on the key's tag is never a reason to leave
+/// a key: eviction is ordered against it as on any key ([`write_order`]).
+/// With no script running, a free turn taken and let go of: the key goes as
+/// it would with no locks at all. (A command that waited for a script holds
+/// the turns it waited for until it has its locks: a key of one of those is
+/// left too, for that moment.) Whatever `lua-parallel-scripts` says now: a
+/// script that read it before a switch may still be running. Not waited
+/// for: the writer that makes room holds the write gate.
+///
+/// [`write_order`]: crate::write_order
 #[inline]
 pub fn try_hold_for_eviction(key: &[u8]) -> Option<EvictionHold> {
-    if !enabled() {
-        return Some(EvictionHold(None));
+    #[cfg(feature = "lua")]
+    {
+        let Some(id) = lock_id(key, untagged_keys_locked()) else {
+            return Some(EvictionHold(None));
+        };
+        TURN[id]
+            .try_lock()
+            .ok()
+            .map(|turn| EvictionHold(Some(turn)))
     }
-    match lock_id(key, untagged_keys_locked()) {
-        None => Some(EvictionHold(None)),
-        // `then`, not `then_some`: a hold made and dropped would let go of
-        // a lock nobody took.
-        Some(id) => try_take(id).then(|| EvictionHold(Some(id))),
+    #[cfg(not(feature = "lua"))]
+    {
+        let _ = key;
+        Some(EvictionHold(None))
     }
 }
 
@@ -2347,6 +2456,126 @@ mod tests {
         assert!(lock_keys([b"plain".as_slice()].into_iter()).is_none());
         assert!(try_hold_for_eviction(b"plain").is_some_and(|hold| hold.0.is_none()));
         set_enabled(false);
+    }
+
+    /// Once keys without a tag are locked, the keys a client's command
+    /// locks are every key it names, tagged or not, wherever its first
+    /// tagged key is: for every way commands name their keys (one key,
+    /// several, at steps, counted, a `STORE` destination, more than fit
+    /// inline), with no tag, a tag first, a tag later and a tag only.
+    #[cfg(feature = "lua")]
+    #[test]
+    fn with_keys_locked_every_key_a_command_names_is_locked() {
+        let shapes: &[&[&str]] = &[
+            &["GET", "A"],
+            &["SET", "A", "v"],
+            &["INCR", "A"],
+            &["MGET", "A", "B", "C"],
+            &["MSET", "A", "1", "B", "2", "C", "3"],
+            &["MSETNX", "A", "1", "B", "2"],
+            &["DEL", "A", "B", "C"],
+            &["EXISTS", "A", "B"],
+            &["RENAME", "A", "B"],
+            &["COPY", "A", "B"],
+            &["SMOVE", "A", "B", "m"],
+            &["LMOVE", "A", "B", "LEFT", "RIGHT"],
+            &["BLMOVE", "A", "B", "LEFT", "RIGHT", "0"],
+            &["SINTERSTORE", "A", "B", "C"],
+            &["SINTERCARD", "2", "A", "B"],
+            &["ZUNIONSTORE", "A", "2", "B", "C"],
+            &["ZINTER", "2", "A", "B"],
+            &["LMPOP", "2", "A", "B", "LEFT"],
+            &["BLMPOP", "0", "2", "A", "B", "LEFT"],
+            &["ZMPOP", "2", "A", "B", "MIN"],
+            &["XREAD", "STREAMS", "A", "B", "0", "0"],
+            &["SORT", "A", "STORE", "B"],
+            &["GEORADIUS", "A", "0", "0", "1", "km", "STORE", "B"],
+            &["LCS", "A", "B"],
+            &["PFMERGE", "A", "B", "C"],
+            &["BITOP", "AND", "A", "B", "C"],
+            &["OBJECT", "ENCODING", "A"],
+        ];
+        // The keys of a shape: none tagged, the first, the last, all.
+        let spellings = |at: usize, keys: usize| -> [String; 4] {
+            let plain = format!("k{at}");
+            let tagged = format!("{{t}}:k{at}");
+            [
+                plain.clone(),
+                if at == 0 {
+                    tagged.clone()
+                } else {
+                    plain.clone()
+                },
+                if at + 1 == keys {
+                    tagged.clone()
+                } else {
+                    plain
+                },
+                tagged,
+            ]
+        };
+        let mut many = vec!["MGET".to_string()];
+        many.extend((0..20).map(|at| {
+            if at == 19 {
+                "{t}:last".to_string()
+            } else {
+                format!("m{at}")
+            }
+        }));
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let mut all: Vec<Vec<String>> = Vec::new();
+        for shape in shapes {
+            let keys = shape
+                .iter()
+                .filter(|word| word.len() == 1 && word.as_bytes()[0].is_ascii_uppercase())
+                .count();
+            for way in 0..4 {
+                let mut at = 0;
+                all.push(
+                    shape
+                        .iter()
+                        .map(|word| {
+                            if word.len() == 1 && word.as_bytes()[0].is_ascii_uppercase() {
+                                at += 1;
+                                spellings(at - 1, keys)[way].clone()
+                            } else {
+                                word.to_string()
+                            }
+                        })
+                        .collect(),
+                );
+            }
+        }
+        all.push(many.iter().map(|word| word.to_string()).collect());
+        for words in &all {
+            let cmd: Vec<&[u8]> = words.iter().map(|word| word.as_bytes()).collect();
+            let name = words[0].to_ascii_uppercase();
+            let named: std::collections::BTreeSet<&[u8]> =
+                crate::keyspec::key_positions(&name, &cmd)
+                    .iter()
+                    .map(|at| cmd[at])
+                    .collect();
+            assert!(!named.is_empty(), "{words:?} names no key");
+            let found = untagged_named_keys(None, &name, &cmd).expect("keys found");
+            let at = match &found {
+                NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
+                    next: *from,
+                    last: *last,
+                    step: *step,
+                },
+                NamedKeys::Other(keys) => keys.iter(),
+            };
+            let locked: std::collections::BTreeSet<&[u8]> = at.map(|at| cmd[at]).collect();
+            assert_eq!(locked, named, "{words:?}");
+            // And each of those has a lock: its tag's or its own.
+            for key in &locked {
+                assert!(
+                    lock_id(key, true).is_some(),
+                    "{words:?}: {:?}",
+                    String::from_utf8_lossy(key)
+                );
+            }
+        }
     }
 
     #[test]

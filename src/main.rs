@@ -459,7 +459,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
     // Without Lua there are no scripts to run beside each other, and the
     // commands are spared looking for a tag to wait on.
-    tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
+    tag_locks::set_mode(if cfg!(feature = "lua") {
+        config.lua_parallel_scripts
+    } else {
+        config::ParallelScripts::No
+    });
     eviction::configure(&config);
     compaction::configure(&config);
     give_back::set_enabled(config.allocator_give_back);

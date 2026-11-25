@@ -661,17 +661,13 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
             },
             // Taken with the command gate held alone (`run_command`). A
             // script that read the old setting before the gate may still
-            // run: see `tag_locks::set_enabled` for why that is safe.
-            "lua-parallel-scripts" => match value.to_ascii_lowercase().as_str() {
-                "yes" => {
-                    crate::tag_locks::set_enabled(true);
+            // run: see `tag_locks::set_mode` for why that is safe.
+            "lua-parallel-scripts" => match crate::config::ParallelScripts::parse(value) {
+                Some(mode) => {
+                    crate::tag_locks::set_mode(mode);
                     Some(resp_simple("OK"))
                 }
-                "no" => {
-                    crate::tag_locks::set_enabled(false);
-                    Some(resp_simple("OK"))
-                }
-                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+                None => Some(resp_error("ERR argument must be 'yes', 'tags' or 'no'")),
             },
             "key-access-tracking" => match value.to_ascii_lowercase().as_str() {
                 "yes" => {
@@ -2421,12 +2417,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("lua-time-limit", lua_time_limit.clone()),
         (
             "lua-parallel-scripts",
-            if crate::tag_locks::parallel_scripts() {
-                "yes"
-            } else {
-                "no"
-            }
-            .to_string(),
+            crate::tag_locks::mode().name().to_string(),
         ),
         ("busy-reply-threshold", lua_time_limit),
         (
