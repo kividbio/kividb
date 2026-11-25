@@ -426,10 +426,10 @@ the servers in turn (median):
 
 | | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
 |---|---:|---:|---:|
-| this build | 286,200 | 106 / 279 | 100 / 269 |
-| the build before | 151,200 | 214 / 458 | 194 / 416 |
-| Redis 8.12 | 208,200 | 148 / 293 | 144 / 290 |
-| Valkey 8.1 | 232,000 | 130 / 296 | 132 / 297 |
+| this build | 300,200 | 101 / 245 | 97 / 238 |
+| the build before | 159,500 | 203 / 432 | 184 / 396 |
+| Redis 8.12 | 211,300 | 146 / 285 | 142 / 280 |
+| Valkey 8.1 | 235,400 | 129 / 279 | 131 / 282 |
 
 The build before ran each release alone, the other commands held back
 around it; its four worker threads were 70 % busy. This build runs them

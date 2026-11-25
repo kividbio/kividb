@@ -951,9 +951,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   compare-and-delete release by `EVAL` with its text; 32 connections, each
   its own lock; the server on 4 vCPUs of an Azure `Standard_D8s_v5`,
   `--threads 4`, Redis 8.12 and Valkey 8.1 with `--io-threads 4`, the load
-  on the other 4; median of 3 runs): 286,200 ops/s with an `EVAL` p50/p99 of
-  106/279 µs, against 151,200 and 214/458 µs for the build before, Redis
-  208,200 and 148/293 µs, Valkey 232,000 and 130/296 µs. Regression suite
+  on the other 4; median of 3 runs): 300,200 ops/s with an `EVAL` p50/p99 of
+  101/245 µs, against 159,500 and 203/432 µs for the build before, Redis
+  211,300 and 146/285 µs, Valkey 235,400 and 129/279 µs. Regression suite
   54 records the cycle. See "Scripts that keep to their keys" in
   [docs/SCRIPTS.md](docs/SCRIPTS.md).
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
