@@ -333,6 +333,15 @@ impl Slots {
             .sum()
     }
 
+    pub fn bytes_for(&self, slots: usize) -> usize {
+        if slots == 0 {
+            return 0;
+        }
+        (0..=locate(slots - 1).0)
+            .map(|b| self.layout(block_slots(b)).2.size())
+            .sum()
+    }
+
     /// Make room for slot `id`. Zeroed: no links, not live.
     pub fn reserve(&self, id: usize) {
         let (b, _) = locate(id);
@@ -919,6 +928,16 @@ impl Visited {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_for_is_what_the_blocks_take_once_there_is_room() {
+        let slots = Slots::bytes_only(1_552);
+        assert_eq!(slots.bytes_for(0), 0);
+        for n in [1usize, 2, 1_000, 1_024, 1_025, 5_000, 20_000] {
+            slots.reserve(n - 1);
+            assert_eq!(slots.bytes_for(n), slots.bytes(), "{n} slots");
+        }
+    }
 
     #[test]
     fn every_id_has_a_slot_of_its_own() {

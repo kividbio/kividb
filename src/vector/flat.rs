@@ -412,6 +412,10 @@ impl VectorIndex {
         for ((_, v), out) in picked.iter().zip(codes.chunks_exact_mut(bytes)) {
             copy.codec.encode(v, &mut scratch, out);
         }
+        #[cfg(test)]
+        if let Some(f) = MID_RUN.with(|h| h.borrow_mut().take()) {
+            f();
+        }
         let mut map = self.map.write();
         let mut since = std::time::Instant::now();
         for ((slot, v), code) in picked.iter().zip(codes.chunks_exact(bytes)) {
@@ -441,7 +445,8 @@ impl VectorIndex {
         let set = flat_int8::times_set();
         let limit = crate::RUNTIME_MAXMEMORY.load(Relaxed);
         let len = self.map.read().keys.len();
-        let need = len.saturating_mul(codec.bytes());
+        let bytes = Slots::bytes_only(codec.bytes());
+        let need = bytes.bytes_for(len);
         if limit != 0 && crate::memory_use::counted().saturating_add(need) > limit {
             self.declined.store(set + 1, Relaxed);
             crate::log_warn!(
@@ -451,7 +456,6 @@ impl VectorIndex {
             );
             return false;
         }
-        let bytes = Slots::bytes_only(codec.bytes());
         loop {
             let len = self.map.read().keys.len();
             if len > 0 {
@@ -862,6 +866,12 @@ mod coder {
 #[cfg(test)]
 thread_local! {
     static BETWEEN_RUNS: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+thread_local! {
+    static MID_RUN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1480,6 +1490,53 @@ mod tests {
             results.push(pairs(&found));
         }
         assert_eq!(results[0], results[1]);
+    }
+
+    #[test]
+    fn writes_and_deletes_while_a_run_codes_leave_no_stale_copy() {
+        const DIM: usize = 256;
+        let flat = Arc::new(VectorIndex::new());
+        flat.always.store(true, Relaxed);
+        for i in 0..1_100 {
+            flat.insert(format!("k{i}"), vec![i as f32 + 1.0; DIM]);
+        }
+        flat.code_now();
+        for i in 0..200 {
+            flat.insert(format!("k{i}"), vec![-(i as f32) - 1.0; DIM]);
+        }
+        let index = flat.clone();
+        MID_RUN.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                for i in 0..100 {
+                    index.remove(&format!("k{i}"));
+                    index.insert(format!("n{i}"), vec![i as f32 + 0.25; DIM]);
+                }
+                for i in 100..150 {
+                    index.insert(format!("k{i}"), vec![i as f32 * 3.0; DIM]);
+                }
+            }))
+        });
+        assert!(flat.code_some());
+        assert!(MID_RUN.with(|h| h.borrow().is_none()), "the hook ran");
+        let check = |all_coded: bool| {
+            let copy = flat.copy.get().unwrap();
+            let map = flat.map.read();
+            let slots = flat.slots.get().unwrap();
+            let mut scratch = Vec::new();
+            let mut want = vec![0u8; copy.codec.bytes()];
+            for (slot, key) in map.keys.iter().enumerate() {
+                let have = &copy.slots.slot_bytes(slot)[..want.len()];
+                let coded = have[..HEADER].iter().any(|&b| b != 0);
+                if key.is_some() && (coded || all_coded) {
+                    copy.codec
+                        .encode(slots.vector(slot), &mut scratch, &mut want);
+                    assert_eq!(have, &want[..], "slot {slot}");
+                }
+            }
+        };
+        check(false);
+        flat.code_now();
+        check(true);
     }
 
     #[test]

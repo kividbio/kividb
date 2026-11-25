@@ -187,6 +187,8 @@ fn quantize(v: &[f64], codes: &mut [i8]) -> (f32, f64, f64) {
     let sd = f64::from(s);
     let (mut sq, mut ee) = (0.0f64, 0.0f64);
     for (c, &x) in codes.iter_mut().zip(v) {
+        // Clamped: `s` rounded to f32 can put `x / s` past 127, and `e` is
+        // taken from the clamped `q`.
         let q = if sd > 0.0 {
             (x / sd).round().clamp(-127.0, 127.0)
         } else {
