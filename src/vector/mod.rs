@@ -2,6 +2,7 @@ pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
 pub mod flat;
+pub mod flat_int8;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;

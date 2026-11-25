@@ -2099,6 +2099,14 @@ impl Best {
         }
     }
 
+    #[inline]
+    pub(crate) fn kth(&self) -> Option<f32> {
+        if self.k == 0 || self.heap.len() < self.k {
+            return None;
+        }
+        self.heap.peek().map(|top| top.0)
+    }
+
     pub(crate) fn into_sorted(self) -> Vec<crate::vector::KnnResult> {
         self.heap
             .into_sorted_vec()
