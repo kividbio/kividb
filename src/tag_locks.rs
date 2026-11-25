@@ -411,6 +411,7 @@ static KEY_STRIPE: [KeyStripe; STRIPES] =
 /// script takes it; a key's shared. Kept as the id, the guard forgotten, and
 /// let go of by [`release`]: a command's locks are then a short list of
 /// numbers, with nothing to allocate for up to [`INLINE`] of them.
+#[cfg(feature = "lua")]
 #[inline]
 fn take(id: usize) {
     if id < STRIPES {
@@ -666,22 +667,35 @@ pub enum ScriptTags<'a> {
     /// The one key, without a tag, of a script that keeps to its `KEYS`
     /// (`lua_keys_only`): locked as its own tag, once keys without a tag
     /// are ([`untagged_keys_locked`]).
+    #[cfg(feature = "lua")]
     Key(&'a [u8]),
     /// Several such keys, in the order of [`ScriptTags::Several`].
+    #[cfg(feature = "lua")]
     Keys(Vec<&'a [u8]>),
 }
 
 impl<'a> ScriptTags<'a> {
     pub fn as_slice(&self) -> &[&'a [u8]] {
         match self {
-            ScriptTags::One(tag) | ScriptTags::Key(tag) => std::slice::from_ref(tag),
-            ScriptTags::Several(tags) | ScriptTags::Keys(tags) => tags,
+            ScriptTags::One(tag) => std::slice::from_ref(tag),
+            ScriptTags::Several(tags) => tags,
+            #[cfg(feature = "lua")]
+            ScriptTags::Key(key) => std::slice::from_ref(key),
+            #[cfg(feature = "lua")]
+            ScriptTags::Keys(keys) => keys,
         }
     }
 
     /// Whether these are whole keys rather than tags.
     pub fn whole_keys(&self) -> bool {
-        matches!(self, ScriptTags::Key(_) | ScriptTags::Keys(_))
+        #[cfg(feature = "lua")]
+        {
+            matches!(self, ScriptTags::Key(_) | ScriptTags::Keys(_))
+        }
+        #[cfg(not(feature = "lua"))]
+        {
+            false
+        }
     }
 
     /// The locks of the tags (or keys), each once, lowest first: the order
@@ -705,7 +719,7 @@ impl<'a> ScriptTags<'a> {
 /// keys without a tag are locked: then the keys themselves
 /// ([`ScriptTags::Key`], [`whole_keys`]). Keys of one tag, the usual case,
 /// allocate nothing; nor does one key without a tag.
-#[inline(never)]
+#[cfg_attr(feature = "lua", inline(never))]
 pub fn script_tags<'a>(cmd: &[&'a [u8]]) -> Option<ScriptTags<'a>> {
     let name = cmd.first()?;
     if !(name.eq_ignore_ascii_case(b"EVAL")
@@ -908,7 +922,7 @@ fn hold(
 /// The write gate first, as for any tag's lock (see the top): a read-only
 /// script holds none otherwise, and one that finds a key past its time
 /// enters it to delete the key.
-#[inline(never)]
+#[cfg_attr(feature = "lua", inline(never))]
 pub fn lock_for_script(tags: &ScriptTags) -> ScriptGuard {
     let gate = crate::write_gate::enter();
     let stripes = match tags {
@@ -930,8 +944,6 @@ pub fn lock_for_script(tags: &ScriptTags) -> ScriptGuard {
                 .map(|id| KEY_STRIPE[id - STRIPES].0.write())
                 .collect(),
         },
-        #[cfg(not(feature = "lua"))]
-        ScriptTags::Key(_) | ScriptTags::Keys(_) => Stripes::None,
     };
     hold(tags, stripes, Some(gate))
 }
@@ -964,22 +976,28 @@ pub async fn script_turn(tags: &ScriptTags<'_>) -> ScriptTurn {
         ScriptTags::One(tag) => ScriptTurn::One {
             _turn: TURN[stripe_of(tag)].lock().await,
         },
+        #[cfg(feature = "lua")]
         ScriptTags::Key(key) => ScriptTurn::One {
             _turn: TURN[STRIPES + stripe_of(key)].lock().await,
         },
-        ScriptTags::Several(_) | ScriptTags::Keys(_) => {
-            let mut turns = Vec::new();
-            for stripe in tags.stripes() {
-                turns.push(TURN[stripe].lock().await);
-            }
-            ScriptTurn::Several { _turns: turns }
-        }
+        #[cfg(feature = "lua")]
+        ScriptTags::Keys(_) => several_turns(tags).await,
+        ScriptTags::Several(_) => several_turns(tags).await,
     }
+}
+
+/// [`script_turn`] for several tags or keys: each, lowest first.
+async fn several_turns(tags: &ScriptTags<'_>) -> ScriptTurn {
+    let mut turns = Vec::new();
+    for stripe in tags.stripes() {
+        turns.push(TURN[stripe].lock().await);
+    }
+    ScriptTurn::Several { _turns: turns }
 }
 
 /// Hold a script to `tags` without their locks: one that has the command
 /// gate alone, and so has nothing to be locked against.
-#[inline(never)]
+#[cfg_attr(feature = "lua", inline(never))]
 pub fn hold_script_to(tags: &ScriptTags) -> ScriptGuard {
     hold(tags, Stripes::None, None)
 }
@@ -1040,11 +1058,22 @@ pub fn script_tags_for_message() -> String {
 /// is: the guard is an `Option` in the way of every command
 /// (`handler::run_command`), and letting go of its locks has no business
 /// there.
+#[cfg(feature = "lua")]
 pub struct KeysGuard {
     held: std::mem::ManuallyDrop<KeysHeld>,
 }
 
+/// In a build without Lua, which locks no key without a tag: the locks of
+/// the tags, as guards.
+#[cfg(not(feature = "lua"))]
+pub struct KeysGuard {
+    _one: Option<MutexGuard<'static, ()>>,
+    _more: Vec<MutexGuard<'static, ()>>,
+    _gate: crate::write_gate::WriteGuard,
+}
+
 /// What a [`KeysGuard`] holds: its locks, let go of first, then the gate.
+#[cfg(feature = "lua")]
 struct KeysHeld {
     locks: Locks,
     _gate: crate::write_gate::WriteGuard,
@@ -1052,12 +1081,13 @@ struct KeysHeld {
 
 /// A command's locks: one, as nearly every command on a tagged key holds,
 /// or a list of them.
+#[cfg(feature = "lua")]
 enum Locks {
-    #[cfg_attr(not(feature = "lua"), allow(dead_code))]
     One(u16),
     Many(Ids),
 }
 
+#[cfg(feature = "lua")]
 impl KeysGuard {
     #[inline]
     fn new(ids: Ids, gate: crate::write_gate::WriteGuard) -> Self {
@@ -1069,7 +1099,6 @@ impl KeysGuard {
         }
     }
 
-    #[cfg(feature = "lua")]
     #[inline]
     fn one(id: usize, gate: crate::write_gate::WriteGuard) -> Self {
         KeysGuard {
@@ -1081,6 +1110,7 @@ impl KeysGuard {
     }
 }
 
+#[cfg(feature = "lua")]
 impl Drop for KeysGuard {
     #[inline(never)]
     fn drop(&mut self) {
@@ -1112,6 +1142,7 @@ fn lock_keys<'a>(keys: impl Iterator<Item = &'a [u8]>) -> Option<KeysGuard> {
 /// The write gate first (see the top), for a read too: one that finds a key
 /// past its time deletes it under the gate, and must not enter it with a
 /// tag held. A write holds the gate already, and this costs it a count.
+#[cfg(feature = "lua")]
 fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Option<KeysGuard> {
     let mut ids = Ids::new();
     for key in keys {
@@ -1130,6 +1161,44 @@ fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, untagged: bool) -> Opt
         take(id as usize);
     }
     Some(KeysGuard::new(ids, gate))
+}
+
+/// [`lock_keys_as`] in a build without Lua: the tags' locks only.
+#[cfg(not(feature = "lua"))]
+fn lock_keys_as<'a>(keys: impl Iterator<Item = &'a [u8]>, _untagged: bool) -> Option<KeysGuard> {
+    let mut first: Option<usize> = None;
+    let mut more: Vec<usize> = Vec::new();
+    for key in keys {
+        let Some(tag) = tag_of(key) else { continue };
+        let stripe = stripe_of(tag);
+        match first {
+            None => first = Some(stripe),
+            Some(one) if one == stripe => {}
+            Some(_) => more.push(stripe),
+        }
+    }
+    let first = first?;
+    let gate = crate::write_gate::enter();
+    if more.is_empty() {
+        return Some(KeysGuard {
+            _one: Some(STRIPE[first].0.lock()),
+            _more: Vec::new(),
+            _gate: gate,
+        });
+    }
+    // Several: in the order of the table, so that two commands naming the
+    // same tags the other way round do not wait for each other.
+    more.push(first);
+    more.sort_unstable();
+    more.dedup();
+    Some(KeysGuard {
+        _one: None,
+        _more: more
+            .into_iter()
+            .map(|stripe| STRIPE[stripe].0.lock())
+            .collect(),
+        _gate: gate,
+    })
 }
 
 /// Whether `key` may carry a hash tag: whether it has a `{` at all. One
@@ -1247,6 +1316,7 @@ pub fn named_keys(name: &str, cmd: &[&[u8]]) -> Option<NamedKeys> {
 /// `{` is looked at again out of line ([`untagged_named_keys`]); until then
 /// that costs it one load and one branch, at the one place every such
 /// command ends.
+#[cfg(feature = "lua")]
 #[inline(always)]
 pub(crate) fn named_keys_of(
     shape: Option<crate::keyspec::Shape>,
@@ -1258,6 +1328,18 @@ pub(crate) fn named_keys_of(
         return untagged_named_keys(cmd);
     }
     found
+}
+
+/// [`named_keys_of`] in a build without Lua, which locks no key without a
+/// tag.
+#[cfg(not(feature = "lua"))]
+#[inline(always)]
+pub(crate) fn named_keys_of(
+    shape: Option<crate::keyspec::Shape>,
+    name: &str,
+    cmd: &[&[u8]],
+) -> Option<NamedKeys> {
+    tagged_named_keys_of(shape, name, cmd)
 }
 
 /// [`named_keys_of`] for keys that may carry a tag.
@@ -1308,6 +1390,7 @@ fn tagged_named_keys_of(
 /// ([`command_locks_untagged_keys`]). Its name and how its keys are found
 /// are worked out again here, from `cmd`, so that the command's own path
 /// keeps nothing for this.
+#[cfg(feature = "lua")]
 #[cold]
 #[inline(never)]
 fn untagged_named_keys(cmd: &[&[u8]]) -> Option<NamedKeys> {

@@ -743,7 +743,9 @@ fn script_mode<'a>(
     let allowed_beside = crate::tag_locks::take_next_script_allowed();
     // The setting as it is now, after the script was counted among those
     // that run beside others (`tag_locks::parallel_scripts`).
-    let script_tags = if tag_locks && crate::tag_locks::parallel_scripts() {
+    #[cfg(feature = "lua")]
+    let tag_locks = tag_locks && crate::tag_locks::parallel_scripts();
+    let script_tags = if tag_locks {
         crate::tag_locks::script_tags(cmd)
     } else {
         None
