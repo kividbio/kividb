@@ -36331,6 +36331,167 @@
           "max_x": 2.0
         }
       ]
+    },
+    "54-yii2-mutex/uring4/eval_p50_us": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "eval_p50_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 263.0,
+        "candidate": 130.0,
+        "redis": 172.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_redis",
+          "max_x": 0.9
+        }
+      ]
+    },
+    "54-yii2-mutex/uring4/eval_p99_us": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "eval_p99_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 727.0,
+        "candidate": 185.0,
+        "redis": 295.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_redis",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "54-yii2-mutex/uring4/ops_per_s": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "ops_per_s",
+      "unit": "ops/s",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 122967.0,
+        "candidate": 248780.3,
+        "redis": 183140.9,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "vs_redis",
+          "max_x": 0.8333333333333334
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 0.625
+        },
+        {
+          "kind": "rel",
+          "pct": 10
+        }
+      ]
+    },
+    "54-yii2-mutex/uring4/server_cpus": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "server_cpus",
+      "unit": "cpus",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.3152,
+        "candidate": 3.9966,
+        "redis": 2.8647,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "54-yii2-mutex/uring4/set_p50_us": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "set_p50_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 191.0,
+        "candidate": 124.0,
+        "redis": 169.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "54-yii2-mutex/uring4/set_p99_us": {
+      "suite": "54-yii2-mutex",
+      "config": "uring4",
+      "metric": "set_p99_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 765.0,
+        "candidate": 177.0,
+        "redis": 290.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-25",
+        "commit": "59a457dd",
+        "label": "pr-1049-54-d8s_v5",
+        "rustc": "1.100.0",
+        "rustc_full": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
     }
   }
 }

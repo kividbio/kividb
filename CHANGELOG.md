@@ -932,29 +932,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   hash tag (#1049).** With `lua-parallel-scripts yes` (the default), a
   script whose `KEYS` all lack a hash tag runs beside other commands, under
   its keys' locks, when it is sent by `EVAL` or `EVALSHA` and its source
-  shows that it touches no other key:
-  every `redis.call`/`redis.pcall` names its command with a string literal,
-  of a list of commands whose keys are known (`GET`, `SET`, `DEL`, `INCR`,
-  `EXPIRE`, `HSET`, ...), and gives each key as `KEYS[n]`; `KEYS` and
-  `redis` are only read, never assigned or passed on; and nothing that
-  reaches the globals another way (`_G`, `_ENV`, `loadstring`,
-  `setmetatable`, ...) is named. That is read from the text once per thread
-  and script, before it runs. Any other script with a key without a tag runs
-  alone, as before, and may touch what it likes (BullMQ's and Sidekiq's
-  scripts are of that kind). From the first run of such a script, which is
-  alone, a command on a key without a tag takes that key's lock, as a
-  command on a tagged key takes its tag's; until then it costs that command
-  one load more. While keys can be evicted (`maxmemory` with an evicting
-  policy) such scripts run alone. yii2-redis's `Mutex` cycle (`SET NX PX`,
-  then the compare-and-delete release by `EVAL` with its text; 32
-  connections, each its own lock; the server on 4 vCPUs of an Azure
-  `Standard_D8s_v5`, `--threads 4`, Redis 8.12 and Valkey 8.1 with
-  `--io-threads 4`, the load on the other 4; median of 3 runs): 285,000
-  ops/s with an `EVAL` p50/p99 of 105/285 µs, against 150,200 and 215/471 µs
-  for the build before, Redis 207,600 and 148/296 µs, Valkey 232,200 and
-  130/292 µs. See "Scripts that keep to their keys" in
+  shows that it touches no other key: every `redis.call`/`redis.pcall` names
+  its command with a string literal, of a list of commands whose keys are
+  known (`GET`, `SET`, `DEL`, `INCR`, `EXPIRE`, `HSET`, ...), and gives each
+  key as `KEYS[n]`; `KEYS` and `redis` are only read, never assigned or
+  passed on; and nothing that reaches the globals another way (`_G`, `_ENV`,
+  `loadstring`, `setmetatable`, ...) is named. That is read from the text
+  once per thread and script, before it runs. Any other script with a key
+  without a tag runs alone, as before, and may touch what it likes (BullMQ's
+  and Sidekiq's scripts are of that kind). From the first run of such a
+  script, which is alone, a command on a key without a tag takes that key's
+  lock, as a command on a tagged key takes its tag's; until then that
+  command makes one load more, and `GET` and `SET` cost 13 to 16
+  instructions more than in the build before (`scripts/perf/run.sh`, fat
+  LTO). While keys can be evicted (`maxmemory` with an evicting policy) such
+  scripts run alone. yii2-redis's `Mutex` cycle (`SET NX PX`, then the
+  compare-and-delete release by `EVAL` with its text; 32 connections, each
+  its own lock; the server on 4 vCPUs of an Azure `Standard_D8s_v5`,
+  `--threads 4`, Redis 8.12 and Valkey 8.1 with `--io-threads 4`, the load
+  on the other 4; median of 3 runs): 299,300 ops/s with an `EVAL` p50/p99 of
+  102/251 µs, against 158,900 and 204/434 µs for the build before, Redis
+  211,700 and 146/284 µs, Valkey 235,600 and 128/282 µs. Regression suite
+  54 records the cycle. See "Scripts that keep to their keys" in
   [docs/SCRIPTS.md](docs/SCRIPTS.md).
-
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first

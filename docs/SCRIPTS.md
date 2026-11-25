@@ -398,7 +398,12 @@ that run is alone, and it switches the locks on with every other command
 held back, so no command is between its look at whether to lock its keys
 and its end. From then on a command on a key without a tag takes that key's
 lock, as a command on a tagged key takes its tag's; until then it looks at
-the key for a `{`, and that is all. Switching `lua-parallel-scripts` off
+the key for a `{` and makes one load more (13 to 16 instructions a command
+in all, `GET` and `SET` of 100 B and 1 KB, measured with
+`LTO=fat EXEC=1 CMP=plain FEATURES=lua,tls scripts/perf/run.sh`). With the
+locks on, plain `GET`/`SET` from memtier (50 connections one command at a
+time, and 48 with pipelines of 16) ran at the same rate as with them off,
+within the 2 % the runs spread by. Switching `lua-parallel-scripts` off
 switches those locks off too, until the next such script.
 
 While keys can be evicted (`maxmemory` set, with a policy other than
@@ -415,10 +420,10 @@ the servers in turn (median):
 
 | | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
 |---|---:|---:|---:|
-| this build | 285,000 | 105 / 285 | 100 / 278 |
-| the build before | 150,200 | 215 / 471 | 195 / 429 |
-| Redis 8.12 | 207,600 | 148 / 296 | 144 / 292 |
-| Valkey 8.1 | 232,200 | 130 / 292 | 132 / 293 |
+| this build | 299,300 | 102 / 251 | 97 / 244 |
+| the build before | 158,900 | 204 / 434 | 185 / 399 |
+| Redis 8.12 | 211,700 | 146 / 284 | 142 / 280 |
+| Valkey 8.1 | 235,600 | 128 / 282 | 131 / 283 |
 
 The build before ran each release alone, the other commands held back
 around it; its four worker threads were 70 % busy. This build runs them

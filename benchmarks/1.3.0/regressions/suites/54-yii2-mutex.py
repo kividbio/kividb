@@ -32,11 +32,11 @@ beside others (`INFO stats`, kept in the raw data), or the suite fails.
 
 Gates in the same session: commands a second at least 1.2x Redis's and at
 least 1.6x v1.2.2's, and within 10 % of recorded; the `EVAL` p50 at most
-0.9x Redis's and its p99 at most 1.1x Redis's. On a `Standard_D8s_v5` the
-candidate measured 1.37x Redis 8.12 and 1.23x Valkey 8.1 (both
-`--io-threads 4`) in ops/s, with an `EVAL` p50/p99 of 105/285 us against
-Redis's 148/296 (docs/SCRIPTS.md). Needs the `lua,tls` builds
-(`--candidate-full`); `min_cpus=8`.
+0.9x Redis's and its p99 at most 1.1x Redis's. Recorded on a
+`Standard_D8s_v5` (`results/pr-1049-54-d8s_v5`): 248,780 commands a second
+against Redis's 183,141 (1.36x), an `EVAL` p50/p99 of 130/185 us against
+Redis's 172/295; all of the candidate's releases ran beside others. Needs
+the `lua,tls` builds (`--candidate-full`); `min_cpus=8`.
 """
 import json
 import os
@@ -171,7 +171,7 @@ def check_calls(load, port, cpus):
     sets, evals, inner, locks = 0, 0, 0, set()
     inner_keys = []
     for raw in b"".join(chunks).decode("utf-8", "replace").split("\r\n"):
-        m = MONITOR_LINE.match(raw)
+        m = MONITOR_LINE.match(raw.strip().lstrip("+"))
         if not m:
             continue
         args = [unescape(a) for a in ARG.findall(m.group(2))]
