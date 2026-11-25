@@ -939,9 +939,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
 
     log_info!("Shards per DB  : {}", store::num_shards());
     if server_uring::coop_taskrun() {
-        log_info!(
-            "I/O model      : io_uring (completions taken at the worker's next system call)"
-        );
+        log_info!("I/O model      : io_uring (completions taken at the worker's next system call)");
     } else {
         log_info!("I/O model      : io_uring");
     }

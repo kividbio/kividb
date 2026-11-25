@@ -2158,7 +2158,7 @@ mod sort_gate_tests {
 
 #[cfg(test)]
 mod keys_walk_tests {
-    use super::{KEYS_PART, KeysFound, keys_of_shard};
+    use super::{BEFORE_LOOK, KEYS_PART, KeysFound, keys_of_shard};
     use crate::commands::glob_redis::Glob;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -2355,7 +2355,10 @@ mod keys_walk_tests {
                 // shard and writes before the walk goes on.
                 let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
                 while !wrote.load(SeqCst) {
-                    assert!(std::time::Instant::now() < until, "the writer was not served");
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "the writer was not served"
+                    );
                     std::thread::yield_now();
                 }
             });
