@@ -3,7 +3,7 @@
 //! shows it cannot enter the nearest `k`, so a scan returns exactly what the
 //! exact scan returns, ties and order included.
 
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use super::{DistanceMetric, simd};
 
@@ -30,9 +30,15 @@ const EPSILON: f64 = 1.0 / (1u64 << 48) as f64;
 const SUBNORMAL: f64 = 1.401_298_464_324_817e-45;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static SET: AtomicU64 = AtomicU64::new(0);
 
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Relaxed);
+    SET.fetch_add(1, Relaxed);
+}
+
+pub(crate) fn times_set() -> u64 {
+    SET.load(Relaxed)
 }
 
 pub fn enabled() -> bool {
