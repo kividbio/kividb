@@ -4,31 +4,31 @@ Verdict: **ok**
 
 - Machine: Standard_D8s_v5, 8 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on INTEL(R) XEON(R) PLATINUM 8573C / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz / Intel(R) Xeon(R) Platinum 8473C; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-- calibration (indicative only): 92.1 ms for a fixed sha256 loop, 8 cores
+- calibration (indicative only): 100.6 ms for a fixed sha256 loop, 8 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`, rustc 1.100.0
-- candidate: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `783f9be3fc712bda2f62f8368935bc6de282417e73452a21da3bd666a9e064c0`, rustc 1.100.0
+- candidate: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `151a2617f245dddf854d6d35fc8b58201d57bdb1ff748e1ef567b772b6e2e143`, rustc 1.100.0
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
 - v1_2_2_full: `kividb 1.2.2`, sha256 `ac5e05fe1274fd1167780e512bc03aa103340f42525a2cef4a2a762e47317ad5`, rustc 1.100.0
-- candidate_full: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `783f9be3fc712bda2f62f8368935bc6de282417e73452a21da3bd666a9e064c0`, rustc 1.100.0
-- candidate commit: `8b3be2d3`
+- candidate_full: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `151a2617f245dddf854d6d35fc8b58201d57bdb1ff748e1ef567b772b6e2e143`, rustc 1.100.0
+- candidate commit: `8472fcbf`
 - date: 2026-11-25; FULL=0, SCALE=1
-- run time: 54-yii2-mutex 110s
+- run time: 54-yii2-mutex 109s
 
-Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 0.99x over 5 metrics
-- 54-yii2-mutex/uring4: 0.99x (5 metrics)
-- recorded on Standard_D8s_v5 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz: 0.99x (5 metrics)
+Host speed (this host vs the recorded one; 1.00 = same, below 1 = slower), from v1.2.2 measured in both sessions: global 1.05x over 5 metrics
+- 54-yii2-mutex/uring4: 1.05x (5 metrics)
+- recorded on Standard_D8s_v5 / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz: 1.05x (5 metrics)
 
 ## 54-yii2-mutex
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
-| uring4 | eval_p50_us | us | 252.0 | 132.0 | 178.0 | 127.0 | vs_redis: 0.74x Redis <= 0.9x | pass |
-| uring4 | eval_p99_us | us | 724.0 | 183.0 | 308.0 | 178.0 | vs_redis: 0.59x Redis <= 1.1x | pass |
-| uring4 | ops_per_s | ops/s | 125,980 | 244,396 | 177,058 | 253,687 | vs_redis: 0.72x Redis <= 0.833333x<br>vs_v1_2_2: 0.52x v1.2.2 <= 0.625x<br>rel: >= 225,678 (10% under 250,753, recorded 253,687 scaled by host speed 0.99x (group)) | pass<br>pass<br>pass |
-| uring4 | server_cpus | cpus | 3.33 | 4 | 2.86 | 4 | info | info |
-| uring4 | set_p50_us | us | 185.0 | 126.0 | 175.0 | 122.0 | info | info |
-| uring4 | set_p99_us | us | 781.0 | 175.0 | 302.0 | 172.0 | info | info |
+| uring4 | eval_p50_us | us | 244.0 | 125.0 | 170.0 | 132.0 | vs_redis: 0.74x Redis <= 0.9x | pass |
+| uring4 | eval_p99_us | us | 691.0 | 172.0 | 289.0 | 183.0 | vs_redis: 0.60x Redis <= 1.1x | pass |
+| uring4 | ops_per_s | ops/s | 131,883 | 258,952 | 186,524 | 244,396 | vs_redis: 0.72x Redis <= 0.833333x<br>vs_v1_2_2: 0.51x v1.2.2 <= 0.625x<br>rel: >= 230,461 (10% under 256,068, recorded 244,396 scaled by host speed 1.05x (group)) | pass<br>pass<br>pass |
+| uring4 | server_cpus | cpus | 3.34 | 4 | 2.84 | 4 | info | info |
+| uring4 | set_p50_us | us | 176.0 | 119.0 | 166.0 | 126.0 | info | info |
+| uring4 | set_p99_us | us | 734.0 | 164.0 | 282.0 | 175.0 | info | info |
 
 ## Not run this time
 
