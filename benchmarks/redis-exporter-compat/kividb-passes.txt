@@ -1,0 +1,2 @@
+# Checks KiviDB passes that comparing with Redis would not catch (benchmarks/README.md).
+redis-exporter.Known gaps::up to date

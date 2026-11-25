@@ -132,6 +132,12 @@ jobs:
         timeout-minutes: 5
         run: benchmarks/ci/run-harness.sh ratelimit-scripts
 
+      # What the KiviDB operator's metrics sidecar (redis_exporter) reports, against Redis's.
+      - name: redis-exporter
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh redis-exporter
+
       - name: Keep the results
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4

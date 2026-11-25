@@ -155,6 +155,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Prometheus and Grafana: a check of redis_exporter, a dashboard, and
+  `docs/MONITORING.md`.** The compat workflow runs redis_exporter v1.66.0
+  (the KiviDB operator's metrics sidecar) against KiviDB and Redis 8.10.3
+  on each release (`benchmarks/redis-exporter-compat`). It checks the
+  scrape, 14 metrics against a known workload, and each metric Redis has.
+  The 51 KiviDB lacks, for want of an `INFO` field, are listed in
+  `known-gaps.txt`, and the check fails once KiviDB reports one, so the
+  list stays current. `examples/monitoring` has a Grafana dashboard for
+  these metrics and a Compose file that runs it with a master, a replica,
+  the exporters and Prometheus. `compat_junit.py` writes a `SKIP` row as
+  `<skipped>`.
+
 - **Redis Sentinel, tested (`scripts/sentinel/run.sh`, the Sentinel
   workflow).** Three KiviDB nodes run under three Redis 8.10.3 Sentinels,
   each with a password. The master is killed (with each of redis-py,

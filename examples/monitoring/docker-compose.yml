@@ -1,0 +1,49 @@
+# KiviDB with redis_exporter, Prometheus and Grafana, to try the dashboard in
+# grafana/dashboards/kividb.json (docs/MONITORING.md). Not a production setup:
+# no passwords, and Grafana lets anyone in as an admin.
+#
+#   docker compose up -d                    # Grafana on http://localhost:3000
+#   docker compose --profile load up -d     # and some load from redis-benchmark
+services:
+  kividb:
+    image: kividb/kividb:v1.2.2
+    ports: ["6380:6380"]
+
+  kividb-replica:
+    image: kividb/kividb:v1.2.2
+    command: ["--protected-mode", "no", "--replicaof", "kividb", "6380"]
+    depends_on: [kividb]
+
+  # One exporter for each node, at the version the KiviDB operator runs as its sidecar.
+  exporter:
+    image: oliver006/redis_exporter:v1.66.0
+    environment:
+      REDIS_ADDR: redis://kividb:6380
+  exporter-replica:
+    image: oliver006/redis_exporter:v1.66.0
+    environment:
+      REDIS_ADDR: redis://kividb-replica:6380
+
+  prometheus:
+    image: prom/prometheus:v3.15.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:13.3.1
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/kividb.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+
+  load:
+    profiles: [load]
+    image: redis:8.10.3
+    command: ["redis-benchmark", "-h", "kividb", "-p", "6380", "-l", "-q", "-c", "10", "-r", "100000", "-t", "set,get,lpush,lpop,incr", "--csv"]
+    depends_on: [kividb]

@@ -66,3 +66,4 @@ add a step for it to `compat.yml` with its own `timeout-minutes`.
 | `sentry-spans` | getsentry/sentry's span buffer script `add-buffer.lua` (pinned commit), run as Sentry runs it, with real keys (13 checks); `lua` variant | seconds |
 | `client-tracking` | `CLIENT TRACKING ON REDIRECT <id> NOLOOP` with invalidations on `__redis__:invalidate`, the way Frappe uses it (17 checks); default image | seconds |
 | `ratelimit-scripts` | the rate limiters' scripts called as their gateways call them: Spring Cloud Gateway v5.1.0 `request_rate_limiter.lua`, Traefik v3.7.17's token bucket, Kong 3.9.4's `incr` + `expire` (18 checks); `lua` variant | seconds |
+| `redis-exporter` | oliver006/redis_exporter v1.66.0 (the KiviDB operator's metrics sidecar): its scrape, 14 metrics checked against a known workload, and each of the 164 metric names it reports for Redis 8.10.3; KiviDB's missing ones are in `known-gaps.txt` (default image) | seconds, after pulling the image |

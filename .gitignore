@@ -10,6 +10,8 @@
 !benchmarks/**/requirements.txt
 !benchmarks/*-compat/kividb-passes.txt
 !scripts/sentinel/requirements.txt
+!benchmarks/redis-exporter-compat/expected-metrics.txt
+!benchmarks/redis-exporter-compat/known-gaps.txt
 ./*.py
 *.kdb
 # Test fixtures are committed.
