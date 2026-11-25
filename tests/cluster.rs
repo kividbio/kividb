@@ -11993,12 +11993,16 @@ fn replica_in_step_after_the_voters_lost_their_history(moves: Option<EpochMoves>
             .join("\n")
     );
     let absent = written.missing_on(&replica);
-    assert!(absent.is_empty(), "{} writes not on the owner", absent.len());
+    assert!(
+        absent.is_empty(),
+        "{} writes not on the owner",
+        absent.len()
+    );
 }
 
 #[test]
 fn a_replica_in_step_is_elected_for_every_slot_after_every_voter_started_without_its_came_at_file()
- {
+{
     replica_in_step_after_the_voters_lost_their_history(None);
 }
 
@@ -12104,7 +12108,11 @@ fn a_replica_keeps_its_slots_when_one_voter_takes_them_to_have_come_later() {
             .join("\n")
     );
     let absent = written.missing_on(&replica);
-    assert!(absent.is_empty(), "{} writes not on the owner", absent.len());
+    assert!(
+        absent.is_empty(),
+        "{} writes not on the owner",
+        absent.len()
+    );
 }
 
 /// A slot handed from the source S to the destination D is noted at S
@@ -12120,8 +12128,7 @@ fn a_replica_keeps_its_slots_when_one_voter_takes_them_to_have_come_later() {
 /// replica is elected only for D's other slots. D, back, owns the slots
 /// with every write, S's included.
 #[test]
-fn a_source_restarted_after_a_handover_refuses_a_replica_that_claims_the_slots_at_an_older_epoch()
- {
+fn a_source_restarted_after_a_handover_refuses_a_replica_that_claims_the_slots_at_an_older_epoch() {
     let (mut nodes, ranges) = form_cluster_of(vec![
         Node::start_with_env(&[], &[IGNORE_CLAIMS]),
         Node::start(&["--appendonly", "yes"]),
@@ -12158,6 +12165,11 @@ fn a_source_restarted_after_a_handover_refuses_a_replica_that_claims_the_slots_a
     std::thread::sleep(Duration::from_millis(1500));
     replica.kill();
     set_bus(&nodes[2], "stall");
+    wait_until(
+        "the third master's bus to be held",
+        Duration::from_secs(10),
+        || nodes[2].log().contains("(test) the bus is stalled"),
+    );
     // To S, written there, and back to D, whose claims S does not take in.
     import_until_taken(&nodes[0], a, b);
     let between = Written::on(&nodes[0], a..=b, "between", 100);

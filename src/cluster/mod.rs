@@ -875,6 +875,10 @@ impl ClusterState {
         repl_state.note_stream_origin_if_unknown(
             self.my_master_id().map(|id| node_id_str(&id).to_string()),
         );
+        // When each slot came to its owner, as this node knew it: read
+        // before anything at start-up gives a slot an owner (a handover
+        // settled below notes its slots on top of it).
+        came_at::load(self);
         // The keys of an import this node was receiving when it went down,
         // which never completed (#108).
         migration::drop_unfinished_imports(self);
@@ -883,8 +887,6 @@ impl ClusterState {
         migration::settle_unfinished_handovers(self, &repl_state);
         // Those of its master, or of its old master, that it knew of (#741).
         followed_imports::start(self, &repl_state);
-        // When each slot came to its owner, as this node knew it.
-        came_at::load(self);
         migration::save_imports(self);
         // A master's replicas are told its slots once it starts, so that the
         // hub keeps a claim to send ahead of every full sync's dataset.
@@ -2444,8 +2446,13 @@ impl ClusterState {
                 // Of the slots it owns here already, one noted provisionally
                 // when it was given to it here: its own claim says when it
                 // came (`came_at`).
-                self.came_at
-                    .owner_claimed(&slots[..], owner_id, claim.start, claim.end, claim.epoch);
+                self.came_at.owner_claimed(
+                    &slots[..],
+                    owner_id,
+                    claim.start,
+                    claim.end,
+                    claim.epoch,
+                );
                 for slot in claim.start..=claim.end {
                     let i = slot as usize;
                     if i >= CLUSTER_SLOTS || slots[i] == Some(owner_id) {
