@@ -341,8 +341,12 @@ fn a_held_string_is_never_written_in_place() {
             "the new entry"
         );
         let held2 = map.get_ref("k").unwrap();
-        assert_eq!(map.set_range_in_place("k", 0, b"zz"), None);
         // Held: a copy, the holder keeping the bytes from before.
+        assert!(matches!(
+            map.edit_str_in_place("k", 0, b"zz"),
+            Some(Written::Replaced(_))
+        ));
+        let held3 = map.get_ref("k").unwrap();
         assert!(matches!(
             map.append_str("k", b"y", usize::MAX),
             Ok((102, Written::Replaced(_)))
@@ -351,6 +355,8 @@ fn a_held_string_is_never_written_in_place() {
         let mut was = bytes(100, 2);
         was.push(b'x');
         assert!(matches!(held2.value(), ValueRef::String(b) if b.as_bytes() == &was[..]));
+        was[..2].copy_from_slice(b"zz");
+        assert!(matches!(held3.value(), ValueRef::String(b) if b.as_bytes() == &was[..]));
         was.push(b'y');
         assert_eq!(text(map.get("k")), Some(was));
     });
@@ -373,14 +379,19 @@ fn appends_and_ranges_in_place() {
             Ok((11, Written::InPlace))
         ));
         assert_eq!(text(map.get("k")), Some(b"hello world".to_vec()));
-        assert_eq!(map.set_range_in_place("k", 6, b"WORLD"), Some(11));
+        assert!(matches!(
+            map.edit_str_in_place("k", 6, b"WORLD"),
+            Some(Written::InPlace)
+        ));
         assert_eq!(text(map.get("k")), Some(b"hello WORLD".to_vec()));
         // Past the end: the gap is zeros.
-        assert_eq!(map.set_range_in_place("k", 13, b"!"), Some(14));
+        assert!(matches!(
+            map.edit_str_in_place("k", 13, b"!"),
+            Some(Written::InPlace)
+        ));
         assert_eq!(text(map.get("k")), Some(b"hello WORLD\0\0!".to_vec()));
-        // Out of the class: left as it was.
-        assert_eq!(map.set_range_in_place("k", 100, b"!"), None);
-        assert_eq!(map.set_range_in_place("k", usize::MAX, b"!"), None);
+        // Past the longest string: left as it was.
+        assert!(map.edit_str_in_place("k", usize::MAX, b"!").is_none());
         assert_eq!(text(map.get("k")), Some(b"hello WORLD\0\0!".to_vec()));
         // An APPEND out of the class: a new entry.
         assert!(matches!(
@@ -391,6 +402,15 @@ fn appends_and_ranges_in_place() {
             text(map.get("k")),
             Some(b"hello WORLD\0\0!..........".to_vec())
         );
+        // An edit out of the class: a new entry, the gap zeros.
+        assert!(matches!(
+            map.edit_str_in_place("k", 100, b"!"),
+            Some(Written::Replaced(_))
+        ));
+        let mut want = b"hello WORLD\0\0!..........".to_vec();
+        want.resize(100, 0);
+        want.push(b'!');
+        assert_eq!(text(map.get("k")), Some(want));
         // Not a string kept inline.
         map.insert("l", list(&[b"x"]));
         assert!(map.append_str("l", b"x", usize::MAX).is_err());
@@ -400,7 +420,14 @@ fn appends_and_ranges_in_place() {
             map.append_str("big", b"x", usize::MAX),
             Ok((5_001, Written::InPlace))
         ));
-        assert_eq!(map.set_range_in_place("big", 0, b"x"), None);
+        assert!(matches!(
+            map.edit_str_in_place("big", 0, b"x"),
+            Some(Written::InPlace)
+        ));
+        let mut want = bytes(5_000, 1);
+        want[0] = b'x';
+        want.push(b'x');
+        assert_eq!(text(map.get("big")), Some(want));
     });
 }
 

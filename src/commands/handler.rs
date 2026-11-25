@@ -2831,6 +2831,11 @@ fn announce_command_events(ctx: &Ctx, name: &str, result: &[u8]) {
     if result.starts_with(b"-") || crate::commands::blocking::parked(ctx) {
         return;
     }
+    // A BITFIELD that changed no field and grew nothing wrote nothing, and
+    // Redis 8 announces nothing for it.
+    if name == "BITFIELD" && ctx.skip_write_side_effects {
+        return;
+    }
     for event in crate::keyspace_events::command_events(name, &ctx.cmd, result) {
         if let Some(key) = ctx.cmd.get(event.key) {
             crate::keyspace_events::notify(
