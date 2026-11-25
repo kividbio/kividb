@@ -232,7 +232,7 @@ pub struct Config {
 
     /// An int8 first pass in FLAT KNN scans over many candidates, re-scored
     /// exactly: the same replies. See docs/CONFIGURATION.md.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    #[arg(long, default_value = "no", value_parser = parse_yes_no, num_args = 1)]
     pub search_flat_int8: bool,
 
     /// Rewrite the AOF once it has grown this much past its post-rewrite size,
