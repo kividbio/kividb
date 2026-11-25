@@ -1253,11 +1253,25 @@ impl Config {
     /// and values, which are what is in effect now. CONFIG REWRITE writes
     /// that; it used to write the configuration the server started with,
     /// and lose whatever CONFIG SET had changed since. A value that does not
-    /// read back as a directive leaves its setting as it was.
+    /// read back as a directive leaves its setting as it was, and so does
+    /// one shown as `**redacted**`.
     pub fn with_values(&self, values: &[(String, String)]) -> Config {
         let mut config = self.clone();
         for (name, value) in values {
             if value == "**redacted**" {
+                continue;
+            }
+            // A password or a user name is taken whole, spaces, quotes and
+            // all; empty unsets it.
+            let secret = match name.to_ascii_lowercase().as_str() {
+                "requirepass" => Some(&mut config.requirepass),
+                "masterauth" | "primaryauth" => Some(&mut config.masterauth),
+                "masteruser" | "primaryuser" => Some(&mut config.masteruser),
+                "cluster-bus-secret" => Some(&mut config.cluster_bus_secret),
+                _ => None,
+            };
+            if let Some(field) = secret {
+                field.clone_from(value);
                 continue;
             }
             let args: Vec<String> = value.split_whitespace().map(String::from).collect();
@@ -1303,7 +1317,12 @@ impl Config {
     /// ([`crate::redis_settings::remembered_defaults`]) is written only when
     /// it is not at its default, since the file then warns of it at every
     /// start. Empty values are left out, since one reads back as a missing
-    /// argument; redacted ones are written above.
+    /// argument. Secrets (`requirepass`, `masterauth`, `cluster-bus-secret`)
+    /// are written as `values` gives them, so the caller passes them as they
+    /// are set, not as `CONFIG GET` shows them.
+    ///
+    /// The file is written beside the old one, synced, renamed over it, and
+    /// the directory synced: a crash leaves the old file or the new one.
     pub fn rewrite_with(&self, values: &[(String, String)]) -> Result<(), RewriteError> {
         if !self.configfile_loaded {
             return Err(RewriteError::NoConfigFile);
@@ -1315,7 +1334,7 @@ impl Config {
 
         let mut out = String::new();
         out.push_str(&format!("port {}\n", self.port));
-        out.push_str(&format!("bind {}\n", self.bind));
+        out.push_str(&format!("bind {}\n", quote(&self.bind)));
         // Where the data is, so that a restart from this file opens the
         // directory in use now: Sentinel's REPLICAOF is followed by
         // CONFIG REWRITE.
@@ -1463,13 +1482,16 @@ impl Config {
             out.push_str(&format!("masterauth {}\n", quote(&self.masterauth)));
         }
         if !self.masteruser.is_empty() {
-            out.push_str(&format!("masteruser {}\n", self.masteruser));
+            out.push_str(&format!("masteruser {}\n", quote(&self.masteruser)));
         }
         if !self.update_check {
             out.push_str("update-check no\n");
         }
         if self.update_check_url != crate::update_check::DEFAULT_URL {
-            out.push_str(&format!("update-check-url {}\n", self.update_check_url));
+            out.push_str(&format!(
+                "update-check-url {}\n",
+                quote(&self.update_check_url)
+            ));
         }
         out.push_str(&format!("repl-backlog-size {}\n", self.repl_backlog_size));
         out.push_str(&format!("repl-backlog-ttl {}\n", self.repl_backlog_ttl));
@@ -1510,13 +1532,13 @@ impl Config {
         if !self.cluster_announce_ip.is_empty() {
             out.push_str(&format!(
                 "cluster-announce-ip {}\n",
-                self.cluster_announce_ip
+                quote(&self.cluster_announce_ip)
             ));
         }
         if !self.cluster_announce_hostname.is_empty() {
             out.push_str(&format!(
                 "cluster-announce-hostname {}\n",
-                self.cluster_announce_hostname
+                quote(&self.cluster_announce_hostname)
             ));
         }
         out.push_str(&format!(
@@ -1538,13 +1560,13 @@ impl Config {
         if !self.cluster_announce_client_ipv4.is_empty() {
             out.push_str(&format!(
                 "cluster-announce-client-ipv4 {}\n",
-                self.cluster_announce_client_ipv4
+                quote(&self.cluster_announce_client_ipv4)
             ));
         }
         if !self.cluster_announce_client_ipv6.is_empty() {
             out.push_str(&format!(
                 "cluster-announce-client-ipv6 {}\n",
-                self.cluster_announce_client_ipv6
+                quote(&self.cluster_announce_client_ipv6)
             ));
         }
         if self.cluster_announce_bus_port != 0 {
@@ -1557,7 +1579,10 @@ impl Config {
             out.push_str(&format!("cluster-port {}\n", self.cluster_port));
         }
         if !self.cluster_bus_secret.is_empty() {
-            out.push_str(&format!("cluster-bus-secret {}\n", self.cluster_bus_secret));
+            out.push_str(&format!(
+                "cluster-bus-secret {}\n",
+                quote(&self.cluster_bus_secret)
+            ));
         }
         out.push_str(&format!(
             "cluster-bus-port-protected-mode {}\n",
@@ -1569,7 +1594,7 @@ impl Config {
         ));
         out.push_str(&format!(
             "cluster-config-file {}\n",
-            self.cluster_config_file
+            quote(&self.cluster_config_file)
         ));
         out.push_str(&format!(
             "cluster-replica-validity-factor {}\n",
@@ -1599,7 +1624,7 @@ impl Config {
             "stream-idmp-maxsize {}\n",
             self.stream_idmp_maxsize
         ));
-        out.push_str(&format!("backupdirname {}\n", self.backupdirname));
+        out.push_str(&format!("backupdirname {}\n", quote(&self.backupdirname)));
         out.push_str(&format!("backup-sealed-ttl {}\n", self.backup_sealed_ttl));
         out.push_str(&format!(
             "cluster-slot-migration-handoff-max-lag-bytes {}\n",
@@ -1618,7 +1643,11 @@ impl Config {
         if let Some(parts) = &self.replicaof
             && parts.len() == 2
         {
-            out.push_str(&format!("replicaof {} {}\n", parts[0], parts[1]));
+            out.push_str(&format!(
+                "replicaof {} {}\n",
+                quote(&parts[0]),
+                quote(&parts[1])
+            ));
         }
         if self.replica_announced_port != 0 {
             out.push_str(&format!(
@@ -1646,11 +1675,16 @@ impl Config {
                 out.push_str(&format!("{name} {}\n", quote(value)));
             }
         }
-        // Names checked when set, one word each, written as `bind` is.
+        // Names checked when set, each a word of its own.
         if !self.tls_auth_clients_allowed_names.is_empty() {
+            let names: Vec<String> = self
+                .tls_auth_clients_allowed_names
+                .split_whitespace()
+                .map(quote)
+                .collect();
             out.push_str(&format!(
                 "tls-auth-clients-allowed-names {}\n",
-                self.tls_auth_clients_allowed_names
+                names.join(" ")
             ));
         }
         if self.tls_auth_clients != "yes" {
@@ -1680,8 +1714,9 @@ impl Config {
                 continue;
             }
             // A list (`latency-tracking-info-percentiles 50 99 99.9`) is
-            // written as its words, as Redis writes it.
-            if value.contains(char::is_whitespace) {
+            // written as its words, as Redis writes it; a secret
+            // (`tls-key-file-pass`) as one quoted value.
+            if value.contains(char::is_whitespace) && !is_secret(&name) {
                 out.push_str(&format!("{name} {value}\n"));
             } else {
                 out.push_str(&format!("{name} {}\n", quote(value)));
@@ -1711,7 +1746,26 @@ impl Config {
         // others while they are written.
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&tmp).map_err(RewriteError::Io)?;
+        let file = options.open(&tmp).map_err(RewriteError::Io)?;
+        // From here on, a failure leaves the old file as it is, and the
+        // temporary one is removed.
+        let written = Self::fill_and_replace(file, &tmp, path, out.as_bytes());
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        written.map_err(RewriteError::Io)
+    }
+
+    /// The rest of [`Config::rewrite_with`]: `out` written to `file`, which
+    /// was just created at `tmp`, in the old file's mode and owner; synced;
+    /// renamed to `path`; and `path`'s directory synced, so that the rename
+    /// is kept too.
+    fn fill_and_replace(
+        mut file: std::fs::File,
+        tmp: &std::path::Path,
+        path: &std::path::Path,
+        out: &[u8],
+    ) -> std::io::Result<()> {
         // Set, not just created with: the umask narrows the mode a file is
         // created with.
         #[cfg(unix)]
@@ -1719,21 +1773,28 @@ impl Config {
             use std::os::unix::fs::{MetadataExt, PermissionsExt};
             match std::fs::metadata(path) {
                 Ok(old) => {
-                    file.set_permissions(old.permissions())
-                        .map_err(RewriteError::Io)?;
+                    file.set_permissions(old.permissions())?;
                     // Only root may give a file away; for anyone else this
                     // fails, and the file stays the process's.
                     let _ = std::os::unix::fs::fchown(&file, Some(old.uid()), Some(old.gid()));
                 }
-                Err(_) => file
-                    .set_permissions(std::fs::Permissions::from_mode(0o600))
-                    .map_err(RewriteError::Io)?,
+                Err(_) => file.set_permissions(std::fs::Permissions::from_mode(0o600))?,
             }
         }
-        std::io::Write::write_all(&mut file, out.as_bytes()).map_err(RewriteError::Io)?;
+        std::io::Write::write_all(&mut file, out)?;
+        file.sync_all()?;
         drop(file);
-        std::fs::rename(&tmp, path).map_err(RewriteError::Io)?;
-
+        std::fs::rename(tmp, path)?;
+        // The rename is an entry in the directory: synced, so that after a
+        // crash the directory names the new file.
+        #[cfg(unix)]
+        {
+            let dir = match path.parent() {
+                Some(dir) if !dir.as_os_str().is_empty() => dir,
+                _ => std::path::Path::new("."),
+            };
+            std::fs::File::open(dir)?.sync_all()?;
+        }
         Ok(())
     }
 
@@ -2667,6 +2728,85 @@ mod config_file_tests {
         let mut config = Config::default();
         let warnings = config.apply_config_text(text, &|_| false)?;
         Ok((config, warnings))
+    }
+
+    /// The words of the line of `text` that sets `name`.
+    fn line_of(text: &str, name: &str) -> Vec<String> {
+        let line = text
+            .lines()
+            .find(|line| line.split_whitespace().next() == Some(name))
+            .unwrap_or_else(|| panic!("no {name} in\n{text}"));
+        split_config_line(line).unwrap()
+    }
+
+    /// Secrets, user names and addresses are written so that each reads back
+    /// as the one value it is: spaces, quotes, `#`, backslashes and
+    /// non-ASCII included. `with_values` takes a secret whole, and empty
+    /// unsets it.
+    #[test]
+    fn rewrite_writes_values_that_read_back_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kividb.conf");
+        std::fs::write(&path, "").unwrap();
+        let odd = "a \"b\" # c 'd' \\ é\tf";
+        let mut config = Config {
+            configfile: path.to_str().unwrap().to_string(),
+            configfile_loaded: true,
+            configfile_named: true,
+            requirepass: "at start".into(),
+            masterauth: "at start".into(),
+            ..Config::default()
+        };
+        config = config.with_values(&[
+            ("requirepass".into(), odd.into()),
+            ("masterauth".into(), odd.into()),
+            ("masteruser".into(), "user # one".into()),
+            ("cluster-bus-secret".into(), odd.into()),
+        ]);
+        config.cluster_announce_hostname = "#host".into();
+        let rewritten = config.rewrite_with(&[("tls-key-file-pass".into(), odd.into())]);
+        assert!(rewritten.is_ok(), "the rewrite failed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        for (name, value) in [
+            ("requirepass", odd),
+            ("masterauth", odd),
+            ("masteruser", "user # one"),
+            ("cluster-bus-secret", odd),
+            ("tls-key-file-pass", odd),
+            ("cluster-announce-hostname", "#host"),
+            ("bind", config.bind.as_str()),
+        ] {
+            assert_eq!(line_of(&text, name), [name, value], "{text}");
+        }
+
+        let unset = config.with_values(&[
+            ("requirepass".into(), String::new()),
+            ("masterauth".into(), String::new()),
+            ("cluster-bus-secret".into(), "**redacted**".into()),
+        ]);
+        assert_eq!(unset.requirepass, "");
+        assert_eq!(unset.masterauth, "");
+        assert_eq!(unset.cluster_bus_secret, odd);
+    }
+
+    /// The rewritten file replaces the old one whole, and nothing is left
+    /// at the temporary path.
+    #[test]
+    fn rewrite_replaces_the_file_and_leaves_no_temporary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kividb.conf");
+        std::fs::write(&path, "port 1\n").unwrap();
+        let config = Config {
+            configfile: path.to_str().unwrap().to_string(),
+            configfile_loaded: true,
+            configfile_named: true,
+            port: 7777,
+            ..Config::default()
+        };
+        assert!(config.rewrite_with(&[]).is_ok(), "the rewrite failed");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("port 7777\n"), "{text}");
+        assert!(!path.with_extension("tmp").exists());
     }
 
     #[test]

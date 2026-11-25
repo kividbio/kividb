@@ -227,6 +227,11 @@ pub struct ReplState {
     /// `(masteruser, masterauth)` — what this node authenticates with when it
     /// connects to a master as a replica.
     master_credentials: RwLock<(String, String)>,
+    /// `requirepass` as it is set now: the configuration's, then the last
+    /// `CONFIG SET requirepass`. A password is checked against the default
+    /// user in the ACL store, which keeps only its hash; this is the text
+    /// `CONFIG REWRITE` writes, as Redis writes `requirepass`.
+    requirepass: RwLock<String>,
     /// Master side: the hub is keeping a backlog of the write stream, so every
     /// write has to reach it — replicas connected or not. Set at the cut of
     /// the first full sync; cleared by the hub once no replica has been
@@ -606,6 +611,7 @@ impl ReplState {
             full_sync_guard: AtomicU8::new(FullSyncGuard::Empty as u8),
             full_sync_guard_ratio: AtomicU64::new(50),
             master_credentials: RwLock::new((String::new(), String::new())),
+            requirepass: RwLock::new(String::new()),
             backlog_active: AtomicBool::new(false),
             #[cfg(test)]
             hub_parks: AtomicU64::new(0),
@@ -1006,6 +1012,15 @@ impl ReplState {
         self.master_credentials.write().1 = password.to_string();
     }
 
+    /// `requirepass` as it is set now (empty: none).
+    pub fn requirepass(&self) -> String {
+        self.requirepass.read().clone()
+    }
+
+    pub fn set_requirepass(&self, password: &str) {
+        *self.requirepass.write() = password.to_string();
+    }
+
     /// A master-role state carrying the replication settings from `config`.
     pub fn from_config(config: &crate::config::Config) -> Self {
         let state = Self::new_master();
@@ -1039,6 +1054,7 @@ impl ReplState {
         );
         state.set_master_user(&config.masteruser);
         state.set_master_auth(&config.masterauth);
+        state.set_requirepass(&config.requirepass);
         state
             .backlog_size
             .store(config.repl_backlog_size, Ordering::Relaxed);

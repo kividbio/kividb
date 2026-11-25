@@ -617,6 +617,8 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         default_user.passwords = vec![crate::acl::sha256_hex(value)];
                     }
                 }
+                // As set, for `CONFIG REWRITE`: the store keeps a hash.
+                ctx.repl_state.set_requirepass(value);
                 Some(resp_simple("OK"))
             }
             "appendonly" => match value {
@@ -2218,6 +2220,24 @@ fn output_buffer_limits(ctx: &Ctx) -> String {
         },
     );
     limits.to_config_string()
+}
+
+/// [`config_rows`] with each secret as it is set now, where `CONFIG GET`
+/// shows `**redacted**`: what `CONFIG REWRITE` writes, and what a `CONFIG
+/// SET` of several settings puts back when one of them is refused. Never a
+/// reply to a client.
+fn config_rows_with_secrets(ctx: &Ctx) -> Vec<(String, String)> {
+    let (_, master_auth) = ctx.repl_state.master_credentials();
+    let mut rows = config_rows(ctx);
+    for (name, value) in rows.iter_mut() {
+        match name.as_str() {
+            "requirepass" => *value = ctx.repl_state.requirepass(),
+            "masterauth" => value.clone_from(&master_auth),
+            "cluster-bus-secret" => value.clone_from(&ctx.config.cluster_bus_secret),
+            _ => {}
+        }
+    }
+    rows
 }
 
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
@@ -5626,7 +5646,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // it would be alone, in order; if one is refused, the
                     // ones before it are put back to what they were.
                     let before = if settings.len() > 1 {
-                        config_rows(ctx)
+                        config_rows_with_secrets(ctx)
                     } else {
                         Vec::new()
                     };
@@ -5697,7 +5717,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "REWRITE" => {
                     use crate::config::RewriteError;
-                    let rows = config_rows(ctx);
+                    let rows = config_rows_with_secrets(ctx);
                     match ctx.config.with_values(&rows).rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
