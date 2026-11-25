@@ -405,29 +405,8 @@ fn warn_clamped(param: &str, asked: usize, kept: usize) {
 }
 
 /// A setting's own name, for one Redis also takes under an older one.
-fn config_name(name: &str) -> &str {
-    match name {
-        "cluster-slave-no-failover" => "cluster-replica-no-failover",
-        "slave-lazy-flush" => "replica-lazy-flush",
-        "slave-serve-stale-data" => "replica-serve-stale-data",
-        "slave-read-only" => "replica-read-only",
-        "slave-ignore-maxmemory" => "replica-ignore-maxmemory",
-        "slave-announce-ip" => "replica-announce-ip",
-        "cluster-slave-validity-factor" => "cluster-replica-validity-factor",
-        "list-max-ziplist-size" => "list-max-listpack-size",
-        "slave-priority" => "replica-priority",
-        "slave-announce-port" => "replica-announce-port",
-        "repl-ping-slave-period" => "repl-ping-replica-period",
-        "min-slaves-to-write" => "min-replicas-to-write",
-        "min-slaves-max-lag" => "min-replicas-max-lag",
-        "lua-time-limit" => "busy-reply-threshold",
-        "hash-max-ziplist-entries" => "hash-max-listpack-entries",
-        "zset-max-ziplist-entries" => "zset-max-listpack-entries",
-        "hash-max-ziplist-value" => "hash-max-listpack-value",
-        "zset-max-ziplist-value" => "zset-max-listpack-value",
-        "slaveof" => "replicaof",
-        other => other,
-    }
+pub(crate) fn config_name(name: &str) -> &str {
+    crate::config::setting_name(name)
 }
 
 /// `CONFIG SET appendonly yes` with the AOF off: the log made, and the
@@ -2224,85 +2203,9 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::BTreeMap<String, String>>,
 > = std::sync::LazyLock::new(|| {
     parking_lot::Mutex::new(
-        [
-            ("list-max-listpack-size", "-2"),
-            ("list-max-ziplist-size", "-2"),
-            ("list-compress-depth", "0"),
-            ("hll-sparse-max-bytes", "3000"),
-            ("proto-max-bulk-len", "536870912"),
-            ("client-query-buffer-limit", "1073741824"),
-            ("latency-tracking", "yes"),
-            ("latency-tracking-info-percentiles", "50 99 99.9"),
-            ("maxclients", "10000"),
-            ("maxmemory-clients", "0"),
-            // No save points: nothing is saved on a timer.
-            ("save", ""),
-            ("appendfsync", "everysec"),
-            // `DEL` frees what it deletes before it replies (#152).
-            ("lazyfree-lazy-user-del", "no"),
-            ("lazyfree-lazy-user-flush", "no"),
-            ("lazyfree-lazy-expire", "yes"),
-            ("lazyfree-lazy-server-del", "yes"),
-            ("close-on-replica-write", "yes"),
-            ("hz", "10"),
-            ("activerehashing", "yes"),
-            ("lazyfree-lazy-eviction", "no"),
-            ("timeout", "0"),
-            ("tcp-keepalive", "300"),
-            ("latency-monitor-threshold", "0"),
-            ("ts-duplicate-policy", "last"),
-            ("aof-ack-after-write", "yes"),
-            ("rdbcompression", "no"),
-        ]
-        .into_iter()
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .chain([
-            (
-                "set-max-intset-entries".to_string(),
-                crate::member_set::DEFAULT_INTSET_MAX.to_string(),
-            ),
-            (
-                "set-max-listpack-entries".to_string(),
-                crate::member_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "set-max-listpack-value".to_string(),
-                crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "hash-max-listpack-entries".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "hash-max-ziplist-entries".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "hash-max-listpack-value".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "hash-max-ziplist-value".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "zset-max-listpack-entries".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "zset-max-ziplist-entries".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "zset-max-listpack-value".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "zset-max-ziplist-value".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-        ])
-        .collect(),
+        crate::redis_settings::remembered_defaults()
+            .into_iter()
+            .collect(),
     )
 });
 
@@ -5804,7 +5707,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "REWRITE" => {
                     use crate::config::RewriteError;
-                    match ctx.config.with_values(&config_rows(ctx)).rewrite_to_disk() {
+                    let rows = config_rows(ctx);
+                    match ctx.config.with_values(&rows).rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",

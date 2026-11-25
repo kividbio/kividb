@@ -1,0 +1,7 @@
+{
+  "private": true,
+  "description": "The ioredis client of scripts/sentinel/run.sh",
+  "dependencies": {
+    "ioredis": "5.11.1"
+  }
+}
