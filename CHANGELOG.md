@@ -2340,6 +2340,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`CONFIG REWRITE` writes `dir`, `io-model`, `replica-announced-port`,
+  `preload-file` and the TLS settings.** It left them out, so a server
+  restarted from the file it wrote opened the directory it was started
+  from, without its data, and served without TLS. Redis Sentinel sends
+  `CONFIG REWRITE` after every `REPLICAOF` it gives, so one failover was
+  enough: the old master or a repointed replica, restarted, came up empty
+  or waited on another node's `kividb.lock`. TLS lines are written only
+  where they are set, so a build without TLS reads its own file back.
+
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the
   entry point and the others link to it, whether they come from a vector

@@ -1299,6 +1299,20 @@ impl Config {
         let mut out = String::new();
         out.push_str(&format!("port {}\n", self.port));
         out.push_str(&format!("bind {}\n", self.bind));
+        // Where the data is. Left out, a restart opened the directory it
+        // was started from instead, without the data: Sentinel's REPLICAOF
+        // is followed by CONFIG REWRITE, so a failover was enough.
+        if !self.dir.is_empty() {
+            out.push_str(&format!("dir {}\n", quote(&self.dir)));
+        }
+        out.push_str(&format!(
+            "io-model {}\n",
+            match self.io_model {
+                IoModel::Auto => "auto",
+                IoModel::Uring => "uring",
+                IoModel::Tokio => "tokio",
+            }
+        ));
         out.push_str(&format!(
             "protected-mode {}\n",
             if self.protected_mode { "yes" } else { "no" }
@@ -1588,6 +1602,50 @@ impl Config {
             && parts.len() == 2
         {
             out.push_str(&format!("replicaof {} {}\n", parts[0], parts[1]));
+        }
+        if self.replica_announced_port != 0 {
+            out.push_str(&format!(
+                "replica-announced-port {}\n",
+                self.replica_announced_port
+            ));
+        }
+        // Read on every start, so kept as the file had it.
+        if !self.preload_file.is_empty() {
+            out.push_str(&format!("preload-file {}\n", quote(&self.preload_file)));
+        }
+        // TLS, where it is set: left out, a restart served plaintext, or
+        // refused to start for want of a certificate. Each line is written
+        // only when it is not the default, so a build without TLS reads back
+        // a file it wrote.
+        if self.tls_port != 0 {
+            out.push_str(&format!("tls-port {}\n", self.tls_port));
+        }
+        for (name, value) in [
+            ("tls-cert-file", &self.tls_cert_file),
+            ("tls-key-file", &self.tls_key_file),
+            ("tls-ca-cert-file", &self.tls_ca_cert_file),
+            ("tls-client-cert-file", &self.tls_client_cert_file),
+            ("tls-client-key-file", &self.tls_client_key_file),
+        ] {
+            if !value.is_empty() {
+                out.push_str(&format!("{name} {}\n", quote(value)));
+            }
+        }
+        // Names checked when set, one word each, written as `bind` is.
+        if !self.tls_auth_clients_allowed_names.is_empty() {
+            out.push_str(&format!(
+                "tls-auth-clients-allowed-names {}\n",
+                self.tls_auth_clients_allowed_names
+            ));
+        }
+        if self.tls_auth_clients != "yes" {
+            out.push_str(&format!("tls-auth-clients {}\n", self.tls_auth_clients));
+        }
+        if self.tls_cluster {
+            out.push_str("tls-cluster yes\n");
+        }
+        if self.tls_replication {
+            out.push_str("tls-replication yes\n");
         }
 
         // The new file keeps the old one's mode, and its owner where the
@@ -3020,6 +3078,74 @@ mod config_file_tests {
         // CONFIG REWRITE dropped this setting once: a restart came back
         // unpinned.
         assert!(written.contains("worker-cpu-affinity auto\n"), "{written}");
+    }
+
+    /// CONFIG REWRITE left out `dir`, `io-model`, `replica-announced-port`,
+    /// `preload-file` and every TLS setting. Sentinel follows its
+    /// `REPLICAOF` with CONFIG REWRITE, so after a failover a node restarted
+    /// from its file opened the directory it was started from, without its
+    /// data, and served without TLS. Each is read back as it was.
+    #[test]
+    fn config_rewrite_keeps_dir_tls_and_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("kividb.conf");
+        std::fs::write(&path, "port 7001\n").unwrap();
+        let config = Config {
+            configfile: path.to_string_lossy().into_owned(),
+            configfile_loaded: true,
+            configfile_named: true,
+            dir: tmp.path().join("data dir").to_string_lossy().into_owned(),
+            io_model: IoModel::Tokio,
+            replica_announced_port: 7100,
+            preload_file: "/backups/seed.kdb".into(),
+            tls_port: 6390,
+            tls_cert_file: "/etc/kividb/server.crt".into(),
+            tls_key_file: "/etc/kividb/server.key".into(),
+            tls_ca_cert_file: "/etc/kividb/ca.crt".into(),
+            tls_client_cert_file: "/etc/kividb/client.crt".into(),
+            tls_client_key_file: "/etc/kividb/client.key".into(),
+            tls_auth_clients: "optional".into(),
+            tls_auth_clients_allowed_names: "app.example.com *.svc.local".into(),
+            tls_cluster: true,
+            tls_replication: true,
+            ..Config::default()
+        };
+        assert!(config.rewrite_to_disk().is_ok());
+        let written = std::fs::read_to_string(&path).unwrap();
+        let (back, warnings) = load(&written).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(back.dir, config.dir, "{written}");
+        assert_eq!(back.io_model, IoModel::Tokio, "{written}");
+        assert_eq!(back.replica_announced_port, 7100, "{written}");
+        assert_eq!(back.preload_file, config.preload_file, "{written}");
+        assert_eq!(back.tls_port, 6390, "{written}");
+        assert_eq!(back.tls_cert_file, config.tls_cert_file, "{written}");
+        assert_eq!(back.tls_key_file, config.tls_key_file, "{written}");
+        assert_eq!(back.tls_ca_cert_file, config.tls_ca_cert_file, "{written}");
+        assert_eq!(back.tls_client_cert_file, config.tls_client_cert_file);
+        assert_eq!(back.tls_client_key_file, config.tls_client_key_file);
+        assert_eq!(back.tls_auth_clients, "optional", "{written}");
+        assert_eq!(
+            back.tls_auth_clients_allowed_names, config.tls_auth_clients_allowed_names,
+            "{written}"
+        );
+        assert!(back.tls_cluster && back.tls_replication, "{written}");
+
+        // Left at their defaults, none of them is written: a build without
+        // TLS reads the file back.
+        let config = Config {
+            configfile: config.configfile.clone(),
+            configfile_loaded: true,
+            configfile_named: true,
+            ..Config::default()
+        };
+        assert!(config.dir.is_empty());
+        assert!(config.rewrite_to_disk().is_ok());
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("tls-"), "{written}");
+        assert!(!written.contains("\ndir "), "{written}");
+        assert!(!written.contains("preload-file"), "{written}");
+        assert!(!written.contains("replica-announced-port"), "{written}");
     }
 }
 
