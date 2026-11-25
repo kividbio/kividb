@@ -42,11 +42,12 @@
 //! whose postings gave back an id while it ran tries each hit against the
 //! filter (`commands::vector::knn_planned`).
 
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock, Weak};
 
-use parking_lot::{RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use super::flat_int8::{self, Codec, HEADER};
 use super::postings::{Bits, NO_DOC, PostingsLock, PostingsRead};
 use super::slots::Slots;
 use super::{KnnResult, PreparedQuery};
@@ -78,7 +79,30 @@ pub struct VectorIndex {
     map: RwLock<Map>,
     /// Slots given back so far.
     frees: AtomicU64,
+    me: Weak<VectorIndex>,
+    copy: OnceLock<Int8Copy>,
+    coding: AtomicBool,
+    cursor: AtomicUsize,
+    skipped: AtomicU64,
+    rescored: AtomicU64,
 }
+
+#[derive(Debug)]
+struct Int8Copy {
+    codec: Codec,
+    slots: Slots,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    Auto,
+    #[cfg(test)]
+    Off,
+    #[cfg(test)]
+    On,
+}
+
+const CODING_HOLD: std::time::Duration = std::time::Duration::from_micros(50);
 
 #[derive(Debug, Default)]
 struct Map {
@@ -94,6 +118,7 @@ struct Map {
     /// By document id: its slot, or [`NO_SLOT`]. Valid only where `slot_doc`
     /// says the same.
     doc_slot: Vec<AtomicU32>,
+    dirty: Vec<AtomicU64>,
 }
 
 impl Map {
@@ -116,6 +141,18 @@ impl Map {
             .get(slot as usize)
             .is_some_and(|d| d.load(Relaxed) == doc);
         mine.then_some(slot)
+    }
+
+    fn mark(&mut self, slot: u32) {
+        let w = slot as usize / 64;
+        if self.dirty.len() <= w {
+            self.dirty.resize_with(w + 1, || AtomicU64::new(0));
+        }
+        self.dirty[w].fetch_or(1 << (slot % 64), Relaxed);
+    }
+
+    fn any_dirty(&self) -> bool {
+        self.dirty.iter().any(|w| w.load(Relaxed) != 0)
     }
 
     /// Forget the id recorded for `slot`, if any.
@@ -153,12 +190,26 @@ impl Map {
     }
 }
 
-/// What a scan measures: each vector with its key.
-type Visit<'v> = dyn FnMut(&[f32], &str) + 'v;
+/// What a scan measures: each slot with its key.
+type Visit<'v> = dyn FnMut(usize, &str) + 'v;
+
+struct Tally {
+    on: bool,
+    seen: usize,
+    skipped: u64,
+    rescored: u64,
+}
 
 impl VectorIndex {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn new_shared() -> Arc<Self> {
+        Arc::new_cyclic(|me| Self {
+            me: me.clone(),
+            ..Self::default()
+        })
     }
 
     /// `key`'s vector is `vec` now. For tests and callers that know no id.
@@ -208,16 +259,21 @@ impl VectorIndex {
                 Some(&slot) => slot,
                 None => map.keys.len() as u32,
             };
-            if !slots.has(slot as usize) {
+            let copy = self.copy.get();
+            if !slots.has(slot as usize) || copy.is_some_and(|c| !c.slots.has(slot as usize)) {
                 // Room made with the lock let go: a block of 1,024 vectors
                 // of 1536 dimensions is 6 MB. Then looked at again.
                 drop(map);
                 slots.reserve(slot as usize);
+                if let Some(copy) = copy {
+                    copy.slots.reserve(slot as usize);
+                }
                 map = self.map.write();
                 continue;
             }
             break (slot, true);
         };
+        let copy = self.copy.get();
         // SAFETY: the write lock is held, and every reader of a slot's
         // vector holds the read lock. A slot is read only for the key it
         // holds: a new slot is given its key once `fill` has written all of
@@ -246,6 +302,145 @@ impl VectorIndex {
             }
             map.note_doc(slot, doc);
         }
+        if let Some(copy) = copy {
+            // SAFETY: the write lock is held; readers of a slot's copy hold
+            // the read lock.
+            unsafe { copy.slots.write_bytes(slot as usize, 0, &[0; HEADER]) };
+            map.mark(slot);
+        }
+        let count = map.by_key.len();
+        drop(map);
+        if copy.is_some() || self.wants_copy(count) {
+            self.schedule();
+        }
+    }
+
+    fn wants_copy(&self, count: usize) -> bool {
+        flat_int8::enabled()
+            && flat_int8::supported()
+            && self.copy.get().is_none()
+            && self.dim().is_some_and(|d| d >= flat_int8::DIM_MIN)
+            && count >= flat_int8::BUILD_AT
+    }
+
+    fn schedule(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if self.coding.swap(true, SeqCst) {
+            return;
+        }
+        match self.me.upgrade() {
+            Some(me) => coder::hand(Arc::downgrade(&me)),
+            None => self.coding.store(false, SeqCst),
+        }
+    }
+
+    fn code_some(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let Some(slots) = self.slots.get() else {
+            self.coding.store(false, SeqCst);
+            return false;
+        };
+        let Some(copy) = self.copy.get() else {
+            self.publish(slots);
+            return true;
+        };
+        let mut picked: Vec<(usize, Vec<f32>)> = Vec::new();
+        let mut found = false;
+        {
+            let map = self.map.read();
+            let words = map.dirty.len();
+            let start = self.cursor.load(Relaxed).min(words);
+            'words: for w in (start..words).chain(0..start) {
+                let word = &map.dirty[w];
+                let mut bits = word.load(Relaxed);
+                while bits != 0 {
+                    found = true;
+                    let b = bits.trailing_zeros();
+                    bits &= bits - 1;
+                    word.fetch_and(!(1u64 << b), Relaxed);
+                    let slot = w * 64 + b as usize;
+                    if map.keys.get(slot).is_some_and(Option::is_some) {
+                        picked.push((slot, slots.vector(slot).to_vec()));
+                    }
+                    if picked.len() >= RUN {
+                        self.cursor.store(w, Relaxed);
+                        break 'words;
+                    }
+                }
+            }
+        }
+        if !found {
+            self.coding.store(false, SeqCst);
+            let more = self.map.read().any_dirty();
+            return more && !self.coding.swap(true, SeqCst);
+        }
+        let bytes = copy.codec.bytes();
+        let mut scratch = Vec::new();
+        let mut codes = vec![0u8; picked.len() * bytes];
+        for ((_, v), out) in picked.iter().zip(codes.chunks_exact_mut(bytes)) {
+            copy.codec.encode(v, &mut scratch, out);
+        }
+        let mut map = self.map.write();
+        let mut since = std::time::Instant::now();
+        for ((slot, v), code) in picked.iter().zip(codes.chunks_exact(bytes)) {
+            let same = map.keys[*slot].is_some()
+                && slots
+                    .vector(*slot)
+                    .iter()
+                    .zip(v)
+                    .all(|(a, b)| a.to_bits() == b.to_bits());
+            if same {
+                // SAFETY: the write lock is held.
+                unsafe {
+                    copy.slots.write_bytes(*slot, HEADER, &code[HEADER..]);
+                    copy.slots.write_bytes(*slot, 0, &code[..HEADER]);
+                }
+            }
+            if since.elapsed() >= CODING_HOLD {
+                RwLockWriteGuard::bump(&mut map);
+                since = std::time::Instant::now();
+            }
+        }
+        true
+    }
+
+    fn publish(&self, slots: &Slots) {
+        let codec = Codec::new(slots.dim());
+        let bytes = Slots::bytes_only(codec.bytes());
+        loop {
+            let len = self.map.read().keys.len();
+            if len > 0 {
+                bytes.reserve(len - 1);
+            }
+            let mut map = self.map.write();
+            let len = map.keys.len();
+            if len == 0 || bytes.has(len - 1) {
+                for slot in 0..len {
+                    if map.keys[slot].is_some() {
+                        map.mark(slot as u32);
+                    }
+                }
+                let _ = self.copy.set(Int8Copy {
+                    codec,
+                    slots: bytes,
+                });
+                return;
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn code_now(&self) {
+        while self.code_some() {}
+    }
+
+    pub fn int8_copy(&self) -> Option<(usize, u64, u64)> {
+        let copy = self.copy.get()?;
+        Some((
+            copy.slots.bytes(),
+            self.skipped.load(Relaxed),
+            self.rescored.load(Relaxed),
+        ))
     }
 
     /// Take `key`'s vector out, if the index holds one.
@@ -311,9 +506,14 @@ impl VectorIndex {
         k: usize,
         deadline: Option<std::time::Instant>,
     ) -> (Vec<KnnResult>, bool) {
-        self.nearest_by(query, k, &mut |index, hold, visit| {
-            index.each(hold, deadline, visit)
-        })
+        let candidates = self.len();
+        self.nearest_by(
+            query,
+            k,
+            candidates,
+            Pass::Auto,
+            &mut |index, hold, visit| index.each(hold, deadline, visit),
+        )
     }
 
     /// The nearest `k` of the documents `ids` (by the ids `postings` gave
@@ -327,9 +527,39 @@ impl VectorIndex {
         postings: &PostingsLock,
         deadline: Option<std::time::Instant>,
     ) -> (Vec<KnnResult>, bool) {
-        self.nearest_by(query, k, &mut |index, hold, visit| {
-            index.each_doc(ids, postings, hold, deadline, visit)
-        })
+        self.nearest_by(
+            query,
+            k,
+            ids.count(),
+            Pass::Auto,
+            &mut |index, hold, visit| index.each_doc(ids, postings, hold, deadline, visit),
+        )
+    }
+
+    fn pass(
+        &self,
+        query: &PreparedQuery<'_>,
+        k: usize,
+        candidates: usize,
+        mode: Pass,
+    ) -> Option<(&Int8Copy, flat_int8::Query)> {
+        let wanted = match mode {
+            Pass::Auto => {
+                flat_int8::enabled()
+                    && flat_int8::supported()
+                    && candidates >= flat_int8::CANDIDATES_MIN
+                    && k.saturating_mul(flat_int8::K_SHARE) <= candidates
+            }
+            #[cfg(test)]
+            Pass::Off => false,
+            #[cfg(test)]
+            Pass::On => true,
+        };
+        if !wanted || k == 0 {
+            return None;
+        }
+        let copy = self.copy.get()?;
+        Some((copy, copy.codec.query(query.metric(), query.vector())?))
     }
 
     /// The nearest `k` of what `scan` measures: run again holding the lock
@@ -338,16 +568,59 @@ impl VectorIndex {
         &self,
         query: &PreparedQuery<'_>,
         k: usize,
+        candidates: usize,
+        mode: Pass,
         scan: &mut dyn FnMut(&Self, bool, &mut Visit<'_>) -> bool,
     ) -> (Vec<KnnResult>, bool) {
-        if self.dim() != Some(query.vector().len()) {
+        let Some(slots) = self.slots.get() else {
+            return (Vec::new(), false);
+        };
+        if slots.dim() != query.vector().len() {
             return (Vec::new(), false);
         }
+        if mode == Pass::Auto
+            && flat_int8::enabled()
+            && self.copy.get().is_none()
+            && self.wants_copy(self.len())
+        {
+            self.schedule();
+        }
+        let pass = self.pass(query, k, candidates, mode);
         let mut hold = false;
         loop {
             let frees = self.frees.load(Relaxed);
             let mut best = Best::new(k);
-            let cut = scan(self, hold, &mut |v, key| best.offer(query.to_raw(v), key));
+            let mut tally = Tally {
+                on: pass.is_some(),
+                seen: 0,
+                skipped: 0,
+                rescored: 0,
+            };
+            let cut = scan(self, hold, &mut |slot, key| {
+                if let Some((copy, q)) = &pass
+                    && tally.on
+                {
+                    tally.seen += 1;
+                    if let Some(kth) = best.kth()
+                        && let Some(lb) = q.lower_bound(copy.slots.slot_bytes(slot))
+                        && lb >= f64::from(kth)
+                    {
+                        tally.skipped += 1;
+                        return;
+                    }
+                    tally.rescored += 1;
+                    if tally.seen.is_multiple_of(flat_int8::CUT_EVERY)
+                        && tally.rescored as usize * flat_int8::CUT_SHARE > tally.seen
+                    {
+                        tally.on = false;
+                    }
+                }
+                best.offer(query.to_raw(slots.vector(slot)), key);
+            });
+            if pass.is_some() {
+                self.skipped.fetch_add(tally.skipped, Relaxed);
+                self.rescored.fetch_add(tally.rescored, Relaxed);
+            }
             let found = best.into_sorted();
             if hold || self.frees.load(Relaxed) == frees || !twice(&found) {
                 return (found, cut);
@@ -365,9 +638,9 @@ impl VectorIndex {
         deadline: Option<std::time::Instant>,
         visit: &mut Visit<'_>,
     ) -> bool {
-        let Some(slots) = self.slots.get() else {
+        if self.slots.get().is_none() {
             return false;
-        };
+        }
         let mut map = self.map.read();
         let mut at = 0;
         let mut runs = 0;
@@ -376,7 +649,7 @@ impl VectorIndex {
             // In order: the processor fetches the next slots on its own.
             for (i, key) in map.keys[at..end].iter().enumerate() {
                 if let Some(key) = key {
-                    visit(slots.vector(at + i), key);
+                    visit(at + i, key);
                 }
             }
             at = end;
@@ -407,9 +680,9 @@ impl VectorIndex {
         deadline: Option<std::time::Instant>,
         visit: &mut Visit<'_>,
     ) -> bool {
-        let Some(slots) = self.slots.get() else {
+        if self.slots.get().is_none() {
             return false;
-        };
+        }
         let mut map = self.map.read();
         let mut ids = ids.iter().peekable();
         let mut run: Vec<u32> = Vec::with_capacity(RUN);
@@ -438,7 +711,7 @@ impl VectorIndex {
             }
             for &slot in &run {
                 if let Some(key) = map.keys[slot as usize].as_deref() {
-                    visit(slots.vector(slot as usize), key);
+                    visit(slot as usize, key);
                 }
             }
             runs += 1;
@@ -453,6 +726,61 @@ impl VectorIndex {
             }
         }
         false
+    }
+}
+
+mod coder {
+    use super::VectorIndex;
+    use std::collections::VecDeque;
+    use std::sync::Weak;
+
+    type Queue = (VecDeque<Weak<VectorIndex>>, bool);
+
+    static QUEUE: parking_lot::Mutex<Queue> = parking_lot::const_mutex((VecDeque::new(), false));
+    static READY: parking_lot::Condvar = parking_lot::Condvar::new();
+
+    pub(super) fn hand(index: Weak<VectorIndex>) {
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            use crate::cpus::BuilderExt;
+            let started = std::thread::Builder::new()
+                .name("flat-int8".into())
+                .spawn_released(run);
+            if started.is_err() {
+                QUEUE.lock().1 = true;
+            }
+        });
+        let mut queue = QUEUE.lock();
+        if queue.1 {
+            return;
+        }
+        queue.0.push_back(index);
+        drop(queue);
+        READY.notify_one();
+    }
+
+    fn run() {
+        loop {
+            let index = {
+                let mut queue = QUEUE.lock();
+                loop {
+                    if let Some(index) = queue.0.pop_front() {
+                        break index;
+                    }
+                    READY.wait(&mut queue);
+                }
+            };
+            let Some(strong) = index.upgrade() else {
+                continue;
+            };
+            let more =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strong.code_some()))
+                    .unwrap_or(false);
+            drop(strong);
+            if more {
+                QUEUE.lock().0.push_back(index);
+            }
+        }
     }
 }
 
@@ -817,7 +1145,8 @@ mod tests {
                 let prepared = PreparedQuery::new(&DistanceMetric::L2, &q);
                 while !stop.load(Ordering::Relaxed) {
                     let hold = r == 0;
-                    flat.each(hold, None, &mut |v, key| check(v, key));
+                    let slots = flat.slots.get().unwrap();
+                    flat.each(hold, None, &mut |slot, key| check(slots.vector(slot), key));
                     // The writes so far, then the ids and the keys they named.
                     let before: Vec<u64> =
                         written.iter().map(|w| w.load(Ordering::SeqCst)).collect();
@@ -839,8 +1168,8 @@ mod tests {
                             "{key}: neither named by the ids nor written meanwhile"
                         );
                     };
-                    flat.each_doc(&ids, &postings, hold, None, &mut |v, key| {
-                        check(v, key);
+                    flat.each_doc(&ids, &postings, hold, None, &mut |slot, key| {
+                        check(slots.vector(slot), key);
                         met_by_ids(key);
                     });
                     // The nearest to 0 are the lowest numbers, which stay.
@@ -878,5 +1207,305 @@ mod tests {
                 assert_eq!(found, slot);
             }
         }
+    }
+
+    fn nearest_with(
+        flat: &VectorIndex,
+        query: &PreparedQuery<'_>,
+        k: usize,
+        mode: Pass,
+    ) -> Vec<KnnResult> {
+        let (found, cut) = flat.nearest_by(query, k, 0, mode, &mut |index, hold, visit| {
+            index.each(hold, None, visit)
+        });
+        assert!(!cut);
+        found
+    }
+
+    fn nearest_of_docs_with(
+        flat: &VectorIndex,
+        query: &PreparedQuery<'_>,
+        k: usize,
+        ids: &Bits,
+        postings: &PostingsLock,
+        mode: Pass,
+    ) -> Vec<KnnResult> {
+        let (found, cut) = flat.nearest_by(query, k, 0, mode, &mut |index, hold, visit| {
+            index.each_doc(ids, postings, hold, None, visit)
+        });
+        assert!(!cut);
+        found
+    }
+
+    fn pairs(found: &[KnnResult]) -> Vec<(String, u32)> {
+        found
+            .iter()
+            .map(|h| (h.key.clone(), h.score.to_bits()))
+            .collect()
+    }
+
+    #[test]
+    fn the_pass_answers_as_the_exact_scan() {
+        let mut seed = 0x1033_1033u64;
+        let mut skipped = 0u64;
+        for (dim, metric) in [
+            (256, DistanceMetric::Cosine),
+            (300, DistanceMetric::L2),
+            (768, DistanceMetric::InnerProduct),
+        ] {
+            let flat = VectorIndex::new();
+            let postings = PostingsLock::new(super::super::postings::Postings::new(&[]));
+            let centers: Vec<Vec<f32>> = (0..8).map(|_| random_vector(dim, &mut seed)).collect();
+            let near = |seed: &mut u64| {
+                let c = &centers[(rng(seed) % 8) as usize];
+                c.iter()
+                    .map(|x| x + ((rng(seed) % 2001) as f32 - 1000.0) / 4000.0)
+                    .collect::<Vec<f32>>()
+            };
+            for i in 0..2_000 {
+                let key = format!("doc:{i}");
+                let doc = postings.write().ensure(&key);
+                flat.insert_doc(&key, &near(&mut seed), doc);
+            }
+            flat.code_now();
+            for step in 0..400 {
+                for _ in 0..10 {
+                    let key = format!("doc:{}", rng(&mut seed) % 2_400);
+                    match rng(&mut seed) % 10 {
+                        0..=5 => {
+                            let mut v = near(&mut seed);
+                            match rng(&mut seed) % 50 {
+                                0 => v[3] = f32::NAN,
+                                1 => v.fill(0.0),
+                                _ => {}
+                            }
+                            let doc = postings.write().ensure(&key);
+                            flat.insert_doc(&key, &v, doc);
+                        }
+                        _ => {
+                            flat.remove(&key);
+                            postings.write().remove(&key);
+                        }
+                    }
+                }
+                if step % 3 == 0 {
+                    flat.code_now();
+                }
+                let q = near(&mut seed);
+                let prepared = PreparedQuery::new(&metric, &q);
+                let k = [1usize, 10, 100][step % 3];
+                let before = flat.skipped.load(Relaxed);
+                assert_eq!(
+                    pairs(&nearest_with(&flat, &prepared, k, Pass::On)),
+                    pairs(&nearest_with(&flat, &prepared, k, Pass::Off)),
+                    "{dim}-d step {step} k {k}"
+                );
+                let mut ids = Bits::new();
+                {
+                    let p = postings.peek();
+                    for id in p.live().iter() {
+                        if !rng(&mut seed).is_multiple_of(3) {
+                            ids.set(id);
+                        }
+                    }
+                }
+                if step % 2 == 0 {
+                    let gone = {
+                        let p = postings.peek();
+                        p.live()
+                            .iter()
+                            .find(|&id| ids.get(id))
+                            .and_then(|id| p.key(id).map(|k| (id, k.to_string())))
+                    };
+                    if let Some((id, key)) = gone {
+                        flat.remove(&key);
+                        postings.write().remove(&key);
+                        let again = format!("again:{dim}:{step}");
+                        let doc = postings.write().ensure(&again);
+                        assert_eq!(doc, id);
+                        flat.insert_doc(&again, &near(&mut seed), doc);
+                    }
+                }
+                assert_eq!(
+                    pairs(&nearest_of_docs_with(
+                        &flat,
+                        &prepared,
+                        k,
+                        &ids,
+                        &postings,
+                        Pass::On
+                    )),
+                    pairs(&nearest_of_docs_with(
+                        &flat,
+                        &prepared,
+                        k,
+                        &ids,
+                        &postings,
+                        Pass::Off
+                    )),
+                    "{dim}-d step {step} k {k}, by ids"
+                );
+                skipped += flat.skipped.load(Relaxed) - before;
+            }
+        }
+        assert!(skipped > 100_000, "skipped {skipped}");
+    }
+
+    #[test]
+    fn a_slot_written_over_never_keeps_the_old_copy() {
+        let flat = VectorIndex::new();
+        for i in 0..1_100 {
+            flat.insert(format!("k{i}"), vec![i as f32 + 1.0; 2048]);
+        }
+        flat.code_now();
+        let header = |key: &str| {
+            let map = flat.map.read();
+            let slot = map.find(key).unwrap() as usize;
+            flat.copy.get().unwrap().slots.slot_bytes(slot)[..HEADER].to_vec()
+        };
+        assert!(header("k5").iter().any(|&b| b != 0));
+        let mut nan = vec![1.0f32; 2048];
+        nan[9] = f32::NAN;
+        flat.insert("k5".into(), nan);
+        flat.code_now();
+        assert!(header("k5").iter().all(|&b| b == 0));
+        let before = header("k6");
+        flat.insert("k6".into(), vec![-3.0; 2048]);
+        assert!(header("k6").iter().all(|&b| b == 0));
+        flat.code_now();
+        let after = header("k6");
+        assert!(after.iter().any(|&b| b != 0) && after != before);
+        flat.remove("k7");
+        flat.insert("new".into(), vec![2.5; 2048]);
+        assert!(header("new").iter().all(|&b| b == 0));
+        flat.code_now();
+        assert!(header("new").iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn a_copy_block_is_zeroed_when_made() {
+        let flat = VectorIndex::new();
+        for i in 0..1_100 {
+            flat.insert(format!("k{i}"), vec![i as f32 + 1.0; 2048]);
+        }
+        flat.publish(flat.slots.get().unwrap());
+        let copy = flat.copy.get().unwrap();
+        assert!(copy.slots.bytes() >= 1_100 * 2_112);
+        for slot in 0..1_100 {
+            assert!(
+                copy.slots.slot_bytes(slot)[..HEADER]
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+        }
+        flat.code_now();
+        for slot in 0..1_100 {
+            assert!(
+                copy.slots.slot_bytes(slot)[..HEADER]
+                    .iter()
+                    .any(|&b| b != 0)
+            );
+        }
+    }
+
+    #[test]
+    fn the_pass_under_writes_and_the_coding_thread() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        const DIM: usize = 256;
+        const KEYS: u32 = 3_000;
+        const STEADY: u32 = 50;
+        let flat = VectorIndex::new_shared();
+        let postings = PostingsLock::new(super::super::postings::Postings::new(&[]));
+        let vector = |n: u32, version: u32| {
+            let mut v = vec![(n * 1000 + version % 1000) as f32; DIM];
+            v[0] += 0.5;
+            v
+        };
+        for n in 0..KEYS {
+            let key = format!("doc:{n}");
+            let doc = postings.write().ensure(&key);
+            flat.insert_doc(&key, &vector(n, 0), doc);
+        }
+        flat.schedule();
+        let stop = Arc::new(AtomicBool::new(false));
+        let checked = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for w in 0..3u64 {
+            let (flat, postings, stop) = (flat.clone(), postings.clone(), stop.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut seed = 0x5678 + w;
+                let mut version: u32 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    let n = (rng(&mut seed) % u64::from(KEYS / 3)) as u32 * 3 + w as u32;
+                    let key = format!("doc:{n}");
+                    version += 1;
+                    if n >= STEADY && rng(&mut seed).is_multiple_of(3) {
+                        flat.remove(&key);
+                        postings.write().remove(&key);
+                    } else {
+                        let doc = postings.write().ensure(&key);
+                        flat.insert_doc(&key, &vector(n, version), doc);
+                    }
+                }
+            }));
+        }
+        for _ in 0..3 {
+            let (flat, postings, stop, checked) = (
+                flat.clone(),
+                postings.clone(),
+                stop.clone(),
+                checked.clone(),
+            );
+            threads.push(std::thread::spawn(move || {
+                let q = vec![0.0f32; DIM];
+                let prepared = PreparedQuery::new(&DistanceMetric::L2, &q);
+                while !stop.load(Ordering::Relaxed) {
+                    let ids = postings.peek().live().clone();
+                    for found in [
+                        nearest_with(&flat, &prepared, 10, Pass::On),
+                        nearest_of_docs_with(&flat, &prepared, 10, &ids, &postings, Pass::On),
+                    ] {
+                        assert!(!twice(&found));
+                        let names: Vec<&str> = found.iter().map(|h| h.key.as_str()).collect();
+                        let want: Vec<String> = (0..10).map(|i| format!("doc:{i}")).collect();
+                        assert_eq!(names, want);
+                        for hit in &found {
+                            let n: u32 = hit.key["doc:".len()..].parse().unwrap();
+                            let base = (n * 1000) as f32;
+                            assert!(hit.score >= base * base * DIM as f32 * 0.99);
+                        }
+                    }
+                    checked.fetch_add(1, Ordering::Relaxed);
+                }
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(checked.load(Ordering::Relaxed) > 30);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while flat.coding.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < until, "coding never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let copy = flat.copy.get().expect("the copy was built");
+        let map = flat.map.read();
+        let slots = flat.slots.get().unwrap();
+        let mut scratch = Vec::new();
+        let mut want = vec![0u8; copy.codec.bytes()];
+        for (slot, key) in map.keys.iter().enumerate() {
+            if key.is_some() {
+                copy.codec
+                    .encode(slots.vector(slot), &mut scratch, &mut want);
+                assert_eq!(
+                    &copy.slots.slot_bytes(slot)[..want.len()],
+                    &want[..],
+                    "slot {slot}"
+                );
+            }
+        }
+        assert!(!map.any_dirty());
     }
 }
