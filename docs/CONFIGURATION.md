@@ -392,9 +392,16 @@ under the write lock only if the slot still holds the same vector, and lets writ
 searches in every 50 µs. Until a slot is coded again a scan measures it exactly. The copy
 takes 16 bytes plus one a dimension per vector, is counted in `used_memory`, is not saved,
 and is made again after a restart. `FT.INFO` shows it under `flat_int8_indexes`: the field,
-its bytes, and how many candidates the pass skipped and measured exactly. Turning the switch
-off stops the pass at once; a copy already made is kept up to date until the index is
+its bytes, and how many candidates the pass skipped and measured exactly since the index
+was made (`CONFIG RESETSTAT` leaves them). Turning the switch off stops the pass at once,
+but a copy already made keeps its memory, and is kept up to date, until the index is
 dropped.
+
+The copy counts against `maxmemory` like any other memory. An index whose copy would take
+`used_memory` past `maxmemory` gets none, and a warning says so; setting `search-flat-int8`
+again (`CONFIG SET search-flat-int8 yes`) lets it try once more. Made near the limit, a copy
+can still leave too little room for the writes that follow, which then evict keys or, under
+`noeviction`, are refused.
 
 A scan the query's timeout cuts returns the nearest of the candidates it reached, as it
 does without the pass.

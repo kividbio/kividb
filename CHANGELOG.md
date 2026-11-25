@@ -202,10 +202,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Off by default; `CONFIG SET search-flat-int8 yes` turns it on. A FLAT field of 256
   dimensions or more gets an int8 copy of its vectors (rotated, one scale a vector, made off
   the write path by one thread), and a scan of 1,024 candidates or more measures a candidate
-  exactly only when its bound could beat the k-th held: the reply is the exact scan's. On
-  100,000 1,536-dimension vectors with 8 clients, a KNN 5 over the whole index went from 65
-  to 220 lookups/s. The copy adds about a quarter of the FLOAT32 vectors' memory. `FT.INFO`
-  shows it under `flat_int8_indexes`. x86_64 only.
+  exactly only when its bound could beat the k-th held: the reply is the exact scan's. The
+  copy adds about a quarter of the FLOAT32 vectors' memory. `FT.INFO` shows it under
+  `flat_int8_indexes`. x86_64 only.
 
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
