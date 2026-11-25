@@ -26,18 +26,24 @@ use tokio_uring::net::TcpStream;
 /// turn of its loop anyway, and a worker that sleeps is still woken for it.
 /// An older kernel refuses the flag, and the ring is then made without it.
 pub fn worker_runtime() -> tokio_uring::Builder {
+    let mut runtime = tokio_uring::builder();
+    if coop_taskrun() {
+        runtime.uring_builder(tokio_uring::uring_builder().setup_coop_taskrun());
+    }
+    runtime
+}
+
+/// Whether the kernel makes a ring with `IORING_SETUP_COOP_TASKRUN`, which
+/// the workers' rings are then made with (see [`worker_runtime`]). Asked once
+/// a process.
+pub fn coop_taskrun() -> bool {
     static COOP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let coop = *COOP.get_or_init(|| {
+    *COOP.get_or_init(|| {
         tokio_uring::uring_builder()
             .setup_coop_taskrun()
             .build(2)
             .is_ok()
-    });
-    let mut runtime = tokio_uring::builder();
-    if coop {
-        runtime.uring_builder(tokio_uring::uring_builder().setup_coop_taskrun());
-    }
-    runtime
+    })
 }
 
 /// Called when a replica sends PSYNC on the io_uring path.
@@ -4205,6 +4211,12 @@ mod worker_runtime_tests {
     /// without a system call (the read then finishes at its next one).
     #[test]
     fn a_waiting_read_completes_asleep_and_busy() {
+        // Where io_uring is not allowed (a container with Docker's default
+        // seccomp profile refuses `io_uring_setup`) there is no ring to read on.
+        if let Err(e) = tokio_uring::uring_builder().build(2) {
+            eprintln!("skipped: io_uring is not available here ({e})");
+            return;
+        }
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let peer = std::thread::spawn(move || {

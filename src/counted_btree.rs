@@ -1860,6 +1860,17 @@ impl<R: Member> Inner<R> {
             assert_eq!(order(last, first), Ordering::Less, "order at {s}");
             let sep = OrderedFloat(keys.seps[s]);
             let (low, high) = (OrderedFloat(last.0), OrderedFloat(first.0));
+            // Not checked: that a tied separator has a tie, or an untied one
+            // sits at its child's first score. A tied separator can stay
+            // marked tied after the last entry of the child before it that
+            // had its score is removed (then `low < sep`), and an untied one
+            // can be below its next child's first score after a first entry
+            // is removed (then `sep < high`). Routing then reads the member
+            // of a key with the separator's score, and decides by the next
+            // child's first lead and member (tied) or goes past the separator
+            // (untied). Both give the key's place in the order: every key
+            // left of the separator is below it in `(score, member)`, every
+            // key right of it at or above, whether or not a tie is still there.
             if keys.tied(s) {
                 assert_eq!(sep, high, "tied separator {s} is the next first score");
                 if let Some(lead) = keys.leads[s] {
