@@ -1309,6 +1309,7 @@ async fn run_replication_session(
         crate::vector::restore_dictionaries(index_store, staged.dictionaries);
         if !staged.index_schemas.is_empty() {
             let schemas = staged.index_schemas;
+            let orders = staged.document_orders;
             let store_bg = Arc::clone(store);
             let index_bg = Arc::clone(index_store);
             log_info!(
@@ -1321,6 +1322,9 @@ async fn run_replication_session(
                     &schemas,
                     &std::collections::HashMap::new(),
                 );
+                // The master's order of the documents, which the rebuild gives
+                // them.
+                crate::vector::restore_document_orders(&index_bg, orders);
                 for schema in &schemas {
                     let def = match index_bg.read().get(&schema.name) {
                         Some(d) => d.clone(),
@@ -1923,6 +1927,8 @@ impl Drop for SyncInProgress<'_> {
 struct StagedSync {
     store: Store,
     index_schemas: Vec<crate::vector::IndexSchema>,
+    /// The order of each index's documents (`LoadedSnapshot::document_orders`).
+    document_orders: Vec<(String, crate::vector::postings::KeyList)>,
     dictionaries: Vec<(String, Vec<String>)>,
     /// The master's function libraries, from a KDB image or a Redis RDB file
     /// that has any.
@@ -1970,7 +1976,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     let _loading = crate::expiry::Loading::start();
 
     let is_kividb = crate::snapshot::blocks::is_kdb(payload);
-    let (dbs, expiries, index_schemas, dictionaries, functions) = if is_kividb {
+    let (dbs, expiries, index_schemas, dictionaries, functions, document_orders) = if is_kividb {
         let loaded = crate::snapshot::load_snapshot_bytes(payload).map_err(|e| {
             payload_refusal(e, |e| {
                 format!("full-sync payload is not a valid KDB image: {e}")
@@ -1982,6 +1988,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
             loaded.index_schemas,
             loaded.dictionaries,
             loaded.functions,
+            loaded.document_orders,
         )
     } else {
         let (dbs, expiries, functions) =
@@ -2002,7 +2009,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
                     None => SessionError::Link(what),
                 }
             })?;
-        (dbs, expiries, Vec::new(), Vec::new(), functions)
+        (dbs, expiries, Vec::new(), Vec::new(), functions, Vec::new())
     };
 
     let keys = crate::snapshot::restore_into_store(dbs, &staging_store);
@@ -2010,6 +2017,7 @@ fn load_full_sync_payload(payload: &[u8], databases: usize) -> Result<StagedSync
     Ok(StagedSync {
         store: staging_store,
         index_schemas,
+        document_orders,
         dictionaries,
         functions,
         keys,

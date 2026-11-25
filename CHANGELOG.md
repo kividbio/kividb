@@ -638,6 +638,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Rows with equal `SORTBY` values come in the order their documents were
+  written, as in Redis (#1043).** `SORTBY … ASC` gives documents with the
+  same value first written first, and `DESC` the reverse; documents without
+  the value come last, in the same order. A query without `SORTBY` gives the
+  matches that score the same in the order they were written, and a KNN
+  query the vectors it returns that are as near (in an index with TAG,
+  NUMERIC or TEXT fields). `FT.AGGREGATE` rows come in that order (but for
+  rows that go into a `GROUPBY` of `COUNT`, `MIN`, `MAX` or `COUNT_DISTINCT`
+  only, which are read in any; groups come in the order of their first
+  documents written), and rows
+  level on every `SORTBY` key keep it, or its reverse where the last key is
+  `DESC`. A write that names a field of the index (`HSET`,
+  `HINCRBY`, `HDEL` of an indexed field, a field of it that expires), a JSON
+  write, or a value put under the key whole makes the document the last
+  written; a write of other fields of the hash leaves it where it is, and a
+  `RENAME` keeps its place. The
+  documents an `FT.CREATE` finds already written come before those written
+  after it, by key. The order is kept in snapshots (a last section,
+  `KIVIDO1`, which 1.2 passes over), replayed from the AOF, and sent to
+  replicas; documents loaded from a snapshot without it go by key. In a
+  cluster each master's order is kept, and level rows of different masters
+  come by their place in their master's order, then by key. Each document
+  of an index with TAG, NUMERIC or TEXT fields takes 8 bytes more.
+
 - **`INFO server` has `valkey_version` (#1039).** It is `9.0.1`, after `redis_version`, which stays
   `8.10.0`. Clients that take a server for Valkey read it: Open WebUI's Valkey vector store asks for
   9.0.1 or later before it uses valkey-search's commands. It is the lowest release it accepts, not
