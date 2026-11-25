@@ -33,9 +33,9 @@ beside others (`INFO stats`, kept in the raw data), or the suite fails.
 Gates in the same session: commands a second at least 1.2x Redis's and at
 least 1.6x v1.2.2's, and within 10 % of recorded; the `EVAL` p50 at most
 0.9x Redis's and its p99 at most 1.1x Redis's. Recorded on a
-`Standard_D8s_v5` (`results/pr-1049-54-d8s_v5`): 248,780 commands a second
-against Redis's 183,141 (1.36x), an `EVAL` p50/p99 of 130/185 us against
-Redis's 172/295; all of the candidate's releases ran beside others. Needs
+`Standard_D8s_v5` (`results/pr-1049-54-final`): 253,687 commands a second
+against Redis's 182,648 (1.39x), an `EVAL` p50/p99 of 127/178 us against
+Redis's 173/295; all of the candidate's releases ran beside others. Needs
 the `lua,tls` builds (`--candidate-full`); `min_cpus=8`.
 """
 import json

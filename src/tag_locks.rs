@@ -95,7 +95,7 @@ pub fn enabled() -> bool {
 /// `CONFIG SET lua-parallel-scripts` and the same at startup. Switching it
 /// is done with the command gate held alone (see the caller), so no command
 /// that went by the old setting is running beside one that goes by the new.
-/// Off, keys without a tag are no longer locked either, until the next
+/// Off, keys without a tag are not locked either, until the next
 /// script that keeps to its keys switches that on again.
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);

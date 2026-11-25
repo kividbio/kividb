@@ -1,4 +1,4 @@
-# Regression suite: pr-1049-54-d8s_v5
+# Regression suite: pr-1049-54-final
 
 Verdict: **ok**
 
@@ -6,27 +6,27 @@ NOTE: v1.2.2 has no usable value for the speed metrics of 1 gate(s): speed gates
 
 - Machine: Standard_D8s_v5, 8 vCPU, Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz, kernel 7.0.0-1017-azure, glibc 2.39
 - CPU: recorded on INTEL(R) XEON(R) PLATINUM 8573C / Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz / Intel(R) Xeon(R) Platinum 8473C; now Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz
-- calibration (indicative only): 99.4 ms for a fixed sha256 loop, 8 cores
+- calibration (indicative only): 97.1 ms for a fixed sha256 loop, 8 cores
 - Client: Python 3.12.3, redis-py 5.2.1
 - v1_2_2: `kividb 1.2.2`, sha256 `38fc2cea40c131e041f4914527a98719e5d34dffdfe2abdc1f07ecb86aa6723e`, rustc 1.100.0
-- candidate: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `ba89817a525d5e4faaf712f4b37f7ea938f8721dbc632efe47aab9036eb706fd`, rustc 1.100.0
+- candidate: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `c6a808f7d8eda1034ff8be2ac061ab9a753898d2c3f7aa2eac2a697dfab86664`, rustc 1.100.0
 - redis: `Redis server v=8.10.2 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=75a9b36b1f0aa00`, sha256 `b0cd304980112fa6cd8dced524fdd6b136fd8efb802f5cf9e81610051a11891c`
 - v1_2_2_full: `kividb 1.2.2`, sha256 `ac5e05fe1274fd1167780e512bc03aa103340f42525a2cef4a2a762e47317ad5`, rustc 1.100.0
-- candidate_full: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `ba89817a525d5e4faaf712f4b37f7ea938f8721dbc632efe47aab9036eb706fd`, rustc 1.100.0
-- candidate commit: `59a457dd`
+- candidate_full: `kividb 1.2.1 (full build: Lua, TLS)`, sha256 `c6a808f7d8eda1034ff8be2ac061ab9a753898d2c3f7aa2eac2a697dfab86664`, rustc 1.100.0
+- candidate commit: `f3bd52d6`
 - date: 2026-11-25; FULL=0, SCALE=1
-- run time: 54-yii2-mutex 110s
+- run time: 54-yii2-mutex 109s
 
 ## 54-yii2-mutex
 
 | config | metric | unit | v1.2.2 | candidate | Redis | recorded | gate | result |
 |---|---|---|---:|---:|---:|---:|---|---|
-| uring4 | eval_p50_us | us | 263.0 | 130.0 | 172.0 | - | vs_redis: 0.76x Redis <= 0.9x | pass |
-| uring4 | eval_p99_us | us | 727.0 | 185.0 | 295.0 | - | vs_redis: 0.63x Redis <= 1.1x | pass |
-| uring4 | ops_per_s | ops/s | 122,967 | 248,780 | 183,141 | - | vs_redis: 0.74x Redis <= 0.833333x<br>vs_v1_2_2: 0.49x v1.2.2 <= 0.625x<br>rel: rel 10%: nothing recorded | pass<br>pass<br>new |
-| uring4 | server_cpus | cpus | 3.32 | 4 | 2.86 | - | info | info |
-| uring4 | set_p50_us | us | 191.0 | 124.0 | 169.0 | - | info | info |
-| uring4 | set_p99_us | us | 765.0 | 177.0 | 290.0 | - | info | info |
+| uring4 | eval_p50_us | us | 252.0 | 127.0 | 173.0 | - | vs_redis: 0.73x Redis <= 0.9x | pass |
+| uring4 | eval_p99_us | us | 720.0 | 178.0 | 295.0 | - | vs_redis: 0.60x Redis <= 1.1x | pass |
+| uring4 | ops_per_s | ops/s | 127,454 | 253,687 | 182,648 | - | vs_redis: 0.72x Redis <= 0.833333x<br>vs_v1_2_2: 0.50x v1.2.2 <= 0.625x<br>rel: rel 10%: nothing recorded | pass<br>pass<br>new |
+| uring4 | server_cpus | cpus | 3.34 | 4 | 2.86 | - | info | info |
+| uring4 | set_p50_us | us | 181.0 | 122.0 | 169.0 | - | info | info |
+| uring4 | set_p99_us | us | 760.0 | 172.0 | 291.0 | - | info | info |
 
 ## Not run this time
 
