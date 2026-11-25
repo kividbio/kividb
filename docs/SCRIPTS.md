@@ -414,9 +414,9 @@ whatever `lua-parallel-scripts` says. The setting decides whether a script
 may run beside others; a script that started by the setting before a
 `CONFIG SET` finds the tags it holds locked all the same.
 
-Measured on an Azure `Standard_D8s_v5` (Intel Xeon Platinum 8370C; the
-server pinned to 4 vCPUs with `taskset`, `--threads 4`; Redis 8.12 and
-Valkey 8.1 with `--io-threads 4`; the load on the other 4): yii2-redis's
+Measured on 2026-11-26 on an Azure `Standard_D8s_v5` (Intel Xeon Platinum
+8370C; the server pinned to 4 vCPUs with `taskset`, `--threads 4`; Redis
+8.12 and Valkey 8.1 with `--io-threads 4`; the load on the other 4): yii2-redis's
 `Mutex` cycle, `SET <lock> <token> NX PX 30000` and then the release above
 by `EVAL` with the script's text every time, 32 connections each on a lock
 of its own, one command at a time per connection, 10 s, three runs each,
@@ -424,14 +424,13 @@ the servers in turn (median):
 
 | | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
 |---|---:|---:|---:|
-| this build | 300,200 | 101 / 245 | 97 / 238 |
-| the build before | 159,500 | 203 / 432 | 184 / 396 |
-| Redis 8.12 | 211,300 | 146 / 285 | 142 / 280 |
-| Valkey 8.1 | 235,400 | 129 / 279 | 131 / 282 |
+| releases beside others (#1049) | 293,700 | 103 / 272 | 98 / 264 |
+| releases alone (before #1049) | 159,900 | 203 / 428 | 184 / 392 |
+| Redis 8.12 | 210,100 | 148 / 284 | 143 / 279 |
+| Valkey 8.1 | 235,500 | 129 / 279 | 131 / 280 |
 
-The build before ran each release alone, the other commands held back
-around it; its four worker threads were 70 % busy. This build runs them
-beside each other, its four threads at 99 %.
+Run alone, each release held the other commands back around it, and the
+four worker threads were 70 % busy; beside each other, they were at 99 %.
 
 ### What to know
 
