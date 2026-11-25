@@ -839,7 +839,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   when a later one puts the bits back, as in Redis 8; one that changes
   nothing is not logged, replicated or announced, and fails no `WATCH`.
   A write counts one change, as any write command does. A signed
-  `INCRBY` that wraps past the field's largest value now replies with the
+  `INCRBY` that wraps past the field's largest value replies with the
   value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it

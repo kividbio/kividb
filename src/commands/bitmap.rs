@@ -2628,7 +2628,7 @@ pub(crate) mod tests {
                     assert_eq!(announced, want, "{ops}: the events");
                 }
                 assert_eq!(stored(&store, b"k").unwrap().0, b"\x07\x02\x00");
-                // A SETBIT that finds the bit as asked is announced, as it was.
+                // A SETBIT that finds the bit as asked is announced.
                 events::hold();
                 dispatched(&store, "SETBIT k 0 0", &watches);
                 assert_eq!(events::release().len(), 2, "SETBIT");
@@ -2637,9 +2637,9 @@ pub(crate) mod tests {
     }
 
     /// BITFIELDs run whole, each under the key's lock: increments of two
-    /// fields in one command are never seen apart by a reader, and none is
-    /// lost beside other writers, readers and a holder that makes each
-    /// write copy the value now and then.
+    /// fields in one command are never seen apart by a reader, and every
+    /// increment is counted beside other writers, readers and a holder that
+    /// makes each write copy the value now and then.
     #[test]
     fn bitfields_run_whole_beside_readers_writers_and_holders() {
         use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
