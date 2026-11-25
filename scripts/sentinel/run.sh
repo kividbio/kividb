@@ -1,26 +1,38 @@
 #!/usr/bin/env bash
 # run.sh: Redis Sentinel managing KiviDB. Three KiviDB nodes (a master and
 # two replicas, each from a config file, with a password) and three Redis
-# Sentinels watching them, quorum 2. For each client below:
+# Sentinels watching them, quorum 2, with a password of their own. Each round
+# runs one client against the Sentinels and fails the master over one way:
+#
+#   kill     the master is killed (SIGKILL), and started again after;
+#   manual   SENTINEL FAILOVER, the master up throughout;
+#   pause    the master is paused (SIGSTOP, or docker pause) until a replica
+#            has been promoted, then let go: it comes back as a master, and
+#            Sentinel turns it into a replica.
+#
+# A kill round runs for each client; the manual and pause rounds run with
+# the first. In every round:
 #
 #   1. the client connects through the Sentinels and writes to the master;
-#   2. the master is killed (SIGKILL);
-#   3. the Sentinels agree it is down and promote a replica, and the other
-#      replica follows the new master;
-#   4. the client goes on writing, to the new master, with no restart;
-#   5. the old master is started again and Sentinel turns it into a replica
-#      of the new one, which it syncs from.
+#   2. the Sentinels promote a replica, and the other replica follows it;
+#   3. the client goes on writing, to the new master, with no restart;
+#   4. the old master comes back as a replica of the new one, with the
+#      client's writes;
+#   5. the config files say so (Sentinel follows each REPLICAOF with CONFIG
+#      REWRITE): no `replicaof` in the new master's, the new master in the
+#      others'.
 #
 # The clients are redis-py, ioredis and Lettuce (follow_*.*). Each is run
-# with SENTINELS, MASTER, PASSWORD, KEY and DEADLINE in its environment,
-# prints `ready <port>` once it has written to the master, and exits 0 once
-# it has written ten times more to a master on another port and read the
-# last write back, or 1 at the deadline.
+# with SENTINELS, SENTINEL_PASSWORD, MASTER, PASSWORD, KEY and DEADLINE in
+# its environment, prints `ready <port>` once it has written to the master,
+# and exits 0 once it has written ten times more to a master on another port
+# and read the last write back, or 1 at the deadline.
 #
 #   KIVIDB_BIN | KIVIDB_IMAGE    the server: a binary, or an image run with
 #                                host networking (Linux)
 #   SENTINEL_BIN | REDIS_IMAGE   Redis Sentinel: a redis-sentinel binary, or
-#                                a Redis image (default redis:8.10.3)
+#                                a Redis image (default redis:8.10.3, by
+#                                digest)
 #   NODE_KIND                    kividb (default), or redis to run the same
 #                                checks on redis-server nodes (KIVIDB_BIN is
 #                                then a redis-server binary, or REDIS_IMAGE
@@ -38,12 +50,13 @@ set -euo pipefail
 
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 NODE_KIND=${NODE_KIND:-kividb}
-REDIS_IMAGE=${REDIS_IMAGE:-redis:8.10.3}
+REDIS_IMAGE=${REDIS_IMAGE:-redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53}
 CLIENTS=${CLIENTS:-redis-py ioredis lettuce}
 WORK=${WORK:-$(mktemp -d)}
 mkdir -p "$WORK"
 WORK=$(cd "$WORK" && pwd)
 PASSWORD=sentinel-test-password
+SENTINEL_PASSWORD=sentinel-test-sentinels-password
 MASTER=m
 NODES=(17101 17102 17103)
 SENTINEL_PORTS=(27101 27102 27103)
@@ -136,6 +149,18 @@ start_node() {
   fi
 }
 
+# pause_node PORT / resume_node PORT: SIGSTOP and SIGCONT, or docker pause and unpause.
+pause_node() {
+  local pid
+  pid=$(pid_of "$1")
+  if [ -n "$pid" ]; then kill -STOP "$pid"; else docker pause "sentinel-test-node-$1" >/dev/null; fi
+}
+resume_node() {
+  local pid
+  pid=$(pid_of "$1")
+  if [ -n "$pid" ]; then kill -CONT "$pid"; else docker unpause "sentinel-test-node-$1" >/dev/null; fi
+}
+
 kill_node() {
   local port=$1
   local pid
@@ -158,6 +183,8 @@ start_sentinel() {
 port $port
 bind 127.0.0.1
 sentinel resolve-hostnames no
+requirepass $SENTINEL_PASSWORD
+sentinel sentinel-pass $SENTINEL_PASSWORD
 sentinel monitor $MASTER 127.0.0.1 ${NODES[0]} 2
 sentinel auth-pass $MASTER $PASSWORD
 sentinel down-after-milliseconds $MASTER 2000
@@ -179,9 +206,9 @@ EOF
 moved_from() { [ "$(master_port)" != "$1" ]; }
 # The node on port $1 reads $3 from key $2.
 holds() { [ "$(cli "$1" "$PASSWORD" GET "$2")" = "$3" ]; }
-master_port() { cli "${SENTINEL_PORTS[0]}" "" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1; }
+master_port() { cli "${SENTINEL_PORTS[0]}" "$SENTINEL_PASSWORD" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1; }
 # What every Sentinel names as the master is $1.
-all_name() { for s in "${SENTINEL_PORTS[@]}"; do [ "$(cli "$s" "" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1)" = "$1" ] || return 1; done; }
+all_name() { for s in "${SENTINEL_PORTS[@]}"; do [ "$(cli "$s" "$SENTINEL_PASSWORD" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1)" = "$1" ] || return 1; done; }
 role_of() { cli "$1" "$PASSWORD" ROLE | head -n 1; }
 # $1 is a replica of $2, with its link up.
 replica_of() {
@@ -193,7 +220,7 @@ replica_of() {
 sentinels_see() {
   for s in "${SENTINEL_PORTS[@]}"; do
     local m
-    m=$(cli "$s" "" SENTINEL MASTER "$MASTER" | paste - -) || return 1
+    m=$(cli "$s" "$SENTINEL_PASSWORD" SENTINEL MASTER "$MASTER" | paste - -) || return 1
     grep -q "^num-slaves	2$" <<<"$m" && grep -q "^num-other-sentinels	2$" <<<"$m" || return 1
   done
 }
@@ -216,7 +243,7 @@ setup_clients() {
 
 run_client() {
   local client=$1 out=$2
-  export SENTINELS MASTER PASSWORD KEY="sentinel-test:$1" DEADLINE=60
+  export SENTINELS SENTINEL_PASSWORD MASTER PASSWORD KEY="sentinel-test:$1" DEADLINE=60
   case $client in
   redis-py) "$WORK/venv/bin/python" "$HERE/follow_redis_py.py" ;;
   ioredis) node "$HERE/follow_ioredis.js" ;;
@@ -240,20 +267,30 @@ wait_for 30 "the replicas syncing" replica_of "${NODES[2]}" "${NODES[0]}"
 wait_for 60 "every Sentinel seeing both replicas and the other Sentinels" sentinels_see
 summary "### Redis Sentinel ($REDIS_IMAGE) managing $NODE_KIND ${KIVIDB_IMAGE:-${KIVIDB_BIN:-$REDIS_IMAGE}}"
 summary ""
-summary "| Client | Master killed | Promoted | Client followed | Old master rejoined |"
-summary "|---|---|---|---|---|"
+summary "| Round | Client | Old master | Promoted | Client followed | Old master back |"
+summary "|---|---|---|---|---|---|"
 
-for client in $CLIENTS; do
+# round HOW CLIENT: fails the master over HOW (kill, manual or pause), with
+# CLIENT writing through the Sentinels, and checks steps 1 to 5 above.
+round() {
+  local how=$1 client=$2 old new out pid t0 promoted n p
   old=$(master_port)
-  say "$client: writing through the Sentinels to the master on $old"
-  out=$WORK/$client.out
+  say "$how, $client: writing through the Sentinels to the master on $old"
+  out=$WORK/$how-$client.out
   run_client "$client" "$out" &
   pid=$!
   wait_for 60 "$client writing to the master" grep -q "^ready $old" "$out"
 
-  say "$client: killing the master on $old"
   t0=$SECONDS
-  kill_node "$old"
+  case $how in
+  kill) say "killing the master on $old" && kill_node "$old" ;;
+  manual)
+    say "SENTINEL FAILOVER"
+    cli "${SENTINEL_PORTS[1]}" "$SENTINEL_PASSWORD" SENTINEL FAILOVER "$MASTER" >/dev/null ||
+      fail "SENTINEL FAILOVER refused"
+    ;;
+  pause) say "pausing the master on $old" && pause_node "$old" ;;
+  esac
   wait_for 60 "a replica promoted in place of $old" moved_from "$old"
   new=$(master_port)
   wait_for 30 "every Sentinel naming $new" all_name "$new"
@@ -262,23 +299,36 @@ for client in $CLIENTS; do
   for p in "${NODES[@]}"; do
     [ "$p" = "$old" ] || [ "$p" = "$new" ] || wait_for 30 "$p following $new" replica_of "$p" "$new"
   done
-  say "$client: $new promoted after ${promoted}s"
+  say "$new promoted after ${promoted}s"
 
   wait "$pid" || fail "$client did not follow the failover: $(tail -n 3 "$out")"
   grep -q "^followed $old -> $new" "$out" || fail "$client: $(tail -n 3 "$out")"
   say "$client: $(tail -n 1 "$out")"
 
-  say "starting the old master on $old again"
-  start_node "$old"
-  wait_for 60 "$old rejoining as a replica of $new" replica_of "$old" "$new"
+  case $how in
+  kill) say "starting the old master on $old again" && start_node "$old" ;;
+  pause) say "letting the old master on $old go on" && resume_node "$old" ;;
+  esac
+  wait_for 60 "$old back as a replica of $new" replica_of "$old" "$new"
   n=$(cli "$new" "$PASSWORD" GET "sentinel-test:$client")
   wait_for 30 "$old holding $client's writes" holds "$old" "sentinel-test:$client" "$n"
-  # Sentinel's REPLICAOF was followed by CONFIG REWRITE: a restart keeps the role.
-  grep -qi "^replicaof 127.0.0.1 $new" "$WORK/$old/node.conf" || fail "$old's config file does not name $new: $(grep -i replicaof "$WORK/$old/node.conf")"
-  wait_for 60 "every Sentinel seeing both replicas of $new" sentinels_see
-  summary "| $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes |"
-done
 
-say "passed: $CLIENTS"
+  # Sentinel follows each REPLICAOF with CONFIG REWRITE: a restart keeps the roles.
+  ! grep -qi "^replicaof" "$WORK/$new/node.conf" ||
+    fail "the new master $new's config file still names a master: $(grep -i replicaof "$WORK/$new/node.conf")"
+  for p in "${NODES[@]}"; do
+    [ "$p" = "$new" ] && continue
+    wait_for 30 "$p's config file naming $new" grep -qi "^replicaof 127.0.0.1 $new" "$WORK/$p/node.conf"
+  done
+  wait_for 60 "every Sentinel seeing both replicas of $new" sentinels_see
+  summary "| $how | $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes |"
+}
+
+for client in $CLIENTS; do round kill "$client"; done
+first=${CLIENTS%% *}
+round manual "$first"
+round pause "$first"
+
+say "passed: kill with $CLIENTS, manual and pause with $first"
 summary ""
-summary "✅ every client followed its failover"
+summary "✅ every failover was followed"

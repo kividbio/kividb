@@ -1,7 +1,8 @@
 name: Sentinel
-# Redis Sentinel managing KiviDB (scripts/sentinel/run.sh): three KiviDB nodes and three Sentinels.
-# For each of redis-py, ioredis and Lettuce, the master is killed, Sentinel promotes a replica, the
-# client goes on writing to the new master, and the old master comes back as a replica.
+# Redis Sentinel managing KiviDB (scripts/sentinel/run.sh): three KiviDB nodes and three Sentinels,
+# each with a password. The master is killed (with each of redis-py, ioredis and Lettuce), failed
+# over with SENTINEL FAILOVER, and paused until a replica is promoted. Each time, the client goes on
+# writing to the new master, the old master comes back as a replica, and the config files agree.
 #
 # Actions minutes cost money, so: never on push or pull_request, as compat.yml. KiviDB comes from the
 # release's image (or the image given to a run by hand: the latest release by default), Sentinel from

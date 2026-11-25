@@ -14,14 +14,15 @@ public class FollowLettuce {
     public static void main(String[] args) throws Exception {
         String key = System.getenv("KEY");
         String[] sentinels = System.getenv("SENTINELS").split(",");
+        String sentinelPassword = System.getenv("SENTINEL_PASSWORD");
         String[] first = sentinels[0].split(":");
         RedisURI.Builder uri = RedisURI.Builder
-                .sentinel(first[0], Integer.parseInt(first[1]), System.getenv("MASTER"))
+                .sentinel(first[0], Integer.parseInt(first[1]), System.getenv("MASTER"), sentinelPassword)
                 .withPassword(System.getenv("PASSWORD").toCharArray())
                 .withTimeout(Duration.ofSeconds(1));
         for (int i = 1; i < sentinels.length; i++) {
             String[] a = sentinels[i].split(":");
-            uri.withSentinel(a[0], Integer.parseInt(a[1]));
+            uri.withSentinel(a[0], Integer.parseInt(a[1]), sentinelPassword);
         }
         long deadline = System.nanoTime() + (long) (1e9 * Double.parseDouble(
                 System.getenv().getOrDefault("DEADLINE", "60")));

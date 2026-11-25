@@ -13,6 +13,7 @@ const r = new Redis({
   sentinels,
   name: process.env.MASTER,
   password: process.env.PASSWORD,
+  sentinelPassword: process.env.SENTINEL_PASSWORD,
   commandTimeout: 1000,
   maxRetriesPerRequest: 0,
   enableOfflineQueue: true,

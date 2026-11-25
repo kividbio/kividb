@@ -15,7 +15,7 @@ sentinel = Sentinel(
     sentinels,
     socket_timeout=1,
     password=password,
-    sentinel_kwargs={"socket_timeout": 1},
+    sentinel_kwargs={"socket_timeout": 1, "password": os.environ["SENTINEL_PASSWORD"]},
 )
 master = sentinel.master_for(name, socket_timeout=1, retry_on_timeout=False)
 
