@@ -283,8 +283,8 @@ wait_for 30 "the replicas syncing" replica_of "${NODES[2]}" "${NODES[0]}"
 wait_for 60 "every Sentinel seeing both replicas and the other Sentinels" sentinels_see
 summary "### Redis Sentinel ($REDIS_IMAGE) managing $NODE_KIND ${KIVIDB_IMAGE:-${KIVIDB_BIN:-$REDIS_IMAGE}}"
 summary ""
-summary "| Round | Client | Old master | Promoted | Client followed | Old master back |"
-summary "|---|---|---|---|---|---|"
+summary "| Round | Client | Old master | Promoted | Client followed | Old master back | Three nodes agree, WAIT 1 write kept, own dir |"
+summary "|---|---|---|---|---|---|---|"
 
 # change_passwords NEW: `masterauth` and then `requirepass` set to NEW on
 # every node with CONFIG SET, and written with CONFIG REWRITE; the Sentinels
@@ -370,7 +370,7 @@ round() {
     holds "$p" "$acked" "$how-$client" || fail "$p does not hold $acked, which WAIT 1 acknowledged before the $how"
     dir_is_its_own "$p" || fail "$p's dir: file '$(sed -n 's/^dir //p' "$WORK/$p/node.conf")', CONFIG GET '$(cli "$p" "$PASSWORD" CONFIG GET dir | tail -n 1)', expected $(node_dir_seen "$p")"
   done
-  summary "| $how | $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes |"
+  summary "| $how | $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes | yes |"
 }
 
 for client in $CLIENTS; do round kill "$client"; done
