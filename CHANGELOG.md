@@ -2350,19 +2350,17 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - **`CONFIG REWRITE` writes every setting the server runs with, and no
-  `replicaof` after `REPLICAOF NO ONE`.** It wrote its own list, and left
-  out the rest, `dir`, `io-model`, `replica-announced-port`, `preload-file`,
-  the TLS settings, `maxclients`, `hz`, `rdbcompression` and the search,
-  stream and probabilistic settings among them. It also kept the
-  `replicaof` the file started with after the server became a master.
-  Redis Sentinel sends `CONFIG REWRITE` after every `REPLICAOF` it gives,
-  so after one failover a node restarted from its file opened the
-  directory it was started from, without its data, served without TLS, or
-  followed its old master again. It now writes each setting `CONFIG GET`
-  lists, except the ones `config::NOT_REWRITTEN` gives a reason for (older
-  names, and file names that cannot change); a setting KiviDB keeps without
-  acting on only when it is not at its default; and the TLS lines only
-  where they are set, so a build without TLS reads its own file back.
+  `replicaof` after `REPLICAOF NO ONE`.** It writes each setting
+  `CONFIG GET` lists, `dir`, `io-model`, `replica-announced-port`,
+  `preload-file`, the TLS settings, `maxclients`, `hz`, `rdbcompression`
+  and the search, stream and probabilistic settings among them, except the
+  ones `config::NOT_REWRITTEN` gives a reason for (older names, and file
+  names that cannot change); a setting KiviDB keeps without acting on only
+  when it is not at its default; and the certificate and key lines only
+  where they are set, so a build without TLS reads its own file back. A
+  server restarted from the file opens the same data directory, serves
+  TLS as it did and has the role it had: Redis Sentinel sends
+  `CONFIG REWRITE` after every `REPLICAOF` it gives.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the

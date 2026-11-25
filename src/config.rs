@@ -1265,9 +1265,9 @@ impl Config {
                 // Set to empty at runtime: unset, not left at what the
                 // server started with.
                 match name.to_ascii_lowercase().as_str() {
-                    // `REPLICAOF NO ONE`: a master now. Left as it started,
-                    // the file named the old master, and a promoted replica
-                    // restarted from it followed that master again.
+                    // `REPLICAOF NO ONE`: a master now, and the file says so,
+                    // so that a promoted replica restarted from it is a
+                    // master.
                     "replicaof" | "slaveof" => config.replicaof = None,
                     "cluster-announce-ip" => config.cluster_announce_ip.clear(),
                     "cluster-announce-hostname" => config.cluster_announce_hostname.clear(),
@@ -1302,9 +1302,8 @@ impl Config {
     /// setting KiviDB keeps without acting on it
     /// ([`crate::redis_settings::remembered_defaults`]) is written only when
     /// it is not at its default, since the file then warns of it at every
-    /// start. Empty and redacted values are left out: an empty one reads
-    /// back as a missing argument, and the secrets are this configuration's
-    /// own lines.
+    /// start. Empty values are left out, since one reads back as a missing
+    /// argument; redacted ones are written above.
     pub fn rewrite_with(&self, values: &[(String, String)]) -> Result<(), RewriteError> {
         if !self.configfile_loaded {
             return Err(RewriteError::NoConfigFile);
@@ -1317,9 +1316,9 @@ impl Config {
         let mut out = String::new();
         out.push_str(&format!("port {}\n", self.port));
         out.push_str(&format!("bind {}\n", self.bind));
-        // Where the data is. Left out, a restart opened the directory it
-        // was started from instead, without the data: Sentinel's REPLICAOF
-        // is followed by CONFIG REWRITE, so a failover was enough.
+        // Where the data is, so that a restart from this file opens the
+        // directory in use now: Sentinel's REPLICAOF is followed by
+        // CONFIG REWRITE.
         if !self.dir.is_empty() {
             out.push_str(&format!("dir {}\n", quote(&self.dir)));
         }
@@ -1631,10 +1630,8 @@ impl Config {
         if !self.preload_file.is_empty() {
             out.push_str(&format!("preload-file {}\n", quote(&self.preload_file)));
         }
-        // TLS, where it is set: left out, a restart served plaintext, or
-        // refused to start for want of a certificate. Each line is written
-        // only when it is not the default, so a build without TLS reads back
-        // a file it wrote.
+        // TLS, where it is set. Each line is written only when it is not
+        // the default, so a build without TLS reads back a file it wrote.
         if self.tls_port != 0 {
             out.push_str(&format!("tls-port {}\n", self.tls_port));
         }
@@ -2392,6 +2389,8 @@ impl Config {
                                 | "zset-max-ziplist-value"
                                 | "rdbchecksum"
                                 | "rdbcompression"
+                                | "busy-reply-threshold"
+                                | "lua-time-limit"
                         ) || crate::commands::server::remembered_config(key).is_none() => {}
                     Some(_) => return no_effect("KiviDB has no such setting"),
                     None if key.starts_with("cluster-")

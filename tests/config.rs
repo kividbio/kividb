@@ -459,13 +459,11 @@ fn config_get_all(c: &mut Conn) -> std::collections::BTreeMap<String, String> {
 
 /// `CONFIG REWRITE` writes every setting the server was started with: a
 /// server restarted from the file it wrote, in another directory, gives the
-/// same `CONFIG GET *`. It used to leave out `dir`, `io-model`,
-/// `replica-announced-port`, `preload-file`, the TLS settings and every
-/// setting not in its own list (`maxclients`, `hz`, `rdbcompression`, the
-/// search and stream settings, ...). Redis Sentinel sends `CONFIG REWRITE`
-/// after each `REPLICAOF`, so a failover was enough to lose them, and a node
-/// restarted after one opened the directory it was started from, without
-/// its data.
+/// same `CONFIG GET *`: `dir`, `io-model`, `replica-announced-port`,
+/// `preload-file`, the TLS settings, `maxclients`, `hz`, `rdbcompression`,
+/// the search and stream settings and the rest. Redis Sentinel sends
+/// `CONFIG REWRITE` after each `REPLICAOF`, so a node restarted after a
+/// failover starts from such a file.
 ///
 /// Then every name `CONFIG GET *` lists is checked against the file: it is
 /// written, or it is an older name of one that is, or it is empty, or it is
@@ -562,9 +560,8 @@ fn config_rewrite_round_trip_keeps_every_setting() {
 }
 
 /// `REPLICAOF NO ONE` makes the server a master, and `CONFIG REWRITE` after
-/// it writes no `replicaof`. It used to keep the line the file started with:
-/// a replica Sentinel promoted (`REPLICAOF NO ONE`, then `CONFIG REWRITE`)
-/// followed its old master again when it restarted.
+/// it writes no `replicaof`: a replica Sentinel promoted (`REPLICAOF NO ONE`,
+/// then `CONFIG REWRITE`) is a master when it restarts.
 #[test]
 fn config_rewrite_after_replicaof_no_one_drops_replicaof() {
     let port = free_port();

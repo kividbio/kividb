@@ -37,17 +37,7 @@ restarts keeps the role Sentinel gave it. A node started without a config
 file refuses `CONFIG REWRITE`, and the failover still works, but a node
 restarted that way comes back with the role on its command line.
 
-In 1.2.2 and earlier, `CONFIG REWRITE` leaves many settings out of the
-file, `dir` and the TLS settings among them. It also keeps `replicaof` after
-`REPLICAOF NO ONE`. After a failover, a node restarted from its file then:
-
-- opens the directory it was started from;
-- serves without TLS;
-- if it was the replica Sentinel promoted, follows its old master again.
-
-On those releases, start each node in its data directory
-(`WorkingDirectory=` in a systemd unit), don't use Sentinel with TLS, and
-check a promoted node's file before restarting it.
+Sentinel is tested with KiviDB 1.3.0 and later.
 
 A node, the master and both replicas alike (`replicaof` only on the
 replicas):
@@ -84,7 +74,7 @@ same one. The clients need it too (below).
 **Choosing the replica to promote.** `replica-priority` works as in Redis:
 Sentinel promotes the replica with the lowest priority first, and never one
 with priority `0`. `replica-announced no` hides a replica from Sentinel.
-Both are new in 1.2.1 (see [CONFIGURATION.md](CONFIGURATION.md)).
+See [CONFIGURATION.md](CONFIGURATION.md).
 
 ## Addresses
 
