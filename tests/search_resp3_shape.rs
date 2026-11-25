@@ -747,12 +747,28 @@ fn valkey_mode_answers_as_valkey_search_does() {
     }
     assert!(checked >= 5, "{checked}");
     assert!(text.contains("|+attributes|*3|"), "{text}");
+    // A vector field keeps what the index holds in an `index` list, as
+    // valkey-search lays it out (valkey-glide's callers read `dimensions`
+    // there), where the Redis shape lists them one after another.
+    assert!(
+        text.contains(
+            "|+type|$6|VECTOR|+index|*8|+dimensions|:2|+distance_metric|+L2|\
+             +data_type|+FLOAT32|+algorithm|*8|+name|+HNSW|+m|:"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("|+ef_construction|:"), "{text}");
+    assert!(text.contains("|+ef_runtime|:"), "{text}");
+    assert!(!text.contains("|+dim|"), "{text}");
 }
 
-/// FT.PROFILE has no valkey-search shape: its reply, and the reply it holds,
-/// are Redis's in every mode, and for a GLIDE client.
+/// FT.PROFILE answers Redis's shape (a map), and the search inside it
+/// Redis's too. A connection that takes valkey-search's shape (`valkey`, or a
+/// GLIDE client under `auto`) gets the layout valkey-glide's converter reads:
+/// an array of the search's reply in that shape and a flat list of names
+/// (simple strings) and numbers.
 #[test]
-fn profile_keeps_the_redis_shape_in_every_mode() {
+fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
     // Times are not the shape.
     fn untimed(node: Node) -> Node {
         match node {
@@ -812,14 +828,35 @@ fn profile_keeps_the_redis_shape_in_every_mode() {
         }
         // The same command is a flat array for the commands that have a shape.
         assert!(is_array(&knn(&mut c)), "{mode}");
-        let got = profiles(&mut c);
-        for (got, want) in got.iter().zip(&want) {
-            assert_eq!(
-                untimed(parse(got)),
-                untimed(parse(want)),
-                "{mode}\n{}",
-                show(got)
-            );
+        for got in profiles(&mut c) {
+            let Node::Array(parts) = parse(&got) else {
+                panic!("{mode}: {}", show(&got));
+            };
+            assert_eq!(parts.len(), 2, "{mode}: {}", show(&got));
+            // The search's own reply: an array, not a map.
+            assert!(matches!(parts[0], Node::Array(_)), "{mode}: {}", show(&got));
+            let Node::Array(stats) = &parts[1] else {
+                panic!("{mode}: {}", show(&got));
+            };
+            assert_eq!(stats.len(), 6, "{mode}: {}", show(&got));
+            for pair in stats.chunks(2) {
+                assert!(matches!(pair[0], Node::Simple(_)), "{mode}: {:?}", pair[0]);
+                let Node::Bulk(number) = &pair[1] else {
+                    panic!("{mode}: {:?}", pair[1]);
+                };
+                assert!(
+                    String::from_utf8_lossy(number).parse::<f64>().is_ok(),
+                    "{mode}: {number:?}"
+                );
+            }
+        }
+        // The same connection, named something else, is back to the map.
+        if glide {
+            c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "redis-py"]);
+            let got = profiles(&mut c);
+            for (got, want) in got.iter().zip(&want) {
+                assert_eq!(untimed(parse(got)), untimed(parse(want)), "{mode}");
+            }
         }
     }
 }
@@ -1081,4 +1118,89 @@ fn scripts_keep_their_own_protocol() {
                    ARGV[1], 'DIALECT', '2'); return r.map['total_results']";
     let total = c.raw(&[b"EVAL", script3.as_bytes(), b"0", &blob]);
     assert_eq!(total, b":3\r\n", "{}", show(&total));
+}
+
+/// Every command that takes an index name answers a missing one as Redis 8.10
+/// does (`SEARCH_INDEX_NOT_FOUND Index not found: <name>`), and a client that
+/// takes the valkey-search shape (a GLIDE client under `auto`, or `valkey`) as
+/// valkey-search does (`Index with name '<name>' not found in database <n>`),
+/// on RESP2 and RESP3 alike.
+#[test]
+fn a_missing_index_is_worded_for_the_client_that_asks() {
+    let q = "*=>[KNN 3 @v $B AS dist]";
+    let blob = String::from_utf8(vec![0u8; 8]).unwrap();
+    let commands: Vec<Vec<&str>> = vec![
+        vec!["FT.INFO", "nx"],
+        vec!["FT.SEARCH", "nx", "*"],
+        vec![
+            "FT.SEARCH",
+            "nx",
+            q,
+            "PARAMS",
+            "2",
+            "B",
+            &blob,
+            "DIALECT",
+            "2",
+        ],
+        vec!["FT.AGGREGATE", "nx", "*"],
+        vec!["FT.PROFILE", "nx", "SEARCH", "QUERY", "*"],
+        vec!["FT.EXPLAIN", "nx", "*"],
+        vec!["FT.EXPLAINCLI", "nx", "*"],
+        vec!["FT.DROPINDEX", "nx"],
+        vec!["FT.ALTER", "nx", "SCHEMA", "ADD", "f", "TEXT"],
+        vec!["FT.TAGVALS", "nx", "f"],
+        vec!["FT.SYNDUMP", "nx"],
+        vec!["FT.SYNUPDATE", "nx", "g", "a", "b"],
+        vec!["FT.SPELLCHECK", "nx", "hello"],
+        vec!["FT.ALIASADD", "al", "nx"],
+        vec!["FT.CURSOR", "READ", "nx", "1"],
+        vec!["FT.CURSOR", "DEL", "nx", "1"],
+        vec!["FT.HYBRID", "nx", "SEARCH", "*"],
+    ];
+    let redis: &[u8] = b"-SEARCH_INDEX_NOT_FOUND Index not found: nx\r\n";
+    let valkey: &[u8] = b"-Index with name 'nx' not found in database 0\r\n";
+    // (settings, library name, what a missing index is answered)
+    let cases: [(&[&str], Option<&str>, &[u8]); 5] = [
+        (&[], None, redis),
+        (&[], Some("redis-py"), redis),
+        (&[], Some("GlidePy"), valkey),
+        (&["--search-resp3-reply", "redis"], Some("GlidePy"), redis),
+        (&["--search-resp3-reply", "valkey"], None, valkey),
+    ];
+    for (settings, lib, want) in cases {
+        let server = Server::start(settings);
+        for proto in ["2", "3"] {
+            let mut c = server.conn();
+            c.cmd(&["HELLO", proto]);
+            if let Some(lib) = lib {
+                c.ok(&["CLIENT", "SETINFO", "LIB-NAME", lib]);
+            }
+            for args in &commands {
+                let reply = c.cmd(args);
+                assert_eq!(
+                    reply,
+                    want,
+                    "{settings:?} {lib:?} RESP{proto} {args:?}: {}",
+                    show(&reply)
+                );
+            }
+        }
+    }
+}
+
+/// Another database than 0 is named in valkey-search's text, as
+/// valkey-search names it.
+#[test]
+fn the_valkey_text_names_the_database() {
+    let server = Server::start(&["--search-resp3-reply", "valkey"]);
+    let mut c = server.conn();
+    c.ok(&["SELECT", "3"]);
+    let reply = c.cmd(&["FT.INFO", "nx"]);
+    assert_eq!(
+        reply,
+        b"-Index with name 'nx' not found in database 3\r\n",
+        "{}",
+        show(&reply)
+    );
 }

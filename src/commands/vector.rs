@@ -80,6 +80,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     if !name.starts_with("FT.") {
         return None;
     }
+    let reply = handle_ft(ctx, name)?;
+    // valkey-search names a missing index in its own words (the clients that
+    // look for `not found in database` read them); Redis's are the default.
+    if reply.starts_with(b"-SEARCH_INDEX_NOT_FOUND ")
+        && crate::commands::search::valkey_wording(ctx)
+    {
+        return Some(crate::commands::search::valkey_missing_index(
+            reply,
+            *ctx.selected_db,
+        ));
+    }
+    Some(reply)
+}
+
+fn handle_ft(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     // An index, or an alias, of another database is not there.
     for &(at, elsewhere) in index_name_positions(name, &ctx.cmd) {
         let Some(given) = ctx.cmd.get(at).copied() else {

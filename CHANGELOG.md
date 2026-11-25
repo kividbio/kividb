@@ -153,8 +153,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RESP3 connection for `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, and
   for `FT.HYBRID` the count, then each row as a flat array (no `warnings`, no `execution_time`).
   That is the reply GLIDE converts. The `ON_TIMEOUT` warning is not in it, and a KNN `WITHSCORES`
-  gives the distance where valkey-search gives 0. `FT.PROFILE` and the other search commands keep
-  the Redis shape in every mode. `redis` and `valkey` give every connection one or the other. It is
+  gives the distance where valkey-search gives 0. `FT.PROFILE` has its own layout there (see
+  #1039 below), and the other search commands keep the Redis shape in every mode. `redis` and `valkey` give every connection one or the other. It is
   set in the configuration file, on the command line, and with `CONFIG SET`, which acts on
   connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
   replies, a script's, and what the masters of a cluster tell one another are the same in each.
@@ -584,6 +584,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dataset digest lets the replica continue without a full sync.
 
 ### Changed
+
+- **`INFO server` has `valkey_version` (#1039).** It is `9.0.1`, after `redis_version`, which stays
+  `8.10.0`. Clients that take a server for Valkey read it: Open WebUI's Valkey vector store asks for
+  9.0.1 or later before it uses valkey-search's commands, BullMQ reports the database as Valkey, and
+  Sidekiq's web page names it. It is the lowest release those clients accept, not valkey-bundle 9.2.0's:
+  the hash field commands of Valkey 9 and valkey-search 1.2's search commands are answered, not every
+  command of 9.x (`COMMANDLOG`, `DELIFEQ`, `CLUSTER MIGRATESLOTS`). `HELLO` still says `server redis`,
+  version `8.10.0`.
+
+- **An index that does not exist is named in valkey-search's words for a valkey-glide client (#1039).**
+  `FT.INFO`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.HYBRID`, `FT.DROPINDEX`, `FT.CURSOR` and every other
+  `FT.*` command that takes an index name answers `Index with name '<name>' not found in database <n>`
+  to a connection that takes valkey-search's shape (`search-resp3-reply`: a client that named itself
+  GLIDE under `auto`, or every client under `valkey`), on RESP2 and RESP3. Every other connection gets
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does. valkey-glide's callers look for
+  `not found in database` to know an index is not there (Open WebUI's Valkey vector store creates its
+  index on that answer). `FT.HYBRID` on an index that does not exist says so whatever follows the name,
+  as Redis 8.10 does.
+
+- **`FT.INFO` and `FT.PROFILE` in valkey-search's shape (#1039).** In the shape a valkey-glide client is
+  answered in (`search-resp3-reply`), `FT.INFO` lists a vector field's dimensions, metric, data type and
+  algorithm in an `index` list, as valkey-search does, where the Redis shape lists them one after
+  another (Open WebUI reads the dimensions of an index from there). `FT.PROFILE` is an array of the
+  search's reply in that shape and a flat list of names and numbers (`parse.time`, `total.time`,
+  `all.count`), which is the layout valkey-glide converts; valkey-search 1.2 has no `FT.PROFILE`, so
+  there is no reply of its own to match. The Redis shape of both is unchanged.
 
 - **A FLAT vector index keeps its vectors in fixed blocks by slot, and a
   filtered KNN goes from each matching document id to its vector (#1020).**

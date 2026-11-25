@@ -744,6 +744,13 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
     if crate::cluster::search::coordinates(ctx) {
         return Err("ERR FT.HYBRID is not supported across a cluster's masters yet".into());
     }
+    // The index is looked for before the rest is read, as Redis does: a
+    // command for an index that is not there says so, whatever it says after.
+    if let Some(name) = ctx.cmd.get(1).and_then(|n| std::str::from_utf8(n).ok())
+        && ctx.index_store.read().get(name).is_none()
+    {
+        return Err(crate::commands::search::no_such_index(name));
+    }
     let q = parse(&ctx.cmd)?;
     let scorer = match &q.scorer {
         Some(name) => scorer_named(name)?,

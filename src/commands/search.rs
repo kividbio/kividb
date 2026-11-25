@@ -196,7 +196,12 @@ fn misplaced_option(option: &str, owner: &str, previous: Option<&SchemaField>) -
 }
 
 /// A field as `FT.INFO` describes it, and as `FT.CREATE` would be given it.
-fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
+///
+/// `valkey`: valkey-search's layout of a vector field, which keeps what the
+/// index holds in an `index` list (`dimensions`, `distance_metric`,
+/// `data_type` and `algorithm`) where Redis lists them one after another.
+/// valkey-glide's callers (Open WebUI) read the dimensions from there.
+fn describe_field(field: &SchemaField, valkey: bool) -> Vec<Vec<u8>> {
     let mut out = vec![
         resp_bulk_str("identifier"),
         resp_bulk_str(&field.name),
@@ -205,7 +210,47 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
         resp_bulk_str("type"),
         resp_bulk_str(field.type_name()),
     ];
-    if let FieldType::Vector {
+    if valkey
+        && let FieldType::Vector {
+            algo,
+            dim,
+            metric,
+            data_type,
+        } = &field.field_type
+    {
+        let algorithm = match algo {
+            VectorAlgo::Flat => vec![resp_simple("name"), resp_simple("FLAT")],
+            VectorAlgo::Hnsw {
+                m,
+                ef_construction,
+                ef_runtime,
+            } => vec![
+                resp_simple("name"),
+                resp_simple("HNSW"),
+                resp_simple("m"),
+                resp_integer(*m as i64),
+                resp_simple("ef_construction"),
+                resp_integer(*ef_construction as i64),
+                resp_simple("ef_runtime"),
+                resp_integer(*ef_runtime as i64),
+            ],
+        };
+        out.push(resp_simple("index"));
+        out.push(resp_array(vec![
+            resp_simple("dimensions"),
+            resp_integer(*dim as i64),
+            resp_simple("distance_metric"),
+            resp_simple(match metric {
+                DistanceMetric::L2 => "L2",
+                DistanceMetric::Cosine => "COSINE",
+                DistanceMetric::InnerProduct => "IP",
+            }),
+            resp_simple("data_type"),
+            resp_simple(data_type.name()),
+            resp_simple("algorithm"),
+            resp_array(algorithm),
+        ]));
+    } else if let FieldType::Vector {
         algo,
         dim,
         metric,
@@ -579,7 +624,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         resp_array(
             def.fields
                 .iter()
-                .map(|field| resp_array(simple_names(describe_field(field), valkey)))
+                .map(|field| resp_array(simple_names(describe_field(field, valkey), valkey)))
                 .collect(),
         ),
     );
@@ -772,7 +817,43 @@ pub(crate) fn no_such_index(name: &str) -> String {
 /// before it.
 pub(crate) fn is_no_such_index(error: &str) -> bool {
     let error = error.trim_end();
-    error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
+    error.starts_with("SEARCH_INDEX_NOT_FOUND ")
+        || error.ends_with("no such index")
+        || (error.starts_with("Index with name '") && error.contains("' not found in database "))
+}
+
+/// Whether the error text for a missing index is valkey-search's for this
+/// connection: `search-resp3-reply valkey`, or `auto` and a connection that
+/// named itself a GLIDE client. Like the shape of a RESP3 reply, but on
+/// every protocol, and not for a shard answering its coordinator.
+pub(crate) fn valkey_wording(ctx: &Ctx) -> bool {
+    if SHARD.with(|s| s.get()) {
+        return false;
+    }
+    match RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed) {
+        RESP3_REDIS => false,
+        RESP3_VALKEY => true,
+        _ => ctx.client_registry.get_glide(ctx.client_id),
+    }
+}
+
+/// `reply`, if it is the error [`no_such_index`] makes, worded as
+/// valkey-search words it: `Index with name '<name>' not found in database
+/// <db>`. Any other reply is returned as it is.
+pub(crate) fn valkey_missing_index(reply: Vec<u8>, db: usize) -> Vec<u8> {
+    const HEAD: &[u8] = b"-SEARCH_INDEX_NOT_FOUND Index not found: ";
+    if let Some(name) = reply
+        .strip_prefix(HEAD)
+        .and_then(|rest| rest.strip_suffix(b"\r\n"))
+        && !name.contains(&b'\r')
+        && !name.contains(&b'\n')
+    {
+        let mut out = b"-Index with name '".to_vec();
+        out.extend_from_slice(name);
+        out.extend_from_slice(format!("' not found in database {db}\r\n").as_bytes());
+        return out;
+    }
+    reply
 }
 
 // ── Running a filter ──────────────────────────────────────────────────────────
@@ -3763,5 +3844,39 @@ mod tests {
         assert!(!no_time_for(None, usize::MAX));
         let later = Some(Instant::now() + Duration::from_secs(60));
         assert!(!no_time_for(later, usize::MAX));
+    }
+
+    #[test]
+    fn a_missing_index_is_worded_as_valkey_search_words_it() {
+        let redis = format!("-{}\r\n", no_such_index("idx:a b"));
+        assert_eq!(
+            redis,
+            "-SEARCH_INDEX_NOT_FOUND Index not found: idx:a b\r\n"
+        );
+        assert_eq!(
+            valkey_missing_index(redis.into_bytes(), 3),
+            b"-Index with name 'idx:a b' not found in database 3\r\n"
+        );
+        // Another reply is returned as it is.
+        for other in [
+            "-ERR wrong number of arguments for 'FT.INFO' command\r\n",
+            "+OK\r\n",
+            "-SEARCH_INDEX_NOT_FOUND Index not found: a\r\nb\r\n",
+        ] {
+            assert_eq!(
+                valkey_missing_index(other.as_bytes().to_vec(), 0),
+                other.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn both_wordings_of_a_missing_index_are_known_to_a_coordinator() {
+        assert!(is_no_such_index(&no_such_index("idx")));
+        assert!(is_no_such_index(
+            "Index with name 'idx' not found in database 0\r\n"
+        ));
+        assert!(is_no_such_index("ERR no such index"));
+        assert!(!is_no_such_index("ERR wrong number of arguments"));
     }
 }
