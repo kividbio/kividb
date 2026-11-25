@@ -783,9 +783,30 @@ pub(crate) async fn broadcast_auth_request(
                             count,
                         );
                     }
-                    Ok(Some(BusMessage::Update { sender_id, owners })) => {
-                        let names_master = owners.iter().any(|o| o.id == master_id);
+                    Ok(Some(
+                        reply @ (BusMessage::Update { .. } | BusMessage::UpdateMoved { .. }),
+                    )) => {
+                        let (sender_id, owners, moved, fallback) = match reply {
+                            BusMessage::Update { sender_id, owners } => {
+                                (sender_id, owners, Vec::new(), Vec::new())
+                            }
+                            BusMessage::UpdateMoved {
+                                sender_id,
+                                owners,
+                                moved,
+                                fallback,
+                            } => (sender_id, owners, moved, fallback),
+                            _ => break,
+                        };
+                        // The slots that came to its master after its claim
+                        // name it as well.
+                        let names_master = !moved.is_empty()
+                            || !fallback.is_empty()
+                            || owners.iter().any(|o| o.id == master_id);
                         crate::cluster::bus::listener::apply_update(&state, sender_id, owners);
+                        crate::cluster::bus::listener::apply_moved(
+                            &state, sender_id, &moved, &fallback,
+                        );
                         // Still standing at this epoch, for the same master,
                         // with something left to claim: ask again.
                         let standing = state.election.lock().as_ref().is_some_and(|e| {
