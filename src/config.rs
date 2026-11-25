@@ -230,6 +230,9 @@ pub struct Config {
     #[arg(long, default_value = "yes", value_parser = parse_parallel_scripts, num_args = 1)]
     pub lua_parallel_scripts: ParallelScripts,
 
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pub search_flat_int8: bool,
+
     /// Rewrite the AOF once it has grown this much past its post-rewrite size,
     /// as a percentage (0 = never rewrite automatically).
     #[arg(long, default_value_t = 100)]
@@ -790,6 +793,7 @@ impl Default for Config {
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: ParallelScripts::Yes,
+            search_flat_int8: false,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
@@ -943,6 +947,7 @@ impl Config {
             aof: false,
             aof_preamble: true,
             lua_parallel_scripts: ParallelScripts::Yes,
+            search_flat_int8: false,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
@@ -1432,6 +1437,10 @@ impl Config {
         out.push_str(&format!(
             "aof-rewrite-percentage {}\n",
             self.aof_rewrite_percentage
+        ));
+        out.push_str(&format!(
+            "search-flat-int8 {}\n",
+            if self.search_flat_int8 { "yes" } else { "no" }
         ));
         // `lua-parallel-scripts` as it is now, which `CONFIG SET` may have
         // changed: from `values`, `CONFIG GET`'s rows.
@@ -2084,6 +2093,7 @@ impl Config {
                 };
                 set!(lua_parallel_scripts, mode)
             }
+            "search-flat-int8" => set!(search_flat_int8, yes_no(key, one()?)?),
             "aof-rewrite-percentage" | "auto-aof-rewrite-percentage" => {
                 set!(aof_rewrite_percentage, number(key, one()?)?)
             }

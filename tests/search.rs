@@ -5605,3 +5605,98 @@ fn phonetic_fields_match_and_score_as_redis_does() {
     c.cmd(&["HSET", "ph:94", "p", "ab", "q", "zz"]);
     assert_eq!(ids(&mut c, "@p:app"), ["ph:26"]);
 }
+
+#[test]
+fn the_flat_int8_pass_gives_the_same_replies() {
+    let mut c = own_conn();
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+    assert!(
+        c.cmd(&[
+            "FT.CREATE",
+            "i8",
+            "PREFIX",
+            "1",
+            "i8:",
+            "SCHEMA",
+            "c",
+            "TAG",
+            "v",
+            "VECTOR",
+            "FLAT",
+            "6",
+            "TYPE",
+            "FLOAT32",
+            "DIM",
+            "300",
+            "DISTANCE_METRIC",
+            "COSINE",
+        ])
+        .ok()
+    );
+    let mut seed = 0x1033u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let centers: Vec<Vec<f32>> = (0..6)
+        .map(|_| {
+            (0..300)
+                .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect()
+        })
+        .collect();
+    let mut near = move |i: usize| -> Vec<f32> {
+        centers[i % 6]
+            .iter()
+            .map(|x| x + ((next() % 2001) as f32 - 1000.0) / 5000.0)
+            .collect()
+    };
+    for i in 0..3_000 {
+        let tag = if i % 3 == 0 { "red" } else { "blue" };
+        hset_vector(&mut c, &format!("i8:{i}"), &[("c", tag)], "v", &near(i));
+    }
+    let queries: Vec<Vec<f32>> = (0..12).map(&mut near).collect();
+    let run = |c: &mut Conn| -> Vec<V> {
+        let mut out = Vec::new();
+        for q in &queries {
+            for query in [
+                "*=>[KNN 10 @v $q]",
+                "*=>[KNN 100 @v $q]",
+                "(@c:{blue})=>[KNN 10 @v $q]",
+            ] {
+                out.push(search_with_vector(c, "i8", query, q, &["NOCONTENT"]));
+            }
+        }
+        out
+    };
+    let exact = run(&mut c);
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "yes"]).ok());
+    let until = Instant::now() + Duration::from_secs(30);
+    let skipped = loop {
+        let with_pass = run(&mut c);
+        assert_eq!(with_pass, exact);
+        let info = c.cmd(&["FT.INFO", "i8"]);
+        if let Some(V::Arr(copies)) = info
+            .arr()
+            .chunks(2)
+            .find(|p| matches!(&p[0], V::Str(k) if k == "flat_int8_indexes"))
+            .map(|p| p[1].clone())
+        {
+            let skipped: u64 = copies[0].get("skipped").s().parse().unwrap();
+            if skipped > 0 {
+                break skipped;
+            }
+        }
+        assert!(Instant::now() < until, "the pass never skipped: {info:?}");
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(skipped > 0);
+    assert_eq!(
+        c.cmd(&["CONFIG", "GET", "search-flat-int8"]).arr()[1].s(),
+        "yes"
+    );
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+    assert_eq!(run(&mut c), exact);
+}

@@ -90,6 +90,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--search-resp3-reply <auto\|redis\|valkey>` | `auto` | The shape of the search commands' replies over RESP3 (see [Search reply shape over RESP3](#search-reply-shape-over-resp3)) |
+| `--search-flat-int8 <no\|yes>` | `no` | An int8 first pass in FLAT KNN scans of many candidates, the reply still the exact scan's; `CONFIG SET` takes it (see [FLAT int8 first pass](#flat-int8-first-pass)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -374,6 +375,29 @@ another.
 
 The setting belongs to the node: in a cluster, the node that is asked writes the reply, so set
 every node alike.
+
+### FLAT int8 first pass
+
+`--search-flat-int8` (`search-flat-int8` in the configuration file; `CONFIG GET` and
+`CONFIG SET` take it) gives each FLAT vector field of 256 dimensions or more, once it holds
+1,024 vectors, an int8 copy of its vectors, and lets a KNN scan of 1,024 candidates or more
+(and at least 8 times `k`) measure each candidate against the copy first. A candidate is
+measured exactly unless the k nearest are already held and the copy's lower bound on its
+distance is at least the k-th, so the reply is the exact scan's, ties and order included.
+x86_64 only; elsewhere the switch is taken and the pass is not used.
+
+The copy is made and kept up to date by one thread, `flat-int8`, not by the writes: a write
+marks its slot, and the thread codes what is marked with no lock held, stores each code
+under the write lock only if the slot still holds the same vector, and lets writers and
+searches in every 50 µs. Until a slot is coded again a scan measures it exactly. The copy
+takes 16 bytes plus one a dimension per vector, is counted in `used_memory`, is not saved,
+and is made again after a restart. `FT.INFO` shows it under `flat_int8_indexes`: the field,
+its bytes, and how many candidates the pass skipped and measured exactly. Turning the switch
+off stops the pass at once; a copy already made is kept up to date until the index is
+dropped.
+
+A scan the query's timeout cuts returns the nearest of the candidates it reached, as it
+does without the pass.
 
 ### Search index threads
 

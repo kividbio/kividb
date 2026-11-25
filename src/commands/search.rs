@@ -802,6 +802,33 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         );
     }
 
+    let copies: Vec<Vec<u8>> = def
+        .fields
+        .iter()
+        .filter_map(|f| match def.indexes.get(&f.name) {
+            Some(LiveIndex::Flat(flat)) => flat.int8_copy().map(|c| (f.name.as_str(), c)),
+            _ => None,
+        })
+        .map(|(field, (bytes, skipped, rescored))| {
+            resp_array(simple_names(
+                vec![
+                    resp_bulk_str("field"),
+                    resp_bulk_str(field),
+                    resp_bulk_str("bytes"),
+                    resp_bulk_str(&bytes.to_string()),
+                    resp_bulk_str("skipped"),
+                    resp_bulk_str(&skipped.to_string()),
+                    resp_bulk_str("rescored"),
+                    resp_bulk_str(&rescored.to_string()),
+                ],
+                valkey,
+            ))
+        })
+        .collect();
+    if !copies.is_empty() {
+        put("flat_int8_indexes", resp_array(copies));
+    }
+
     Some(resp_map_for(resp, out))
 }
 
