@@ -5606,6 +5606,8 @@ fn phonetic_fields_match_and_score_as_redis_does() {
     assert_eq!(ids(&mut c, "@p:app"), ["ph:26"]);
 }
 
+// `search-flat-int8` is one switch for every server in this process: this keeps the int8 tests
+// apart, and other tests' FLAT indexes of 256+ dimensions may get a `flat_int8_indexes` entry.
 static FLAT_INT8: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn flat_int8_skipped(c: &mut Conn, index: &str) -> Option<u64> {
@@ -5804,7 +5806,7 @@ fn the_flat_int8_pass_keeps_the_order_of_exact_duplicates() {
 }
 
 #[test]
-fn drops_flushes_and_switching_while_the_flat_int8_copy_is_coded() {
+fn drops_flushes_and_switching_right_after_the_flat_int8_build_is_set_off() {
     let _one = FLAT_INT8.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = own_conn();
     let mut seed = 0x1033_f1f1u64;
