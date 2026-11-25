@@ -219,6 +219,13 @@ async fn server_tokio(
             }
         }
     }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
+    }
     // The AOF writer gets a dedicated single-thread runtime rather than a task on
     // the shared one. `rewrite_aof` quiesces by holding every shard lock and then
     // waits for the writer to perform the swap; if the writer were a task here,

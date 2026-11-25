@@ -891,6 +891,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             }
         }
     }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
+    }
     // start_hub needs a tokio runtime — give it its own single-thread runtime
     // just like the AOF writer, so it never competes with the io_uring workers.
     let hub_tx = {
@@ -1784,6 +1791,13 @@ async fn async_main_tokio(
                 std::process::exit(1);
             }
         }
+    }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
     }
 
     let addr: SocketAddr = config.addr().parse()?;

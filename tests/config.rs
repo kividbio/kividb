@@ -513,6 +513,13 @@ fn config_rewrite_round_trip_keeps_every_setting() {
         data.canonicalize().unwrap(),
         "{before:?}"
     );
+    // Set at run time, and read back whole: spaces, quotes and `#`.
+    assert!(
+        c.cmds(&["CONFIG", "SET", "masteruser", "a \"user\" # 'one'"])
+            .is_ok()
+    );
+    let before = config_get_all(&mut c);
+    assert_eq!(before["masteruser"], "a \"user\" # 'one'");
     let reply = c.cmds(&["CONFIG", "REWRITE"]);
     assert!(reply.is_ok(), "CONFIG REWRITE: {reply:?}");
     drop(c);
@@ -557,6 +564,379 @@ fn config_rewrite_round_trip_keeps_every_setting() {
         left_out.is_empty(),
         "CONFIG REWRITE leaves these out, and NOT_REWRITTEN does not say why: {left_out:?}\n{written}"
     );
+}
+
+/// A kividb started from `conf` in `cwd`, killed when dropped, once it
+/// answers `PING`: with `PONG`, or, with a password, `NOAUTH` (which
+/// `start_from_file` does not take).
+fn spawn_from_file(conf: &std::path::Path, cwd: &std::path::Path, port: u16) -> Spawned {
+    let server = Spawned(
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(cwd)
+            .args(["--configfile", conf.to_str().unwrap()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start kividb"),
+    );
+    let answers = || -> bool {
+        let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) else {
+            return false;
+        };
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+        let mut first = [0u8; 1];
+        stream.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok()
+            && stream.read_exact(&mut first).is_ok()
+            && matches!(first[0], b'+' | b'-')
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !answers() {
+        assert!(Instant::now() < deadline, "no answer on port {port}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    server
+}
+
+/// The reply to `AUTH password` on a new connection to `port`, and the
+/// connection.
+fn auth(port: u16, password: &str) -> (Conn, RespValue) {
+    let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut c = Conn(stream);
+    let reply = c.cmds(&["AUTH", password]);
+    (c, reply)
+}
+
+/// A connection to `port` that `AUTH password` let in.
+fn authed(port: u16, password: &str) -> Conn {
+    let (c, reply) = auth(port, password);
+    assert!(reply.is_ok(), "AUTH on {port}: {reply:?}");
+    c
+}
+
+/// Waits until the replica on `c` has its link to the master up.
+fn wait_for_link(c: &mut Conn) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let info = c.cmds(&["INFO", "replication"]).as_str().to_string();
+        if info.contains("master_link_status:up") {
+            return;
+        }
+        assert!(Instant::now() < deadline, "the link is not up: {info}");
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Passwords changed with `CONFIG SET` round-trip through the rewritten
+/// file: a master and its replica restarted from the files they wrote take
+/// the values in effect, clients with them, and the replica authenticates to
+/// its master with them. `CONFIG GET` shows the passwords as `**redacted**`.
+#[test]
+fn config_rewrite_round_trips_passwords() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let first = "first";
+    let second = "second \"one\" # with spaces, 'quotes' and é";
+    let conf = |name: &str, lines: String| {
+        let dir = tmp.path().join(name);
+        std::fs::create_dir(&dir).unwrap();
+        let conf = dir.join("node.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "dir \"{}\"\nrequirepass \"{first}\"\n{lines}",
+                dir.display()
+            ),
+        )
+        .unwrap();
+        (conf, dir)
+    };
+    let (master_conf, master_dir) = conf("master", format!("port {master_port}\n"));
+    let (replica_conf, replica_dir) = conf(
+        "replica",
+        format!(
+            "port {replica_port}\nmasterauth \"{first}\"\n\
+             replicaof 127.0.0.1 {master_port}\n"
+        ),
+    );
+
+    let master = spawn_from_file(&master_conf, &master_dir, master_port);
+    let replica = spawn_from_file(&replica_conf, &replica_dir, replica_port);
+    let mut m = authed(master_port, first);
+    let mut r = authed(replica_port, first);
+    wait_for_link(&mut r);
+    for (name, value) in [
+        ("masterauth", second),
+        ("masteruser", "default"),
+        ("requirepass", second),
+    ] {
+        let reply = r.cmds(&["CONFIG", "SET", name, value]);
+        assert!(reply.is_ok(), "CONFIG SET {name}: {reply:?}");
+    }
+    assert!(m.cmds(&["CONFIG", "SET", "requirepass", second]).is_ok());
+    for c in [&mut m, &mut r] {
+        assert_eq!(config_get(c, "requirepass"), "**redacted**");
+        let reply = c.cmds(&["CONFIG", "REWRITE"]);
+        assert!(reply.is_ok(), "CONFIG REWRITE: {reply:?}");
+    }
+    assert_eq!(config_get(&mut r, "masterauth"), "**redacted**");
+    drop((m, r, replica, master));
+
+    let _master = spawn_from_file(&master_conf, &master_dir, master_port);
+    let _replica = spawn_from_file(&replica_conf, &replica_dir, replica_port);
+    for (port, conf) in [(master_port, &master_conf), (replica_port, &replica_conf)] {
+        let written = std::fs::read_to_string(conf).unwrap();
+        let (_, reply) = auth(port, first);
+        assert!(
+            reply.is_error(),
+            "AUTH with a replaced password on {port}: {reply:?}\n{written}"
+        );
+        let (_, reply) = auth(port, second);
+        assert!(reply.is_ok(), "AUTH on {port}: {reply:?}\n{written}");
+    }
+    let mut m = authed(master_port, second);
+    let mut r = authed(replica_port, second);
+    wait_for_link(&mut r);
+    assert!(m.cmds(&["SET", "after-restart", "1"]).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(r.cmds(&["GET", "after-restart"]), RespValue::BulkStr(v) if v == "1") {
+        assert!(
+            Instant::now() < deadline,
+            "the write did not reach the replica"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `requirepass` round-trips through the rewritten file: set with `CONFIG
+/// SET`, it is asked for after a restart; set to `""`, no password is.
+#[test]
+fn config_rewrite_round_trips_requirepass() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!("port {port}\ndir \"{}\"\n", tmp.path().display()),
+    )
+    .unwrap();
+    let server = spawn_from_file(&conf, tmp.path(), port);
+    let mut c = Conn::connect(port);
+    assert!(
+        c.cmds(&["CONFIG", "SET", "requirepass", "set at run time"])
+            .is_ok()
+    );
+    assert!(c.cmds(&["AUTH", "set at run time"]).is_ok());
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    drop((c, server));
+
+    let server = spawn_from_file(&conf, tmp.path(), port);
+    let written = std::fs::read_to_string(&conf).unwrap();
+    let (mut c, reply) = auth(port, "set at run time");
+    assert!(reply.is_ok(), "AUTH: {reply:?}\n{written}");
+    let (mut other, _) = auth(port, "not it");
+    assert!(other.cmds(&["PING"]).is_error(), "{written}");
+    assert!(c.cmds(&["CONFIG", "SET", "requirepass", ""]).is_ok());
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    drop((c, other, server));
+
+    let _server = spawn_from_file(&conf, tmp.path(), port);
+    let written = std::fs::read_to_string(&conf).unwrap();
+    assert!(!written.contains("requirepass"), "{written}");
+    let mut c = Conn::connect(port);
+    assert_eq!(c.cmds(&["PING"]).as_str(), "PONG");
+}
+
+/// A refused `CONFIG SET` of several settings leaves authentication as it
+/// was: the default user's passwords (here one given by `ACL SETUSER`) and
+/// the `requirepass` that `CONFIG REWRITE` writes.
+#[test]
+fn config_set_refused_leaves_authentication_as_it_was() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!("port {port}\ndir \"{}\"\n", tmp.path().display()),
+    )
+    .unwrap();
+    let _server = spawn_from_file(&conf, tmp.path(), port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["ACL", "SETUSER", "default", ">other"]).is_ok());
+    let reply = c.cmds(&[
+        "CONFIG",
+        "SET",
+        "requirepass",
+        "x",
+        "maxmemory-policy",
+        "not-a-policy",
+    ]);
+    assert!(reply.is_error(), "{reply:?}");
+    let (_, reply) = auth(port, "other");
+    assert!(reply.is_ok(), "AUTH other: {reply:?}");
+    let (_, reply) = auth(port, "x");
+    assert!(reply.is_error(), "AUTH x: {reply:?}");
+    let (mut fresh, _) = auth(port, "nothing");
+    assert!(fresh.cmds(&["PING"]).is_error());
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    let written = std::fs::read_to_string(&conf).unwrap();
+    assert!(
+        !written.lines().any(|l| l.starts_with("requirepass")),
+        "{written}"
+    );
+}
+
+/// `ACL LIST`'s replies, as text.
+fn acl_list(c: &mut Conn) -> Vec<String> {
+    c.cmds(&["ACL", "LIST"])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect()
+}
+
+/// With no `aclfile`, `CONFIG REWRITE` writes the ACL users as `user` lines,
+/// as Redis does, and a server restarted from the file has the same users
+/// and rules: passwords, `nopass`, `resetpass`, a user that is `off`, key
+/// patterns with `%R~`/`%W~`, channels, categories, selectors, and patterns
+/// that need quoting. `default`'s password, given by `ACL SETUSER` alone, is
+/// asked for after the restart. `CONFIG GET` lists no users.
+#[test]
+fn config_rewrite_round_trips_acl_users() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!("port {port}\ndir \"{}\"\n", tmp.path().display()),
+    )
+    .unwrap();
+    let server = spawn_from_file(&conf, tmp.path(), port);
+    let mut c = Conn::connect(port);
+    for rules in [
+        &[
+            "alice",
+            "on",
+            ">a pw",
+            "~app:*",
+            "%R~ro:*",
+            "%W~wo:*",
+            "&chan:*",
+            "+@read",
+            "-@dangerous",
+            "+set",
+            "(~sel:* +get)",
+        ][..],
+        &["bob", "off", "nopass", "~*", "+@all"],
+        &["carol", "on", ">x", "resetpass", "~\"q*", "~'s*", "+get"],
+        &["dave", "on", ">y", "~é*", "~back\\slash*", "&#hash", "+get"],
+        &["default", "on", ">p"],
+    ] {
+        let mut cmd = vec!["ACL", "SETUSER"];
+        cmd.extend_from_slice(rules);
+        let reply = c.cmds(&cmd);
+        assert!(reply.is_ok(), "ACL SETUSER {rules:?}: {reply:?}");
+    }
+    let before = acl_list(&mut c);
+    assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+    let names = config_get_all(&mut c);
+    assert!(
+        !names.keys().any(|n| n.starts_with("user")),
+        "CONFIG GET lists users: {names:?}"
+    );
+    drop((c, server));
+
+    let _server = spawn_from_file(&conf, tmp.path(), port);
+    let written = std::fs::read_to_string(&conf).unwrap();
+    let (mut open, _) = auth(port, "not it");
+    assert!(open.cmds(&["PING"]).is_error(), "{written}");
+    let mut c = authed(port, "p");
+    assert_eq!(acl_list(&mut c), before, "{written}");
+    let (mut a, reply) = auth(port, "x");
+    assert!(reply.is_error(), "carol's password was reset: {reply:?}");
+    let reply = a.cmds(&["AUTH", "alice", "a pw"]);
+    assert!(reply.is_ok(), "AUTH alice: {reply:?}\n{written}");
+}
+
+/// The config file takes `user` lines, and a `user default` line wins over
+/// `requirepass`, as in Redis. `user` lines and `aclfile` together are
+/// refused at startup, as Redis refuses them.
+#[test]
+fn config_file_user_lines() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port}\ndir \"{}\"\nrequirepass a\nuser default on >b ~* &* +@all\n\
+             USER erin on >e ~e:* +get\n",
+            tmp.path().display()
+        ),
+    )
+    .unwrap();
+    let server = spawn_from_file(&conf, tmp.path(), port);
+    let (_, reply) = auth(port, "a");
+    assert!(reply.is_error(), "{reply:?}");
+    let mut c = authed(port, "b");
+    assert!(c.cmds(&["AUTH", "erin", "e"]).is_ok());
+    drop((c, server));
+
+    let acl = tmp.path().join("users.acl");
+    std::fs::write(&acl, "").unwrap();
+    std::fs::write(
+        &conf,
+        format!(
+            "port {port}\ndir \"{}\"\naclfile \"{}\"\nuser erin on >e +get\n",
+            tmp.path().display(),
+            acl.display()
+        ),
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+        .current_dir(tmp.path())
+        .args(["--configfile", conf.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start kividb");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("started with both user lines and an aclfile");
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(!status.success());
+}
+
+/// When the new file cannot be made beside the old one (here a directory is
+/// in its place), `CONFIG REWRITE` replies with an error and the old file
+/// is as it was.
+#[test]
+fn config_rewrite_that_cannot_make_its_file_leaves_the_old_one() {
+    let port = free_port();
+    let tmp = tempfile::tempdir().unwrap();
+    let conf = tmp.path().join("kividb.conf");
+    let text = format!("port {port}\ndir \"{}\"\n", tmp.path().display());
+    std::fs::write(&conf, &text).unwrap();
+    let in_the_way = conf.with_extension("tmp");
+    std::fs::create_dir(&in_the_way).unwrap();
+    std::fs::write(in_the_way.join("keep"), "").unwrap();
+    let _server = spawn_from_file(&conf, tmp.path(), port);
+    let mut c = Conn::connect(port);
+    assert!(c.cmds(&["CONFIG", "SET", "maxmemory-samples", "9"]).is_ok());
+    let reply = c.cmds(&["CONFIG", "REWRITE"]);
+    assert!(reply.is_error(), "CONFIG REWRITE: {reply:?}");
+    assert_eq!(std::fs::read_to_string(&conf).unwrap(), text);
 }
 
 /// `REPLICAOF NO ONE` makes the server a master, and `CONFIG REWRITE` after

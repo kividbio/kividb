@@ -626,6 +626,8 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         default_user.passwords = vec![crate::acl::sha256_hex(value)];
                     }
                 }
+                // As set, for `CONFIG REWRITE`: the store keeps a hash.
+                ctx.repl_state.set_requirepass(value);
                 Some(resp_simple("OK"))
             }
             "appendonly" => match value {
@@ -2227,6 +2229,24 @@ fn output_buffer_limits(ctx: &Ctx) -> String {
         },
     );
     limits.to_config_string()
+}
+
+/// [`config_rows`] with each secret's current value where `CONFIG GET`
+/// shows `**redacted**`: what `CONFIG REWRITE` writes, and what a `CONFIG
+/// SET` of several settings puts back when one of them is refused. Never a
+/// reply to a client.
+fn config_rows_with_secrets(ctx: &Ctx) -> Vec<(String, String)> {
+    let (_, master_auth) = ctx.repl_state.master_credentials();
+    let mut rows = config_rows(ctx);
+    for (name, value) in rows.iter_mut() {
+        match name.as_str() {
+            "requirepass" => *value = ctx.repl_state.requirepass(),
+            "masterauth" => value.clone_from(&master_auth),
+            "cluster-bus-secret" => value.clone_from(&ctx.config.cluster_bus_secret),
+            _ => {}
+        }
+    }
+    rows
 }
 
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
@@ -5636,10 +5656,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // it would be alone, in order; if one is refused, the
                     // ones before it are put back to what they were.
                     let before = if settings.len() > 1 {
-                        config_rows(ctx)
+                        config_rows_with_secrets(ctx)
                     } else {
                         Vec::new()
                     };
+                    // `requirepass` is put back exactly: the default user's
+                    // passwords as they were (`ACL SETUSER default >...`
+                    // may have given it several), and the text kept for
+                    // `CONFIG REWRITE`.
+                    let auth_before = (settings.len() > 1).then(|| {
+                        let user = ctx
+                            .acl_store
+                            .read()
+                            .get("default")
+                            .map(|u| (u.nopass, u.passwords.clone()));
+                        (user, ctx.repl_state.requirepass())
+                    });
                     for (i, (param, value)) in settings.iter().enumerate() {
                         let mut reply = config_set_one(ctx, param, value);
                         // Redis's own reply to a setting it does not know
@@ -5662,6 +5694,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             }
                             for (param, _) in &settings[..i] {
                                 match before.iter().find(|(known, _)| known == param) {
+                                    Some(_) if param == "requirepass" => {}
                                     Some((_, old)) => {
                                         config_set_one(ctx, param, old);
                                     }
@@ -5669,6 +5702,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                         REMEMBERED_CONFIG.lock().remove(param);
                                     }
                                 }
+                            }
+                            if let Some((user, text)) = auth_before.as_ref()
+                                && settings[..i].iter().any(|(p, _)| p == "requirepass")
+                            {
+                                if let Some((nopass, passwords)) = user
+                                    && let Some(default) = ctx.acl_store.write().get_mut("default")
+                                {
+                                    default.nopass = *nopass;
+                                    default.passwords.clone_from(passwords);
+                                }
+                                ctx.repl_state.set_requirepass(text);
                             }
                             return Some(reply);
                         }
@@ -5707,8 +5751,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "REWRITE" => {
                     use crate::config::RewriteError;
-                    let rows = config_rows(ctx);
-                    match ctx.config.with_values(&rows).rewrite_with(&rows) {
+                    let rows = config_rows_with_secrets(ctx);
+                    let mut config = ctx.config.with_values(&rows);
+                    config.users = crate::acl::config_lines(ctx.acl_store, &config.requirepass);
+                    match config.rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",
@@ -5721,6 +5767,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
+                        Err(RewriteError::DirectorySync(e)) => Some(resp_error(&format!(
+                            "ERR Rewriting config file: the file was replaced, but its \
+                             directory could not be synced: {e}"
+                        ))),
                     }
                 }
                 "HELP" => Some(help(
