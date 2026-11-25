@@ -11454,7 +11454,11 @@ fn replica_stopped_while_slots_leave_and_come_back(
                 || replica.log().contains("Manual failover: starting")
         });
         for _ in 0..150 {
-            assert!(!replica.is_master(), "elected\n{}", logs());
+            assert!(
+                !replica.is_master(),
+                "the restarted voter refuses every slot of the master: no election is to be won\n{}",
+                logs()
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
     } else {
@@ -11471,7 +11475,7 @@ fn replica_stopped_while_slots_leave_and_come_back(
                 assert_ne!(
                     owner_in_view_of(n, a).as_deref(),
                     Some(replica_id.as_str()),
-                    "elected for slots that came to its master after the claim it read\n{}",
+                    "slots that came to the master after the claim the replica read stay with the master\n{}",
                     logs()
                 );
             }
