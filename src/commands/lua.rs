@@ -134,6 +134,54 @@ fn script_store() -> &'static RwLock<ahash::AHashMap<String, Arc<str>>> {
     SCRIPT_STORE.get_or_init(|| RwLock::new(ahash::AHashMap::new()))
 }
 
+thread_local! {
+    /// Whether each script this thread has been asked about keeps to its
+    /// `KEYS` (`lua_keys_only`): by body for `EVAL`, by digest for
+    /// `EVALSHA`. Read once a thread, and again only after
+    /// [`KEEPS_TO_KEYS_MAX`] others.
+    static KEEPS_TO_KEYS: RefCell<[ahash::AHashMap<Box<[u8]>, bool>; 2]> =
+        RefCell::new(Default::default());
+}
+
+/// Scripts written out anew for each call would grow [`KEEPS_TO_KEYS`]
+/// without end: past this it starts again.
+const KEEPS_TO_KEYS_MAX: usize = 1024;
+
+/// Whether the script of `cmd` (`EVAL`, `EVALSHA` or their `_RO` forms,
+/// with their arguments) keeps to its `KEYS`: names no key but `KEYS[n]`,
+/// and calls only commands whose keys are known (`lua_keys_only`). False
+/// for a digest of no script the server has.
+pub(crate) fn script_keeps_to_its_keys(cmd: &[&[u8]]) -> bool {
+    let (Some(name), Some(&named)) = (cmd.first(), cmd.get(1)) else {
+        return false;
+    };
+    let by_digest = name.len() >= 7 && name[..7].eq_ignore_ascii_case(b"EVALSHA");
+    let known = KEEPS_TO_KEYS.with(|known| known.borrow()[by_digest as usize].get(named).copied());
+    if let Some(known) = known {
+        return known;
+    }
+    let keeps = if by_digest {
+        let Ok(sha) = std::str::from_utf8(named) else {
+            return false;
+        };
+        let Some(source) = script_store().read().get(&sha.to_ascii_lowercase()).cloned() else {
+            return false;
+        };
+        super::lua_keys_only::keeps_to_its_keys(&source)
+    } else {
+        std::str::from_utf8(named).is_ok_and(super::lua_keys_only::keeps_to_its_keys)
+    };
+    KEEPS_TO_KEYS.with(|known| {
+        let mut known = known.borrow_mut();
+        let known = &mut known[by_digest as usize];
+        if known.len() >= KEEPS_TO_KEYS_MAX {
+            known.clear();
+        }
+        known.insert(Box::from(named), keeps);
+    });
+    keeps
+}
+
 /// How many scripts sent only with `EVAL` the cache keeps, as Redis 7.4:
 /// past this, the least recently used goes. A client that writes its values
 /// into the script, rather than passing them as arguments, grew the cache
@@ -4217,6 +4265,19 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
 
     if ctx.cmd.len() < 3 + numkeys {
         return resp_error("ERR wrong number of arguments for 'eval' command");
+    }
+
+    // A script that keeps to its keys, none of them with a hash tag, here
+    // with the command gate alone: from now on a command locks keys without
+    // a tag too, and the next such script runs beside others under its keys'
+    // locks (`tag_locks::lock_untagged_keys_for`). With the gate alone, no
+    // command is between its look at whether to lock its keys and its end.
+    if crate::tag_locks::enabled()
+        && !crate::tag_locks::untagged_keys_locked()
+        && !ctx.apply_replication
+        && crate::command_gate::alone_on_this_thread()
+    {
+        crate::tag_locks::lock_untagged_keys_for(&ctx.cmd);
     }
 
     // The arguments where they are, not copies: they are copied once, into

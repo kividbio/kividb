@@ -45,11 +45,14 @@ mod lua_compat51;
 #[cfg(feature = "lua")]
 mod lua_format;
 #[cfg(feature = "lua")]
+mod lua_keys_only;
+#[cfg(feature = "lua")]
 pub(crate) use lua::{
     busy_reply as script_busy_reply, cached_script_declares_no_writes,
     cached_script_declares_writes, function_declares_no_writes, library_snapshot,
     lua_command_runs_long_sync_vm, restore_library_snapshot, running_script_is_over_its_time_limit,
-    script_declares_no_writes, script_declares_writes, take_last_vm_run_us, with_client_resp,
+    script_declares_no_writes, script_declares_writes, script_keeps_to_its_keys,
+    take_last_vm_run_us, with_client_resp,
 };
 #[cfg(not(feature = "lua"))]
 mod lua {

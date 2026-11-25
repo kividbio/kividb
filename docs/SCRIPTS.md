@@ -242,9 +242,14 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
   held too (released once more than three `EXEC`s have started waiting),
   so a very long script delays them for its duration.
 
+- **A script whose `KEYS` all lack a tag, and that keeps to them, runs
+  beside others under its keys' locks**: see "Scripts that keep to their
+  keys" below.
+
 - **Every other script is as before.** A script with no keys, or with a key
-  that has no tag, runs alone and may touch what it likes. So do functions
-  (`FCALL`), and scripts inside `MULTI`/`EXEC`.
+  that has no tag (other than those just named), runs alone and may touch
+  what it likes. So do functions (`FCALL`), and scripts inside
+  `MULTI`/`EXEC`.
 
 - **Scripts that run alone and come while one is running are run right
   after it, on the same thread.** Once a script has been seen to be quick,
@@ -269,7 +274,9 @@ between the first `{` and the next `}`, as in `{orders}:waiting`.
 - **A command from a client waits for a script on its tag.** `GET
   {orders}:waiting` sent while a script on `orders` is running is answered
   when the script has finished; so is a command naming a key of any of the
-  tags of a script of several. Keys without a tag are never waited for.
+  tags of a script of several. A key without a tag is waited for only while
+  a script that keeps to its keys holds it (see "Scripts that keep to
+  their keys").
   `MULTI`/`EXEC`, `DBSIZE`, `RANDOMKEY`, `FLUSHALL`, `FLUSHDB` and `SWAPDB`
   wait for every running script, and hold back every other command while
   they run; so do `FT.DROPINDEX … DD` and `DEBUG POPULATE`.
@@ -332,6 +339,91 @@ script's writes reach replicas and the AOF as one group while it holds
 them: replicas and a replay of the AOF apply scripts in an order the
 master could have run them one after another.
 
+### Scripts that keep to their keys
+
+A script whose `KEYS` all lack a hash tag runs beside others too, held to
+its keys as a tagged script is held to its tags, when it is sent by `EVAL`
+or `EVALSHA` (not their `_RO` forms) and its source shows that it keeps to
+them. That is read from the script's text before it runs (once per thread
+and script), and holds when:
+
+- every `redis.call(...)` and `redis.pcall(...)` names its command with a
+  string literal (`"GET"`, `'del'`), of the commands below, and gives each
+  argument that command takes as a key written exactly as `KEYS[1]`,
+  `KEYS[2]`, ...;
+- `redis` is used only for its functions (`redis.call`, `redis.sha1hex`,
+  `redis.log`, ...), never as a value or assigned to;
+- `KEYS` is used only as `KEYS[<number>]`, where it is read: never assigned,
+  passed on (`unpack(KEYS)`), counted (`#KEYS`), iterated or shadowed;
+- nothing that reaches the globals or functions another way is named:
+  `_G`, `_ENV`, `getfenv`, `setfenv`, `loadstring`, `load`, `dofile`,
+  `loadfile`, `rawset`, `rawget`, `setmetatable`, `getmetatable`, `debug`,
+  `require`, `module`, `package`.
+
+The commands, with their key the first argument: `GET`, `SET`, `SETNX`,
+`SETEX`, `PSETEX`, `GETSET`, `GETDEL`, `GETEX`, `INCR`, `INCRBY`, `DECR`,
+`DECRBY`, `INCRBYFLOAT`, `APPEND`, `STRLEN`, `GETRANGE`, `SETRANGE`, `TTL`,
+`PTTL`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `EXPIRETIME`,
+`PEXPIRETIME`, `PERSIST`, `TYPE`, `HGET`, `HSET`, `HSETNX`, `HMSET`, `HMGET`,
+`HDEL`, `HEXISTS`, `HINCRBY`, `HINCRBYFLOAT`, `HGETALL`, `HKEYS`, `HVALS`,
+`HLEN`, `HSTRLEN`, `LPUSH`, `RPUSH`, `LPUSHX`, `RPUSHX`, `LPOP`, `RPOP`,
+`LLEN`, `LRANGE`, `LINDEX`, `LSET`, `LREM`, `LTRIM`, `LINSERT`, `LPOS`,
+`SADD`, `SREM`, `SISMEMBER`, `SMISMEMBER`, `SMEMBERS`, `SCARD`, `SPOP`,
+`SRANDMEMBER`, `ZADD`, `ZREM`, `ZSCORE`, `ZMSCORE`, `ZINCRBY`, `ZCARD`,
+`ZCOUNT`, `ZRANGE`, `ZRANGEBYSCORE`, `ZREVRANGE`, `ZREVRANGEBYSCORE`,
+`ZRANK`, `ZREVRANK`, `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZPOPMIN`,
+`ZPOPMAX`; and with every argument a key: `DEL`, `UNLINK`, `EXISTS`, `MGET`,
+`TOUCH`.
+
+A lock's release, as yii2-redis and many other clients send it, is such a
+script:
+
+```
+EVAL "if redis.call(\"GET\",KEYS[1])==ARGV[1] then return redis.call(\"DEL\",KEYS[1]) else return 0 end" 1 <lock> <token>
+```
+
+A script that does anything else runs alone, exactly as before, and may
+touch what it likes: one that builds a key (`KEYS[1] .. ':log'`), keeps one
+in a local (`local key = KEYS[1]`), loops over `KEYS`, or names its command
+with a variable. BullMQ's and Sidekiq's scripts are of that kind. Nothing a
+script may do changes: the text is read only to decide where the script
+runs, before it starts, never part-way through.
+
+Such a script's keys are locked as tags are: each key stands for its own
+tag. A command from a client on one of them waits for the script, as a
+command on a script's tag does, and a script of the same key waits for it.
+So that a command on a key without a tag finds it locked when it needs to,
+commands lock keys without a tag too from the first run of such a script on:
+that run is alone, and it switches the locks on with every other command
+held back, so no command is between its look at whether to lock its keys
+and its end. From then on a command on a key without a tag takes that key's
+lock, as a command on a tagged key takes its tag's; until then it looks at
+the key for a `{`, and that is all. Switching `lua-parallel-scripts` off
+switches those locks off too, until the next such script.
+
+While keys can be evicted (`maxmemory` set, with a policy other than
+`noeviction`), such scripts run alone, as other scripts with a key without a
+tag do: making room evicts keys from inside a write, a script's included.
+
+Measured on an Azure `Standard_D8s_v5` (Intel Xeon Platinum 8370C; the
+server pinned to 4 vCPUs with `taskset`, `--threads 4`; Redis 8.12 and
+Valkey 8.1 with `--io-threads 4`; the load on the other 4): yii2-redis's
+`Mutex` cycle, `SET <lock> <token> NX PX 30000` and then the release above
+by `EVAL` with the script's text every time, 32 connections each on a lock
+of its own, one command at a time per connection, 10 s, three runs each,
+the servers in turn (median):
+
+| | ops/s | `EVAL` p50 / p99 (µs) | `SET` p50 / p99 (µs) |
+|---|---:|---:|---:|
+| this build | 285,000 | 105 / 285 | 100 / 278 |
+| the build before | 150,200 | 215 / 471 | 195 / 429 |
+| Redis 8.12 | 207,600 | 148 / 296 | 144 / 292 |
+| Valkey 8.1 | 232,200 | 130 / 292 | 132 / 293 |
+
+The build before ran each release alone, the other commands held back
+around it; its four worker threads were 70 % busy. This build runs them
+beside each other, its four threads at 99 %.
+
 ### What to know
 
 - A script that declares tagged keys and also uses a key outside their
@@ -366,12 +458,12 @@ that a server running its scripts one at a time shows it without
 
 | Field | Counts a script that |
 |---|---|
-| `scripts_run_beside_others` | ran beside other commands, under its tags' locks |
+| `scripts_run_beside_others` | ran beside other commands, under its tags' locks (or its keys', for a script that keeps to its keys) |
 | `scripts_run_alone_parallel_off` | ran alone because `lua-parallel-scripts` is `no` |
 | `scripts_run_alone_in_transaction` | ran alone inside `MULTI`/`EXEC` |
 | `scripts_run_alone_function` | ran alone because it is a function |
 | `scripts_run_alone_no_keys` | ran alone because it has no `KEYS` |
-| `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag |
+| `scripts_run_alone_no_tag` | ran alone because a key of its `KEYS` has no hash tag, and it is not a script that keeps to its keys (or keys can be evicted; or it is the run that switches on the locks of keys without a tag) |
 | `scripts_run_alone_not_quick` | ran alone because it has not (or not yet) been seen to be quick |
 | `scripts_handed_to_runner` | (alone, and quick) came while another script was running, and was run by the thread running that one, or by the script-runner thread |
 | `scripts_offloaded_to_pool` | (not yet seen to be quick, or seen to be slow) was run on a thread of the blocking pool |
