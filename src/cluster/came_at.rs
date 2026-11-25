@@ -619,7 +619,8 @@ impl ClusterState {
         claims: &[crate::cluster::bus::SlotClaim],
     ) -> Moved {
         let slots = self.slots.read();
-        let (mut decisive, mut fallback): (Vec<(u16, u64)>, Vec<(u16, u64)>) = Default::default();
+        let mut decisive: Vec<(u16, u64)> = Vec::new();
+        let mut fallback: Vec<(u16, u64)> = Vec::new();
         for c in claims {
             let end = c.end.min((CLUSTER_SLOTS - 1) as u16);
             for slot in c.start..=end {
