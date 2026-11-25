@@ -164,7 +164,11 @@ pub(crate) fn script_keeps_to_its_keys(cmd: &[&[u8]]) -> bool {
         let Ok(sha) = std::str::from_utf8(named) else {
             return false;
         };
-        let Some(source) = script_store().read().get(&sha.to_ascii_lowercase()).cloned() else {
+        let Some(source) = script_store()
+            .read()
+            .get(&sha.to_ascii_lowercase())
+            .cloned()
+        else {
             return false;
         };
         super::lua_keys_only::keeps_to_its_keys(&source)

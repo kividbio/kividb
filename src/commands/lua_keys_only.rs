@@ -68,7 +68,19 @@ fn reads_what_follows(tok: Option<Tok>) -> bool {
     match tok {
         Some(Tok::Op(op)) => matches!(
             op,
-            "=" | "==" | "~=" | "<" | ">" | "<=" | ">=" | ".." | "+" | "-" | "*" | "/" | "%" | "^"
+            "=" | "=="
+                | "~="
+                | "<"
+                | ">"
+                | "<="
+                | ">="
+                | ".."
+                | "+"
+                | "-"
+                | "*"
+                | "/"
+                | "%"
+                | "^"
                 | "#"
         ),
         Some(Tok::Name(word)) => matches!(
@@ -177,7 +189,11 @@ fn key_rule(name: &str) -> Option<KeyRule> {
     if first {
         return Some(KeyRule::First);
     }
-    matches!(upper.as_str(), "DEL" | "UNLINK" | "EXISTS" | "MGET" | "TOUCH").then_some(KeyRule::All)
+    matches!(
+        upper.as_str(),
+        "DEL" | "UNLINK" | "EXISTS" | "MGET" | "TOUCH"
+    )
+    .then_some(KeyRule::All)
 }
 
 /// The tokens of `src`, or `None` if it is not one this can read through.
@@ -318,7 +334,7 @@ pub(crate) fn keeps_to_its_keys(source: &str) -> bool {
     let mut within: Vec<Within> = Vec::new();
     let at = |i: usize| toks.get(i).copied();
     for (i, &tok) in toks.iter().enumerate() {
-        let prev = i.checked_sub(1).and_then(|p| at(p));
+        let prev = i.checked_sub(1).and_then(at);
         let a_field = matches!(prev, Some(Tok::Op(".") | Tok::Op(":")));
         match tok {
             Tok::Op("(") => within.push(Within::Paren),
@@ -327,7 +343,9 @@ pub(crate) fn keeps_to_its_keys(source: &str) -> bool {
             Tok::Op(")") if within.pop() != Some(Within::Paren) => return false,
             Tok::Op("]") if within.pop() != Some(Within::Bracket) => return false,
             Tok::Op("}") if within.pop() != Some(Within::Brace) => return false,
-            Tok::Name("function" | "if" | "do" | "repeat") if !a_field => within.push(Within::Block),
+            Tok::Name("function" | "if" | "do" | "repeat") if !a_field => {
+                within.push(Within::Block)
+            }
             Tok::Name("end" | "until") if !a_field && within.pop() != Some(Within::Block) => {
                 return false;
             }
@@ -459,7 +477,9 @@ mod tests {
              -- redis.call('SET', 'elsewhere', 1)\n\
              return redis.sha1hex('x') .. \"redis.call('GET', ARGV[1])\""
         ));
-        assert!(keeps("local k = #KEYS[1] return redis.call('STRLEN', KEYS[1]) + k"));
+        assert!(keeps(
+            "local k = #KEYS[1] return redis.call('STRLEN', KEYS[1]) + k"
+        ));
         assert!(keeps(
             "local t = {KEYS[1], [KEYS[2]] = 1} return redis.call('MGET', KEYS[1], KEYS[2])"
         ));
@@ -472,9 +492,7 @@ mod tests {
         assert!(!keeps("return redis.call('GET', ARGV[1])"));
         // Through a local, or a loop.
         assert!(!keeps("local k = KEYS[1] return redis.call('GET', k)"));
-        assert!(!keeps(
-            "for i = 1, #KEYS do redis.call('DEL', KEYS[i]) end"
-        ));
+        assert!(!keeps("for i = 1, #KEYS do redis.call('DEL', KEYS[i]) end"));
         assert!(!keeps("return redis.call('DEL', unpack(KEYS))"));
         // A command by a value, or one whose keys are elsewhere.
         assert!(!keeps("return redis.call(ARGV[1], KEYS[1])"));
@@ -488,30 +506,48 @@ mod tests {
 
     #[test]
     fn keys_or_redis_changed_or_passed_on_do_not() {
-        assert!(!keeps("KEYS[1] = 'other' return redis.call('GET', KEYS[1])"));
+        assert!(!keeps(
+            "KEYS[1] = 'other' return redis.call('GET', KEYS[1])"
+        ));
         assert!(!keeps("KEYS = {'other'} return redis.call('GET', KEYS[1])"));
-        assert!(!keeps("local KEYS = {'other'} return redis.call('GET', KEYS[1])"));
-        assert!(!keeps("x, KEYS[1] = 1, 'other' return redis.call('GET', KEYS[1])"));
-        assert!(!keeps("local x = 1 KEYS[1] = 'other' return redis.call('GET', KEYS[1])"));
+        assert!(!keeps(
+            "local KEYS = {'other'} return redis.call('GET', KEYS[1])"
+        ));
+        assert!(!keeps(
+            "x, KEYS[1] = 1, 'other' return redis.call('GET', KEYS[1])"
+        ));
+        assert!(!keeps(
+            "local x = 1 KEYS[1] = 'other' return redis.call('GET', KEYS[1])"
+        ));
         assert!(!keeps(
             "local f = function() KEYS[1] = 'other' end f() return redis.call('GET', KEYS[1])"
         ));
         assert!(!keeps(
             "if 1 then KEYS[1] = 'o' end return redis.call('GET', KEYS[1])"
         ));
-        assert!(!keeps("table.insert(KEYS, 'o') return redis.call('GET', KEYS[1])"));
-        assert!(!keeps("local f = function(KEYS) return redis.call('GET', KEYS[1]) end"));
+        assert!(!keeps(
+            "table.insert(KEYS, 'o') return redis.call('GET', KEYS[1])"
+        ));
+        assert!(!keeps(
+            "local f = function(KEYS) return redis.call('GET', KEYS[1]) end"
+        ));
         assert!(!keeps("local r = redis return r.call('GET', 'x')"));
-        assert!(!keeps("redis.call = function() end return redis.call('GET', KEYS[1])"));
+        assert!(!keeps(
+            "redis.call = function() end return redis.call('GET', KEYS[1])"
+        ));
         assert!(!keeps("local c = redis.call return c('GET', 'x')"));
         assert!(!keeps("return pcall(redis.call, 'GET', 'x')"));
         assert!(!keeps("return redis:call('GET', KEYS[1])"));
         assert!(!keeps("return _G.redis.call('GET', 'x')"));
-        assert!(!keeps("return loadstring('return redis.call(\"GET\", \"x\")')()"));
+        assert!(!keeps(
+            "return loadstring('return redis.call(\"GET\", \"x\")')()"
+        ));
         assert!(!keeps("setmetatable(KEYS, {}) return 1"));
         assert!(!keeps("return rawget(_G, 'KEYS')[1]"));
         assert!(!keeps("return getfenv(1).KEYS[1]"));
-        assert!(!keeps("local _ENV = {KEYS = {'o'}, redis = redis} return redis.call('GET', KEYS[1])"));
+        assert!(!keeps(
+            "local _ENV = {KEYS = {'o'}, redis = redis} return redis.call('GET', KEYS[1])"
+        ));
     }
 
     #[test]

@@ -2770,7 +2770,13 @@ fn a_script_that_keeps_to_its_untagged_keys_runs_beside_others() {
     // A key with a tag beside one without.
     assert!(runs_alone_no_tag(
         &mut c,
-        &["EVAL", "return redis.call('MGET', KEYS[1], KEYS[2])", "2", "{q}:a", "plain"]
+        &[
+            "EVAL",
+            "return redis.call('MGET', KEYS[1], KEYS[2])",
+            "2",
+            "{q}:a",
+            "plain"
+        ]
     ));
     // Inside a transaction.
     assert_eq!(
@@ -2792,7 +2798,10 @@ fn a_script_that_keeps_to_its_untagged_keys_runs_beside_others() {
             "scripts_run_alone_parallel_off"
         ])
     );
-    assert!(c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"]).ok());
+    assert!(
+        c.cmd(&["CONFIG", "SET", "lua-parallel-scripts", "yes"])
+            .ok()
+    );
     lock(&mut c);
     assert_eq!(
         moved(&mut c, |c| assert_eq!(c.cmd(&release), V::Int(1))),
@@ -3109,9 +3118,8 @@ fn a_script_beside_others_writing_a_watched_key_fails_the_exec() {
     let server = Server::start(&[KEEP_FAST]);
     let (mut a, mut b) = (server.conn(), server.conn());
     assert!(a.cmd(&["SET", "w", "0"]).ok());
-    let cas = |c: &mut Conn, from: &str, to: &str| {
-        c.cmd(&["EVAL", CHECK_THEN_SET, "1", "w", from, to])
-    };
+    let cas =
+        |c: &mut Conn, from: &str, to: &str| c.cmd(&["EVAL", CHECK_THEN_SET, "1", "w", from, to]);
     let mut at = 0;
     for _ in 0..30 {
         let counted = moved(&mut b, |b| {

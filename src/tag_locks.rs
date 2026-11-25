@@ -145,7 +145,10 @@ fn locks_untagged_keys(name: &str) -> bool {
 /// [`locks_untagged_keys`] for a client's command `cmd`, its name as sent.
 #[inline]
 fn command_locks_untagged_keys(cmd: &[&[u8]]) -> bool {
-    untagged_keys_locked() && cmd.first().is_none_or(|name| !name.eq_ignore_ascii_case(b"MIGRATE"))
+    untagged_keys_locked()
+        && cmd
+            .first()
+            .is_none_or(|name| !name.eq_ignore_ascii_case(b"MIGRATE"))
 }
 
 /// What `key` is locked by: its hash tag, or — once keys without one are
@@ -206,11 +209,14 @@ pub fn lock_untagged_keys_for(cmd: &[&[u8]]) {
 /// can happen, such scripts run alone.
 #[cfg(feature = "lua")]
 fn keys_only_script_may_run_beside(cmd: &[&[u8]]) -> bool {
-    let writes = cmd
-        .first()
-        .is_some_and(|name| name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA"));
+    let writes = cmd.first().is_some_and(|name| {
+        name.eq_ignore_ascii_case(b"EVAL") || name.eq_ignore_ascii_case(b"EVALSHA")
+    });
     let evicts = crate::RUNTIME_MAXMEMORY.load(Ordering::Relaxed) != 0
-        && !matches!(crate::eviction::policy(), crate::eviction::Policy::NoEviction);
+        && !matches!(
+            crate::eviction::policy(),
+            crate::eviction::Policy::NoEviction
+        );
     writes && !evicts && crate::commands::script_keeps_to_its_keys(cmd)
 }
 
@@ -243,6 +249,7 @@ impl StripeHold {
         }
     }
 
+    #[cfg(feature = "lua")]
     fn try_take(stripe: usize, shared: bool) -> Option<Self> {
         let lock = &STRIPE[stripe].0;
         if shared {
@@ -262,8 +269,6 @@ impl StripeHold {
         }
     }
 }
-
-
 
 /// The hash tag of `key`: what is between the first `{` and the next `}`,
 /// if that is not empty. (As a cluster reads it, except that a key without
@@ -541,8 +546,12 @@ struct Held {
 /// several, taken lowest first.
 enum Stripes {
     None,
-    One { _held: RwLockWriteGuard<'static, ()> },
-    Several { _held: Vec<RwLockWriteGuard<'static, ()>> },
+    One {
+        _held: RwLockWriteGuard<'static, ()>,
+    },
+    Several {
+        _held: Vec<RwLockWriteGuard<'static, ()>>,
+    },
 }
 
 impl Drop for ScriptGuard {
@@ -737,7 +746,9 @@ fn lock_keys_as<'a>(
     let mut first: Option<usize> = None;
     let mut more: Vec<usize> = Vec::new();
     for key in keys {
-        let Some(tag) = lock_name_as(key, untagged) else { continue };
+        let Some(tag) = lock_name_as(key, untagged) else {
+            continue;
+        };
         let stripe = stripe_of(tag);
         match first {
             None => first = Some(stripe),
@@ -1054,7 +1065,9 @@ pub fn try_lock_found_keys(
     let mut more: Vec<usize> = Vec::new();
     let untagged = command_locks_untagged_keys(cmd);
     for key in at.map(|at| cmd[at]) {
-        let Some(tag) = lock_name_as(key, untagged) else { continue };
+        let Some(tag) = lock_name_as(key, untagged) else {
+            continue;
+        };
         let stripe = stripe_of(tag);
         match first {
             None => first = Some(stripe),
