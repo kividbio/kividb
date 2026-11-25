@@ -101,7 +101,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--log-format <text\|json>` | `text` | Log line format |
 | `--io-model` | `auto` | `auto`, `uring` or `tokio` (io_uring is Linux only) |
 | `--requirepass <password>` | none | Password for the `default` user |
-| `--aclfile <path>` | none | ACL file to load users from |
+| `--aclfile <path>` | none | ACL file to load users from. Not together with `user` lines in the config file |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
 | `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
 | `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0`. New in 1.2.1: 1.2.0 has no such flag, and ignores the setting in the file |
@@ -166,6 +166,25 @@ system as soon as its last member or field is removed. A list's chunks are block
 their own. `INFO memory` reports those slabs (the sets', sorted sets',
 hashes' and lists') as `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
+
+### ACL users in the config file
+
+The config file takes `user <name> <rule>...` lines, as Redis's does: each
+is read as a line of an ACL file (the rules of `ACL SETUSER`, a quoted word
+read with `\"`, `\\` and `\xHH`), and defines that user at startup. A
+`user default` line wins over `requirepass`. With no `aclfile` set,
+`CONFIG REWRITE` writes one such line for each user, `default` first, the
+passwords as `#<sha256>` hashes, and `requirepass` beside it as it is set;
+the default user has a line only when it is not the user `requirepass`
+gives by itself. A file with `user` lines is read by 1.3.0 and later.
+`user` lines and `aclfile` together are refused at startup; with an
+`aclfile`, `ACL SAVE` writes the users there. `CONFIG GET` lists no users.
+
+```
+requirepass change-me
+user default on #<sha256 of change-me> ~* &* +@all
+user reader on >reader-password ~cache:* +@read
+```
 
 ### Active defrag
 

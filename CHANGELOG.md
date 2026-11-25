@@ -155,6 +155,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`CONFIG REWRITE` writes the ACL users when no `aclfile` is set, as
+  Redis does; the config file takes `user` lines.** A `user <name>
+  <rule>...` line in the config file is read as a line of an ACL file is,
+  and defines that user at startup; a `user default` line wins over
+  `requirepass`, as in Redis. `CONFIG REWRITE` writes one `user` line for
+  each user, `default` first, the passwords as `#<sha256>` hashes; the
+  default user has a line only when it is not the user `requirepass`
+  gives by itself. With an
+  `aclfile`, the users stay in it (`ACL SAVE`), and a config file with
+  `user` lines and `aclfile` both is refused at startup, as Redis refuses
+  it. `CONFIG GET` lists no users.
+
 - **Redis Sentinel, tested (`scripts/sentinel/run.sh`, the Sentinel
   workflow).** Three KiviDB nodes run under three Redis 8.10.3 Sentinels,
   each with a password. The master is killed (with each of redis-py,
@@ -2442,7 +2454,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where they are set, so a build without TLS reads its own file back. A
   server restarted from the file opens the same data directory, serves
   TLS as it did and has the role it had: Redis Sentinel sends
-  `CONFIG REWRITE` after every `REPLICAOF` it gives.
+  `CONFIG REWRITE` after every `REPLICAOF` it gives. It writes the current
+  `requirepass`, `masterauth` and `masteruser`, quoted as Redis quotes
+  them, and every value is written quoted where it needs it. The new file
+  is synced before it replaces the old one, and the directory after; when
+  the new file cannot be made, the old one is left as it is and the command
+  replies with an error.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the
