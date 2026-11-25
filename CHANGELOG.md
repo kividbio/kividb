@@ -632,12 +632,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the value come last, in the same order. A query without `SORTBY` gives the
   matches that score the same in the order they were written, and a KNN
   query the vectors it returns that are as near (in an index with TAG,
-  NUMERIC or TEXT fields). `FT.AGGREGATE` rows come in that order, and rows
+  NUMERIC or TEXT fields). `FT.AGGREGATE` rows come in that order (but for
+  rows that go into a `GROUPBY` of `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` or
+  `COUNT_DISTINCT` only, which are read in any), and rows
   level on every `SORTBY` key keep it, or its reverse where the last key is
   `DESC`. A write that names a field of the index (`HSET`,
   `HINCRBY`, `HDEL` of an indexed field, a field of it that expires), a JSON
   write, or a value put under the key whole makes the document the last
-  written; a write of other fields of the hash leaves it where it is. The
+  written; a write of other fields of the hash leaves it where it is, and a
+  `RENAME` keeps its place. The
   documents an `FT.CREATE` finds already written come before those written
   after it, by key. The order is kept in snapshots (a last section,
   `KIVIDO1`, which 1.2 passes over), replayed from the AOF, and sent to

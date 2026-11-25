@@ -1033,3 +1033,89 @@ fn a_replica_gives_the_order_of_its_master() {
     replica.stop();
     master.stop();
 }
+
+#[test]
+fn a_renamed_document_keeps_its_place() {
+    let dir = data_dir("rename");
+    let args: Vec<String> = [
+        "--save",
+        "",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "always",
+    ]
+    .map(String::from)
+    .to_vec();
+    let server = Server::start(&dir, &args);
+    let mut c = server.conn();
+    index_with(&mut c, "ix", "r:", 8);
+    let written = numbers(0..8);
+    c.ok(&["RENAME", &key("r:", 2), "r:renamed"]);
+    // Onto a key that is there: nothing renamed, nothing moved.
+    c.ok(&["RENAMENX", &key("r:", 3), &key("r:", 4)]);
+    let check = |c: &mut Conn, when: &str| {
+        let asc = tied(c, "ix", &["SORTBY", "t", "ASC", "LIMIT", "0", "8"]);
+        assert_eq!(asc, written, "{when}: ASC");
+        let desc = tied(c, "ix", &["SORTBY", "t", "DESC", "LIMIT", "0", "8"]);
+        assert_eq!(desc, reversed(written.clone()), "{when}: DESC");
+    };
+    check(&mut c, "renamed");
+    server.stop();
+
+    // Replayed from the log.
+    let server = Server::start(&dir, &args);
+    check(&mut server.conn(), "replayed");
+    // After a rewrite: a rename in the log after it keeps the snapshot's
+    // place.
+    let mut c = server.conn();
+    c.ok(&["BGREWRITEAOF"]);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !c
+        .ok(&["INFO", "persistence"])
+        .s()
+        .contains("aof_rewrite_in_progress:0")
+    {
+        assert!(Instant::now() < deadline, "the rewrite did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    c.ok(&["RENAME", &key("r:", 5), "r:renamed-again"]);
+    check(&mut c, "renamed again");
+    server.stop();
+    let server = Server::start(&dir, &args);
+    check(&mut server.conn(), "from the rewrite and the log after it");
+    server.stop();
+}
+
+/// A snapshot written by 1.2.2 (index `ix` over `f:`, documents 0 to 5
+/// written in that order) holds no order of its documents: they load in
+/// the order of their keys, and documents written after come after them.
+#[test]
+fn a_snapshot_of_1_2_2_loads_its_documents_in_key_order() {
+    let dir = data_dir("v122");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/tie_order_1_2_2.kdb"
+    );
+    std::fs::copy(fixture, dir.join("dump.kdb")).unwrap();
+    let server = Server::start(&dir, &["--save".into(), String::new()]);
+    let mut c = server.conn();
+    let by_key: Vec<String> = {
+        let mut keys: Vec<(String, usize)> = (0..6).map(|i| (key("f:", i), i)).collect();
+        keys.sort();
+        keys.into_iter().map(|(_, i)| i.to_string()).collect()
+    };
+    assert_ne!(by_key, numbers(0..6));
+    let asc = tied(&mut c, "ix", &["SORTBY", "t", "ASC", "LIMIT", "0", "6"]);
+    assert_eq!(asc, by_key, "ASC");
+    let desc = tied(&mut c, "ix", &["SORTBY", "t", "DESC", "LIMIT", "0", "6"]);
+    assert_eq!(desc, reversed(by_key.clone()), "DESC");
+    c.ok(&["HSET", &key("f:", 0), "t", "5"]);
+    let mut then: Vec<String> = by_key.into_iter().filter(|n| n != "0").collect();
+    then.push("0".into());
+    assert_eq!(
+        tied(&mut c, "ix", &["SORTBY", "t", "ASC", "LIMIT", "0", "6"]),
+        then
+    );
+    server.stop();
+}

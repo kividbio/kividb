@@ -851,6 +851,30 @@ impl StreamGroups {
         self
     }
 
+    /// Whether the rows of the steps from `cmd[start]` on go into a `GROUPBY`
+    /// whose reducers keep a running value (`COUNT`, `SUM`, `MIN`, …), with
+    /// nothing before it but steps that take or change rows one at a time
+    /// (`LOAD`, `APPLY`, `FILTER`): what it gives is the same in whatever
+    /// order the rows come, and they are read in any.
+    pub fn order_free(cmd: &[&[u8]], start: usize) -> bool {
+        let mut i = start;
+        while i < cmd.len() {
+            let word = cmd[i].to_ascii_uppercase();
+            match word.as_slice() {
+                b"GROUPBY" => {
+                    let (_, props, reducers) = parse_groupby(cmd, i);
+                    return !props.is_empty()
+                        && reducers.iter().all(|r| Running::new(&r.func).is_some());
+                }
+                b"LOAD" | b"PARAMS" | b"DIALECT" | b"SCORER" | b"TIMEOUT" | b"LANGUAGE"
+                | b"WITHCURSOR" | b"APPLY" | b"FILTER" => i = clause_end(cmd, i),
+                b"SORTBY" | b"LIMIT" => return false,
+                _ => i += 1,
+            }
+        }
+        false
+    }
+
     /// The first `GROUPBY` of the steps from `cmd[start]` on, if it can run
     /// as documents are read: no step before it but those that leave the
     /// rows as they are (`LOAD`, which only says what the reply shows, and

@@ -828,6 +828,12 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     } else {
         None
     };
+    // Rows the steps read in their order: in the order their documents were
+    // written. Rows that go into a GROUPBY of running values only (`COUNT`,
+    // `SUM`, `MIN`, …), which no order changes, are read in any (by id),
+    // whether it groups them as they are read or not.
+    let in_order =
+        knn.is_some() || !crate::commands::aggregate_pipeline::StreamGroups::order_free(cmd, 3);
     let mut add_row = |key: &str,
                        inner: &crate::vector::Fields,
                        json_doc: Option<&crate::json_tree::Value>| {
@@ -912,11 +918,11 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let timed_out_scan = match crate::commands::search::plan(ctx, &def, &filter, None, now) {
         Some(plan) => {
             let mut seen = 0u32;
-            let mut cut = false;
             // Each document tried against the filter where the ids are not
             // exactly the matches (any more: see `search::plan_keys`). In
             // the order they were written, as Redis gives its rows.
-            let (keys, exact) = crate::commands::search::plan_keys_written(&def, &plan);
+            let (keys, exact, mut cut) =
+                crate::commands::search::plan_keys_for(&def, &plan, in_order, deadline);
             for key in keys {
                 if crate::commands::search::deadline_due(deadline, &mut seen) {
                     cut = true;
@@ -955,11 +961,16 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
             })
         }
     };
-    // Found in no order: put in the order they were written.
-    if scanned {
-        rows_as_written(&def, &mut rows);
-    }
+    // Found in no order: put in the order they were written, if there is
+    // time for it.
     let mut timed_out = timed_out_scan;
+    if scanned && in_order {
+        if crate::commands::search::no_time_for(deadline, rows.len()) {
+            timed_out = true;
+        } else {
+            rows_as_written(&def, &mut rows);
+        }
+    }
 
     // ── A KNN clause: the nearest `k` of what the filter left ────────────────
     //

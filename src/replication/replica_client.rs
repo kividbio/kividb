@@ -1928,7 +1928,7 @@ struct StagedSync {
     store: Store,
     index_schemas: Vec<crate::vector::IndexSchema>,
     /// The order of each index's documents (`LoadedSnapshot::document_orders`).
-    document_orders: Vec<(String, Vec<Box<str>>)>,
+    document_orders: Vec<(String, crate::vector::postings::KeyList)>,
     dictionaries: Vec<(String, Vec<String>)>,
     /// The master's function libraries, from a KDB image or a Redis RDB file
     /// that has any.

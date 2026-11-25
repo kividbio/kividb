@@ -1335,21 +1335,31 @@ pub(crate) fn plan_keys(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
     (keys, plan.exact && p.given_back() == plan.given_back)
 }
 
-/// [`plan_keys`], in the order the documents were written (by key where
-/// they are numbered alike).
-pub(crate) fn plan_keys_written(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
+/// [`plan_keys`], with `in_order` in the order the documents were written
+/// (`Postings::first_written`), to `deadline`: cut short, the first of those
+/// found, and true last. Without, in id order, as [`plan_keys`].
+pub(crate) fn plan_keys_for(
+    def: &IndexDef,
+    plan: &Plan,
+    in_order: bool,
+    deadline: Option<Instant>,
+) -> (Vec<Arc<str>>, bool, bool) {
+    if !in_order {
+        let (keys, exact) = plan_keys(def, plan);
+        return (keys, exact, false);
+    }
     let p = def.postings.peek();
-    let mut ids: Vec<u32> = plan.ids.iter().collect();
-    ids.sort_unstable_by(|&a, &b| {
-        p.written(a)
-            .cmp(&p.written(b))
-            .then_with(|| key_of(&p, a).cmp(key_of(&p, b)))
-    });
-    let keys = ids
+    let all = plan.ids.count();
+    let mut clock = Clock::new(deadline);
+    let keys = first_written(&p, &plan.ids, all, all, false, &mut clock)
         .into_iter()
         .filter_map(|id| p.key(id).cloned())
         .collect();
-    (keys, plan.exact && p.given_back() == plan.given_back)
+    (
+        keys,
+        plan.exact && p.given_back() == plan.given_back,
+        clock.out,
+    )
 }
 
 /// Relevance of the document at `key`, whose fields are `fields`, for the

@@ -2194,7 +2194,7 @@ pub fn register_index_schemas(
 /// order section): index name, then the documents' keys, first written
 /// first. The walk that puts them in gives them that order. After
 /// [`register_index_schemas`].
-pub fn restore_document_orders(index_store: &IndexStore, orders: Vec<(String, Vec<Box<str>>)>) {
+pub fn restore_document_orders(index_store: &IndexStore, orders: Vec<(String, postings::KeyList)>) {
     if orders.is_empty() {
         return;
     }
@@ -2570,10 +2570,17 @@ pub fn reindex_key_naming(
         return;
     }
     if indexing_deferred() {
-        note_replayed(index_store, db, key, IndexOn::Hash, |def| {
-            moves(def, &[], how, named)
-        });
-        note_replayed(index_store, db, key, IndexOn::Json, |_| how == Write::Whole);
+        // A key that holds nothing now (the old name of a `RENAME`) was
+        // not written.
+        let there = store
+            .get(db)
+            .is_some_and(|d| crate::store::get_shard(d, key).read().peek(key).is_some());
+        if there {
+            note_replayed(index_store, db, key, IndexOn::Hash, |def| {
+                moves(def, &[], how, named)
+            });
+            note_replayed(index_store, db, key, IndexOn::Json, |_| how == Write::Whole);
+        }
         return;
     }
     let indexes = index_store.read();
@@ -2677,6 +2684,34 @@ pub fn maybe_index(
             continue;
         }
         index_fields(def, &crate::key_bytes::text_of(key), fields, how, &[]);
+    }
+}
+
+/// `from` was renamed to `to` in database `db` (`RENAME`): each index of
+/// the new key gives its document the place in its order the old key's
+/// had (see `postings::Postings::carry`), or, in a replay that puts
+/// indexing off, has the walk after it do so.
+pub fn renamed(index_store: &IndexStore, db: usize, from: &[u8], to: &[u8]) {
+    if index_store.none() {
+        return;
+    }
+    let (from, to_text) = (
+        crate::key_bytes::text_of(from),
+        crate::key_bytes::text_of(to),
+    );
+    let deferred = indexing_deferred();
+    let store = index_store.read();
+    for (name, def) in store.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.gives_ids() || !def.covers(to) {
+            continue;
+        }
+        let mut postings = def.postings.write();
+        if deferred {
+            postings.replayed_rename(&from, &to_text);
+        } else {
+            postings.carry(&from, &to_text);
+        }
+        def.postings.done(postings);
     }
 }
 
