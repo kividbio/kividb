@@ -204,7 +204,8 @@ type Visit<'v> = dyn FnMut(usize, &str) + 'v;
 
 struct Tally {
     on: bool,
-    seen: usize,
+    decided: usize,
+    window: usize,
     skipped: u64,
     rescored: u64,
 }
@@ -653,7 +654,8 @@ impl VectorIndex {
             let mut best = Best::new(k);
             let mut tally = Tally {
                 on: pass.is_some(),
-                seen: 0,
+                decided: 0,
+                window: 0,
                 skipped: 0,
                 rescored: 0,
             };
@@ -661,17 +663,20 @@ impl VectorIndex {
                 if let Some((copy, q)) = &pass
                     && tally.on
                 {
-                    tally.seen += 1;
-                    if tally.seen.is_multiple_of(flat_int8::CUT_EVERY)
-                        && tally.rescored as usize * flat_int8::CUT_SHARE > tally.seen
-                    {
-                        tally.on = false;
-                    } else if let Some(kth) = best.kth()
-                        && let Some(lb) = q.lower_bound(copy.slots.slot_bytes(slot))
-                        && lb >= f64::from(kth)
-                    {
-                        tally.skipped += 1;
-                        return;
+                    if let Some(kth) = best.kth() {
+                        tally.decided += 1;
+                        if tally.decided.is_multiple_of(flat_int8::CUT_EVERY) {
+                            tally.on = tally.window * flat_int8::CUT_SHARE <= flat_int8::CUT_EVERY;
+                            tally.window = 0;
+                        }
+                        if tally.on
+                            && let Some(lb) = q.lower_bound(copy.slots.slot_bytes(slot))
+                            && lb >= f64::from(kth)
+                        {
+                            tally.skipped += 1;
+                            return;
+                        }
+                        tally.window += 1;
                     }
                     tally.rescored += 1;
                 }
@@ -1537,6 +1542,36 @@ mod tests {
         check(false);
         flat.code_now();
         check(true);
+    }
+
+    #[test]
+    fn the_pass_keeps_on_past_the_first_candidates_at_k_100() {
+        let mut seed = 0x1033_0100u64;
+        let dim = 256;
+        let flat = VectorIndex::new();
+        flat.always.store(true, Relaxed);
+        let centers: Vec<Vec<f32>> = (0..16).map(|_| random_vector(dim, &mut seed)).collect();
+        let near = |seed: &mut u64| {
+            let c = &centers[(rng(seed) % 16) as usize];
+            c.iter()
+                .map(|x| x + ((rng(seed) % 2001) as f32 - 1000.0) / 4000.0)
+                .collect::<Vec<f32>>()
+        };
+        for i in 0..20_000 {
+            flat.insert(format!("doc:{i}"), near(&mut seed));
+        }
+        flat.code_now();
+        for metric in [DistanceMetric::L2, DistanceMetric::Cosine] {
+            let q = near(&mut seed);
+            let prepared = PreparedQuery::new(&metric, &q);
+            let before = flat.counts.skipped.load(Relaxed);
+            assert_eq!(
+                pairs(&nearest_with(&flat, &prepared, 100, Pass::On)),
+                pairs(&nearest_with(&flat, &prepared, 100, Pass::Off))
+            );
+            let skipped = flat.counts.skipped.load(Relaxed) - before;
+            assert!(skipped > 15_000, "{metric:?}: skipped {skipped} of 20,000");
+        }
     }
 
     #[test]
