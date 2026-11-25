@@ -1427,7 +1427,19 @@ pub(crate) fn named_keys_of(
     name: &str,
     cmd: &[&[u8]],
 ) -> Option<NamedKeys> {
-    if untagged_keys_locked() {
+    named_keys_as(untagged_keys_locked(), shape, name, cmd)
+}
+
+/// [`named_keys_of`], told whether keys without a tag are locked.
+#[cfg(feature = "lua")]
+#[inline(always)]
+fn named_keys_as(
+    untagged: bool,
+    shape: Option<crate::keyspec::Shape>,
+    name: &str,
+    cmd: &[&[u8]],
+) -> Option<NamedKeys> {
+    if untagged {
         return untagged_named_keys(shape, name, cmd);
     }
     tagged_named_keys_of(shape, name, cmd)
@@ -2459,8 +2471,8 @@ mod tests {
     }
 
     /// Once keys without a tag are locked, the keys a client's command
-    /// locks are every key it names, tagged or not, wherever its first
-    /// tagged key is: for every way commands name their keys (one key,
+    /// locks ([`named_keys_of`]'s dispatch) are every key it names, as the
+    /// test spells them, tagged or not, wherever its first tagged key is: for every way commands name their keys (one key,
     /// several, at steps, counted, a `STORE` destination, more than fit
     /// inline), with no tag, a tag first, a tag later and a tag only.
     #[cfg(feature = "lua")]
@@ -2523,7 +2535,9 @@ mod tests {
             }
         }));
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        let mut all: Vec<Vec<String>> = Vec::new();
+        // Each command with the keys it names, as spelled here: what is
+        // expected does not come from the key table.
+        let mut all: Vec<(Vec<String>, std::collections::BTreeSet<String>)> = Vec::new();
         for shape in shapes {
             let keys = shape
                 .iter()
@@ -2531,32 +2545,35 @@ mod tests {
                 .count();
             for way in 0..4 {
                 let mut at = 0;
-                all.push(
-                    shape
-                        .iter()
-                        .map(|word| {
-                            if word.len() == 1 && word.as_bytes()[0].is_ascii_uppercase() {
-                                at += 1;
-                                spellings(at - 1, keys)[way].clone()
-                            } else {
-                                word.to_string()
-                            }
-                        })
-                        .collect(),
-                );
+                let mut named = std::collections::BTreeSet::new();
+                let words = shape
+                    .iter()
+                    .map(|word| {
+                        if word.len() == 1 && word.as_bytes()[0].is_ascii_uppercase() {
+                            at += 1;
+                            let key = spellings(at - 1, keys)[way].clone();
+                            named.insert(key.clone());
+                            key
+                        } else {
+                            word.to_string()
+                        }
+                    })
+                    .collect();
+                all.push((words, named));
             }
         }
-        all.push(many.iter().map(|word| word.to_string()).collect());
-        for words in &all {
+        all.push((
+            many.iter().map(|word| word.to_string()).collect(),
+            many[1..].iter().map(|word| word.to_string()).collect(),
+        ));
+        for (words, named) in &all {
             let cmd: Vec<&[u8]> = words.iter().map(|word| word.as_bytes()).collect();
             let name = words[0].to_ascii_uppercase();
             let named: std::collections::BTreeSet<&[u8]> =
-                crate::keyspec::key_positions(&name, &cmd)
-                    .iter()
-                    .map(|at| cmd[at])
-                    .collect();
-            assert!(!named.is_empty(), "{words:?} names no key");
-            let found = untagged_named_keys(None, &name, &cmd).expect("keys found");
+                named.iter().map(|key| key.as_bytes()).collect();
+            // Through the dispatch a client's command takes, with keys
+            // without a tag locked.
+            let found = named_keys_as(true, None, &name, &cmd).expect("keys found");
             let at = match &found {
                 NamedKeys::Regular { from, last, step } => crate::keyspec::KeyIter::Range {
                     next: *from,

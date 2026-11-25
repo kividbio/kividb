@@ -3268,10 +3268,10 @@ fn half_scripts_and_readers(port: u16, clients: usize, readers: usize, secs: f64
 
 /// While scripts on keys without a tag run beside others and readers read
 /// those keys, another connection switches `lua-parallel-scripts` between
-/// `yes`, `tags` and `no`, from each to each, again and again: no read finds a script half done, whichever way each
-/// script was decided before the command gate. The first switch of keys
-/// without a tag is made with the readers already queued at the gate. On
-/// both I/O loops.
+/// `yes`, `tags` and `no`, from each to each, again and again: no read
+/// finds a script half done, whichever way each script was decided before
+/// the command gate. The first switch of keys without a tag is made with
+/// the readers already queued at the gate. On both I/O loops.
 #[test]
 fn switching_the_setting_under_load_shows_no_script_half_done() {
     setting_flips_under_load("tokio");
@@ -3877,7 +3877,8 @@ fn half_scripts_and(
 /// A reader whose keys without a tag come before a tagged one (`MGET h0 h1
 /// h2 h3 {t}:x`) never finds a script that keeps to those keys half done
 /// beside it: once keys without a tag are locked, every key a command names
-/// is, from its first. Nor does one with the tagged key first.
+/// is, from its first. Nor does one with the tagged key first, nor one of
+/// 19 keys, two of them tagged.
 #[test]
 fn a_reader_naming_keys_before_a_tagged_one_never_sees_a_script_half_done() {
     let server = Server::start(&[KEEP_FAST]);
@@ -3886,6 +3887,11 @@ fn a_reader_naming_keys_before_a_tagged_one_never_sees_a_script_half_done() {
     for read in [
         &["MGET", "h0", "h1", "h2", "h3", "{t}:x"][..],
         &["MGET", "{t}:x", "h0", "h1", "h2", "h3"][..],
+        // More than a command keeps inline (16): the rest sorted after.
+        &[
+            "MGET", "p0", "{u}:a", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9", "p10",
+            "p11", "p12", "h0", "h1", "h2", "{t}:x", "h3",
+        ][..],
     ] {
         let before = stat(&mut c, "scripts_run_beside_others");
         let (half, ran) = half_scripts_and(server.port, 6, 4, 2.0, read);
@@ -3935,9 +3941,11 @@ fn keys_stop_being_locked_while_tagged_scripts_keep_running() {
     assert!(stat(&mut c, "scripts_run_beside_others") > before + 100);
 }
 
-/// The longest any of `n` connections waited for a `GET` of a key without a
-/// tag while `during` ran, but for the connection that waited longest: one
-/// on the thread a long script holds waits for it whatever the gate does.
+/// How long `n` connections each waited for a `GET` of a key without a
+/// tag at most while `during` ran: the shortest of those. A connection on
+/// the thread a long script holds waits for it whatever the gate does, and
+/// which connections land there is the server's choice; one that did not
+/// waited only for the gate.
 fn get_waits_during(port: u16, n: usize, during: impl FnOnce()) -> Duration {
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let getters: Vec<_> = (0..n)
@@ -3957,9 +3965,11 @@ fn get_waits_during(port: u16, n: usize, during: impl FnOnce()) -> Duration {
         .collect();
     during();
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut waits: Vec<Duration> = getters.into_iter().map(|g| g.join().unwrap()).collect();
-    waits.sort();
-    waits[waits.len() - 2]
+    getters
+        .into_iter()
+        .map(|g| g.join().unwrap())
+        .min()
+        .unwrap()
 }
 
 /// The switch of keys without a tag off does not wait for the command gate
@@ -3985,7 +3995,7 @@ fn switching_key_locks_off_does_not_wait_for_a_long_script() {
     assert_eq!(c.info("stats", "untagged_key_locks"), "1");
     let port = server.port;
     let stall = server.dir.join("script-stall.held");
-    let longest = get_waits_during(port, 6, || {
+    let longest = get_waits_during(port, 8, || {
         let script = std::thread::spawn(move || {
             Conn::connect(port).cmd(&["EVAL", held, "1", "{s}:k", "script-stall:1"])
         });
@@ -4017,7 +4027,7 @@ fn switching_key_locks_off_waits_out_a_client_pause() {
         &mut |_| {},
     );
     let port = server.port;
-    let longest = get_waits_during(port, 6, || {
+    let longest = get_waits_during(port, 8, || {
         assert!(c.cmd(&["CLIENT", "PAUSE", "1500", "WRITE"]).ok());
         let write = std::thread::spawn(move || Conn::connect(port).cmd(&["SET", "w", "1"]));
         std::thread::sleep(Duration::from_millis(1000));
@@ -4124,16 +4134,30 @@ fn a_key_a_script_holds_is_not_evicted() {
         Conn::connect(port).cmd(&["EVAL", held, "1", "{s}:k", "script-stall:1"])
     });
     wait_until("the script to be held", 10, || stall.exists());
-    let value = "x".repeat(10_000);
     let before = stat(&mut c, "evicted_keys");
-    let mut n = 0u64;
-    while stall.exists() {
-        let reply = c.cmd(&["SET", &format!("fill:{n}"), &value]);
-        assert!(reply.ok(), "{reply:?}");
-        n += 1;
-    }
+    // Four writers, each on a connection of its own: whichever thread each
+    // lands on, they fill the server while the script holds its key.
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let stall = stall.clone();
+            std::thread::spawn(move || {
+                let mut c = Conn::connect(port);
+                let value = "x".repeat(10_000);
+                let mut n = 0u64;
+                while stall.exists() {
+                    let reply = c.cmd(&["SET", &format!("fill:{w}:{n}"), &value]);
+                    assert!(reply.ok(), "{reply:?}");
+                    n += 1;
+                }
+                n
+            })
+        })
+        .collect();
+    let written: u64 = writers.into_iter().map(|w| w.join().unwrap()).sum();
     assert_eq!(script.join().unwrap(), V::Str("mine".into()));
-    assert!(stat(&mut c, "evicted_keys") > before + 100);
+    let evicted = stat(&mut c, "evicted_keys") - before;
+    eprintln!("{written} written, {evicted} evicted while the script held its key");
+    assert!(evicted > 100);
 }
 
 /// `lua-parallel-scripts tags`: a script on tagged keys runs beside others,
