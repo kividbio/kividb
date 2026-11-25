@@ -5606,8 +5606,24 @@ fn phonetic_fields_match_and_score_as_redis_does() {
     assert_eq!(ids(&mut c, "@p:app"), ["ph:26"]);
 }
 
+static FLAT_INT8: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn flat_int8_skipped(c: &mut Conn, index: &str) -> Option<u64> {
+    let info = c.cmd(&["FT.INFO", index]);
+    match info
+        .arr()
+        .chunks(2)
+        .find(|p| matches!(&p[0], V::Str(k) if k == "flat_int8_indexes"))
+        .map(|p| p[1].clone())
+    {
+        Some(V::Arr(copies)) => copies[0].get("skipped").s().parse().ok(),
+        _ => None,
+    }
+}
+
 #[test]
 fn the_flat_int8_pass_gives_the_same_replies() {
+    let _one = FLAT_INT8.lock().unwrap_or_else(|e| e.into_inner());
     let mut c = own_conn();
     assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
     assert!(
@@ -5699,4 +5715,183 @@ fn the_flat_int8_pass_gives_the_same_replies() {
     );
     assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
     assert_eq!(run(&mut c), exact);
+}
+
+#[test]
+fn the_flat_int8_pass_keeps_the_order_of_exact_duplicates() {
+    let _one = FLAT_INT8.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = own_conn();
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+    let mut seed = 0x1033_d0d0u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let distinct: Vec<Vec<f32>> = (0..40)
+        .map(|_| {
+            (0..256)
+                .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                .collect()
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..2_000).collect();
+    for i in (1..order.len()).rev() {
+        order.swap(i, (next() % (i as u64 + 1)) as usize);
+    }
+    let metrics = ["L2", "IP", "COSINE"];
+    for metric in metrics {
+        let index = format!("dup{metric}");
+        assert!(
+            c.cmd(&[
+                "FT.CREATE",
+                &index,
+                "PREFIX",
+                "1",
+                &format!("{index}:"),
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "FLAT",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "256",
+                "DISTANCE_METRIC",
+                metric,
+            ])
+            .ok()
+        );
+        for &i in &order {
+            hset_vector(&mut c, &format!("{index}:{i}"), &[], "v", &distinct[i % 40]);
+        }
+    }
+    let run = |c: &mut Conn| -> Vec<V> {
+        let mut out = Vec::new();
+        for metric in metrics {
+            for q in distinct.iter().take(4) {
+                for k in [1, 10, 100] {
+                    out.push(search_with_vector(
+                        c,
+                        &format!("dup{metric}"),
+                        &format!("*=>[KNN {k} @v $q]"),
+                        q,
+                        &["NOCONTENT", "LIMIT", "0", "100"],
+                    ));
+                }
+            }
+        }
+        out
+    };
+    let exact = run(&mut c);
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "yes"]).ok());
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert_eq!(run(&mut c), exact);
+        if metrics
+            .iter()
+            .all(|m| flat_int8_skipped(&mut c, &format!("dup{m}")).is_some_and(|s| s > 0))
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "the pass never skipped");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(run(&mut c), exact);
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+}
+
+#[test]
+fn drops_flushes_and_switching_while_the_flat_int8_copy_is_coded() {
+    let _one = FLAT_INT8.lock().unwrap_or_else(|e| e.into_inner());
+    let mut c = own_conn();
+    let mut seed = 0x1033_f1f1u64;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut vectors = |n: usize| -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|_| {
+                (0..512)
+                    .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                    .collect()
+            })
+            .collect()
+    };
+    let create = |c: &mut Conn| {
+        let _ = c.cmd(&["FT.DROPINDEX", "busy"]);
+        assert!(
+            c.cmd(&[
+                "FT.CREATE",
+                "busy",
+                "PREFIX",
+                "1",
+                "busy:",
+                "SCHEMA",
+                "v",
+                "VECTOR",
+                "FLAT",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "512",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .ok()
+        );
+    };
+    let data = vectors(6_000);
+    let queries = vectors(4);
+    let load = |c: &mut Conn| {
+        for (i, v) in data.iter().enumerate() {
+            hset_vector(c, &format!("busy:{i}"), &[], "v", v);
+        }
+    };
+    let search = |c: &mut Conn| -> Vec<V> {
+        queries
+            .iter()
+            .map(|q| search_with_vector(c, "busy", "*=>[KNN 10 @v $q]", q, &["NOCONTENT"]))
+            .collect()
+    };
+    for step in 0..3 {
+        assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+        create(&mut c);
+        load(&mut c);
+        assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "yes"]).ok());
+        let _ = search(&mut c);
+        match step {
+            0 => assert!(c.cmd(&["FT.DROPINDEX", "busy", "DD"]).ok()),
+            1 => assert!(c.cmd(&["FLUSHALL"]).ok()),
+            _ => {
+                for on in ["no", "yes", "no", "yes"] {
+                    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", on]).ok());
+                }
+                assert!(c.cmd(&["FT.DROPINDEX", "busy", "DD"]).ok());
+            }
+        }
+        assert_eq!(c.cmd(&["DBSIZE"]), V::Int(0));
+    }
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+    create(&mut c);
+    load(&mut c);
+    let exact = search(&mut c);
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "yes"]).ok());
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        assert_eq!(search(&mut c), exact);
+        if flat_int8_skipped(&mut c, "busy").is_some_and(|s| s > 0) {
+            break;
+        }
+        assert!(Instant::now() < until, "the pass never skipped");
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(c.cmd(&["CONFIG", "SET", "search-flat-int8", "no"]).ok());
+    assert_eq!(search(&mut c), exact);
 }
