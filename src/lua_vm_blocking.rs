@@ -747,7 +747,7 @@ pub(crate) async fn run_lua_vm_blocking(
         // A script that will run under its tags' locks (`tag_locks`) runs
         // here and now, beside whatever scripts other threads are running:
         // it has no turn to wait for.
-        if crate::tag_locks::enabled()
+        if crate::tag_locks::parallel_scripts()
             && let Some(tags) = crate::tag_locks::script_tags(cmd)
         {
             // Its turn among the scripts of its tags is waited for here, by

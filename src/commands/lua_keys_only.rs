@@ -27,8 +27,9 @@
 //   `debug`, `require`, `module`, `package`, and `_ENV`, which in Lua 5.4
 //   decides what a global name such as `KEYS` is).
 //
-// The script is still held to its keys while it runs, by the server: a key
-// outside them is refused, as a key outside a tagged script's tags is.
+// What this reads only chooses where the script runs. What holds it to its
+// keys is the server, while it runs: a key outside them is refused, as a
+// key outside a tagged script's tags is, whatever the text looked like.
 
 /// One token of a Lua 5.1 chunk; strings and comments are read past, never
 /// looked into.
@@ -235,7 +236,8 @@ fn tokens(src: &str) -> Option<Vec<Tok<'_>>> {
             if let Some(level) = long_open(at) {
                 at = long_close(at, level)?;
             } else {
-                while at < bytes.len() && bytes[at] != b'\n' {
+                // To the end of the line: Lua ends one at `\n` or at `\r`.
+                while at < bytes.len() && bytes[at] != b'\n' && bytes[at] != b'\r' {
                     at += 1;
                 }
             }
@@ -252,7 +254,9 @@ fn tokens(src: &str) -> Option<Vec<Tok<'_>>> {
             let mut end = start;
             loop {
                 match bytes.get(end) {
-                    None | Some(b'\n') => return None,
+                    // A line end in a short string is an error to Lua
+                    // unless escaped (`\` takes the byte after it, below).
+                    None | Some(b'\n' | b'\r') => return None,
                     Some(&b) if b == c => break,
                     Some(b'\\') => {
                         plain = false;
@@ -547,6 +551,48 @@ mod tests {
         assert!(!keeps("return getfenv(1).KEYS[1]"));
         assert!(!keeps(
             "local _ENV = {KEYS = {'o'}, redis = redis} return redis.call('GET', KEYS[1])"
+        ));
+    }
+
+    #[test]
+    fn a_comment_ends_where_lua_ends_a_line() {
+        // `\r` alone ends a short comment, as `\n` and `\r\n` do: what follows
+        // is code.
+        for end in ["\n", "\r", "\r\n", "\n\r"] {
+            let script = format!(
+                "-- note{end}redis.call('SET','other','1'){end}return redis.call('GET', KEYS[1])"
+            );
+            assert!(!keeps(&script), "{script:?}");
+            let fine = format!("-- note{end}return redis.call('GET', KEYS[1])");
+            assert!(keeps(&fine), "{fine:?}");
+        }
+        // A long comment runs over line ends of every kind.
+        assert!(keeps(
+            "--[[ a\r redis.call('SET','other','1') \n b ]] return redis.call('GET', KEYS[1])"
+        ));
+        assert!(!keeps(
+            "--[[ a ]] redis.call('SET','other','1') return redis.call('GET', KEYS[1])"
+        ));
+    }
+
+    #[test]
+    fn strings_end_where_lua_ends_them() {
+        // A line end in a short string is not one Lua reads; one escaped is.
+        assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'a\rb'"));
+        assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'a\nb'"));
+        assert!(keeps("return redis.call('GET', KEYS[1]) .. 'a\\\nb'"));
+        // `\z`, decimal and hexadecimal escapes stay inside the string; a
+        // `\z` before a line end is not read through, and the script runs
+        // alone.
+        assert!(keeps(
+            "return redis.call('GET', KEYS[1]) .. 'x\\z   y\\65\\x41\\u{48}'"
+        ));
+        assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'x\\z \n y'"));
+        assert!(keeps("return redis.call('GET', KEYS[1]) .. \"redis.call('SET','o','1')\""));
+        assert!(!keeps("return redis.call('GET', KEYS[1]) .. 'a' redis.call('SET','o','1')"));
+        // Long strings over line ends of every kind, of any level.
+        assert!(keeps(
+            "local s = [==[ ]] \r redis.call('SET','o','1') \n ]==] return redis.call('GET', KEYS[1])"
         ));
     }
 

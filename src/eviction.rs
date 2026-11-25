@@ -1066,6 +1066,10 @@ fn evict(
     ordered: bool,
     freeing_slowly: bool,
 ) -> Option<usize> {
+    // Not a key a script that runs beside others holds, nor one a client's
+    // command on its tag is at: left as if gone, and another chosen. Held
+    // until it has gone, its `DEL` with it.
+    let _held = crate::tag_locks::try_hold_for_eviction(key)?;
     // Ordered against other writes to the key, like any write (#271). See
     // `write_order`.
     let _order = (ordered && !crate::command_gate::alone_on_this_thread())

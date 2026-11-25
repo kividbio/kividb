@@ -659,8 +659,9 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                      Valid values: debug, verbose, notice, warning, nothing",
                 )),
             },
-            // Taken with the command gate held alone (`run_command`): no
-            // command that went by the old setting is still running.
+            // Taken with the command gate held alone (`run_command`). A
+            // script that read the old setting before the gate may still
+            // run: see `tag_locks::set_enabled` for why that is safe.
             "lua-parallel-scripts" => match value.to_ascii_lowercase().as_str() {
                 "yes" => {
                     crate::tag_locks::set_enabled(true);
@@ -2420,7 +2421,7 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("lua-time-limit", lua_time_limit.clone()),
         (
             "lua-parallel-scripts",
-            if crate::tag_locks::enabled() {
+            if crate::tag_locks::parallel_scripts() {
                 "yes"
             } else {
                 "no"

@@ -136,10 +136,11 @@ fn script_store() -> &'static RwLock<ahash::AHashMap<String, Arc<str>>> {
 
 thread_local! {
     /// Whether each script this thread has been asked about keeps to its
-    /// `KEYS` (`lua_keys_only`): by body for `EVAL`, by digest for
-    /// `EVALSHA`. Read once a thread, and again only after
+    /// `KEYS` (`lua_keys_only`): by a 128-bit hash of the body for `EVAL`,
+    /// and of the digest for `EVALSHA`, so that nothing of the script is
+    /// copied. Read once a thread, and again only after
     /// [`KEEPS_TO_KEYS_MAX`] others.
-    static KEEPS_TO_KEYS: RefCell<[ahash::AHashMap<Box<[u8]>, bool>; 2]> =
+    static KEEPS_TO_KEYS: RefCell<[ahash::AHashMap<u128, bool>; 2]> =
         RefCell::new(Default::default());
 }
 
@@ -156,7 +157,8 @@ pub(crate) fn script_keeps_to_its_keys(cmd: &[&[u8]]) -> bool {
         return false;
     };
     let by_digest = name.len() >= 7 && name[..7].eq_ignore_ascii_case(b"EVALSHA");
-    let known = KEEPS_TO_KEYS.with(|known| known.borrow()[by_digest as usize].get(named).copied());
+    let hash = xxhash_rust::xxh3::xxh3_128(named);
+    let known = KEEPS_TO_KEYS.with(|known| known.borrow()[by_digest as usize].get(&hash).copied());
     if let Some(known) = known {
         return known;
     }
@@ -181,7 +183,7 @@ pub(crate) fn script_keeps_to_its_keys(cmd: &[&[u8]]) -> bool {
         if known.len() >= KEEPS_TO_KEYS_MAX {
             known.clear();
         }
-        known.insert(Box::from(named), keeps);
+        known.insert(hash, keeps);
     });
     keeps
 }
@@ -4276,12 +4278,14 @@ fn eval(ctx: &mut Ctx, use_sha: bool, read_only: bool) -> Vec<u8> {
     // a tag too, and the next such script runs beside others under its keys'
     // locks (`tag_locks::lock_untagged_keys_for`). With the gate alone, no
     // command is between its look at whether to lock its keys and its end.
-    if crate::tag_locks::enabled()
-        && !crate::tag_locks::untagged_keys_locked()
-        && !ctx.apply_replication
-        && crate::command_gate::alone_on_this_thread()
-    {
-        crate::tag_locks::lock_untagged_keys_for(&ctx.cmd);
+    // Any other script run alone: if none such has run for a while, they
+    // stop being locked (`tag_locks::maybe_clear_untagged`).
+    if !ctx.apply_replication && crate::command_gate::alone_on_this_thread() {
+        if crate::tag_locks::untagged_keys_locked() {
+            crate::tag_locks::maybe_clear_untagged();
+        } else if crate::tag_locks::parallel_scripts() {
+            crate::tag_locks::lock_untagged_keys_for(&ctx.cmd);
+        }
     }
 
     // The arguments where they are, not copies: they are copied once, into

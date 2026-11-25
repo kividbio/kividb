@@ -961,24 +961,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key as `KEYS[n]`; `KEYS` and `redis` are only read, never assigned or
   passed on; and nothing that reaches the globals another way (`_G`, `_ENV`,
   `loadstring`, `setmetatable`, ...) is named. That is read from the text
-  once per thread and script, before it runs. Any other script with a key
-  without a tag runs alone, as before, and may touch what it likes (BullMQ's
-  and Sidekiq's scripts are of that kind). From the first run of such a
-  script, which is alone, a command on a key without a tag takes that key's
-  lock, as a command on a tagged key takes its tag's; until then that
-  command makes one load more, and `GET` and `SET` cost 14 to 17
-  instructions more than in the build before (`scripts/perf/run.sh`, fat
-  LTO). A client's command holds those locks, and a tag's, shared: it
-  waits for a script on its keys, not for other commands. While keys can be
-  evicted (`maxmemory` with an evicting policy) such scripts run alone. yii2-redis's `Mutex` cycle (`SET NX PX`, then the
-  compare-and-delete release by `EVAL` with its text; 32 connections, each
-  its own lock; the server on 4 vCPUs of an Azure `Standard_D8s_v5`,
-  `--threads 4`, Redis 8.12 and Valkey 8.1 with `--io-threads 4`, the load
-  on the other 4; median of 3 runs): 300,200 ops/s with an `EVAL` p50/p99 of
-  101/245 µs, against 159,500 and 203/432 µs for the build before, Redis
-  211,300 and 146/285 µs, Valkey 235,400 and 129/279 µs. Regression suite
-  54 records the cycle. See "Scripts that keep to their keys" in
-  [docs/SCRIPTS.md](docs/SCRIPTS.md).
+  once per thread and script, before it runs, and only chooses where the
+  script runs: while it runs, the server holds it to its keys. Any other
+  script with a key without a tag runs alone, as before, and may touch what
+  it likes (BullMQ's and Sidekiq's scripts are of that kind). From the first
+  run of such a script, which is alone, a command on a key without a tag
+  takes that key's lock, shared: it waits for a script on the key, not for
+  other commands. Once no such script has run for a minute, or with
+  `lua-parallel-scripts no`, those locks are let go of again; `INFO stats`
+  says whether they are taken (`untagged_key_locks`) and how often that was
+  switched (`untagged_key_locks_on`, `untagged_key_locks_off`). Eviction and
+  active expiry leave a key whose lock a script running beside others holds
+  until it is done. See "Scripts that keep to their keys" in
+  [docs/SCRIPTS.md](docs/SCRIPTS.md); regression suite 54 records
+  yii2-redis's `Mutex` cycle.
+- **In a build with Lua, a command takes the lock of each tagged key it
+  names whatever `lua-parallel-scripts` says (#1049).** The setting decides
+  whether scripts run beside others; a script that started under the other
+  setting finds its tags locked all the same.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first
