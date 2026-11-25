@@ -389,7 +389,10 @@ x86_64 only; elsewhere the switch is taken and the pass is not used.
 The copy is made and kept up to date by one thread, `flat-int8`, not by the writes: a write
 marks its slot, and the thread codes what is marked with no lock held, stores each code
 under the write lock only if the slot still holds the same vector, and lets writers and
-searches in every 50 µs. Until a slot is coded again a scan measures it exactly. The copy
+searches in every 50 µs. Until a slot is coded again a scan measures it exactly. After each
+run the thread sleeps as long as the run took, three times as long while writes to the
+index keep arriving, so it takes at most about half a CPU while it builds a copy and a
+quarter under a steady load. The copy
 takes 16 bytes plus one a dimension per vector, is counted in `used_memory`, is not saved,
 and is made again after a restart. `FT.INFO` shows it under `flat_int8_indexes`: the field,
 its bytes, and how many candidates the pass skipped and measured exactly since the index
@@ -402,6 +405,12 @@ The copy counts against `maxmemory` like any other memory. An index whose copy w
 again (`CONFIG SET search-flat-int8 yes`) lets it try once more. Made near the limit, a copy
 can still leave too little room for the writes that follow, which then evict keys or, under
 `noeviction`, are refused.
+
+While a copy is being made, searches of its index are slower than with the switch off,
+and they are faster once it is made. On an Azure D8s_v5 (server on 4 CPUs) with 1M vectors
+of 1,536 dimensions and 4 clients each running a KNN 5 over 100,000 candidates, the p99 was
+69 ms with the switch off, 121 ms for the 36 s the copy took to make, and 37 ms after.
+Switching it on over a large index is best done when the index is not busiest.
 
 A scan the query's timeout cuts returns the nearest of the candidates it reached, as it
 does without the pass.

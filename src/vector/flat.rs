@@ -84,6 +84,7 @@ pub struct VectorIndex {
     coding: AtomicBool,
     cursor: AtomicUsize,
     declined: AtomicU64,
+    writes_seen: AtomicU64,
     counts: Counts,
     #[cfg(test)]
     always: AtomicBool,
@@ -128,6 +129,7 @@ struct Map {
     /// says the same.
     doc_slot: Vec<AtomicU32>,
     dirty: Vec<AtomicU64>,
+    writes: u64,
 }
 
 impl Map {
@@ -317,6 +319,7 @@ impl VectorIndex {
             // the read lock.
             unsafe { copy.slots.write_bytes(slot as usize, 0, &[0; HEADER]) };
             map.mark(slot);
+            map.writes += 1;
         }
         let count = map.by_key.len();
         drop(map);
@@ -351,6 +354,11 @@ impl VectorIndex {
             Some(me) => coder::hand(Arc::downgrade(&me)),
             None => self.coding.store(false, SeqCst),
         }
+    }
+
+    fn writes_arriving(&self) -> bool {
+        let now = self.map.read().writes;
+        self.writes_seen.swap(now, Relaxed) != now
     }
 
     fn code_some(&self) -> bool {
@@ -803,6 +811,10 @@ mod coder {
 
     type Queue = (VecDeque<Weak<VectorIndex>>, bool);
 
+    const PACE_WRITES: u32 = 3;
+    const PACE_BUILD: u32 = 1;
+    const PACE_MOST: std::time::Duration = std::time::Duration::from_millis(20);
+
     static QUEUE: parking_lot::Mutex<Queue> = parking_lot::const_mutex((VecDeque::new(), false));
     static READY: parking_lot::Condvar = parking_lot::Condvar::new();
 
@@ -840,6 +852,7 @@ mod coder {
             let Some(strong) = index.upgrade() else {
                 continue;
             };
+            let started = std::time::Instant::now();
             let more =
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| strong.code_some()))
                 {
@@ -860,8 +873,14 @@ mod coder {
                         false
                     }
                 };
+            let pace = if more && strong.writes_arriving() {
+                PACE_WRITES
+            } else {
+                PACE_BUILD
+            };
             drop(strong);
             if more {
+                std::thread::sleep((started.elapsed() * pace).min(PACE_MOST));
                 QUEUE.lock().0.push_back(index);
             }
         }
