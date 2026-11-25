@@ -1,0 +1,81 @@
+name: Client smoke suite
+# scripts/client_smoke: the same 99 commands through nine Redis clients (redis-py, valkey-glide,
+# ioredis, node-redis, Jedis, Lettuce, go-redis, StackExchange.Redis, redis-rs), over RESP2 and RESP3,
+# against Redis 8.10.3 and against KiviDB. It fails when a client gets another answer from KiviDB
+# than from Redis. The matrix is in the job summary.
+#
+# By hand only: Actions minutes cost money, and the clients change on their own schedule, not with
+# each pull request. Each client is pinned (requirements.txt, package-lock.json, pom.xml, go.sum,
+# SmokeSE.csproj, Cargo.lock).
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release)"
+        required: false
+        default: ""
+      clients:
+        description: "Clients to run, comma-separated (default: all nine)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      REDIS_IMAGE: redis:8.10.3@sha256:1f88291b4c57bdf249f02eb085a8669889b2d2954e91d4de5118a5da6b78dd53
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: scripts/client_smoke/go/go.mod
+          cache-dependency-path: scripts/client_smoke/go/go.sum
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Start Redis and KiviDB
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_IMAGE: ${{ inputs.image }}
+        run: |
+          image=$INPUT_IMAGE
+          if [ -z "$image" ]; then
+            image=docker.io/kividb/kividb:$(gh api repos/kividbio/kividb/releases/latest --jq .tag_name)
+          fi
+          docker run -d --name redis --network host "$REDIS_IMAGE" --port 6379 --save "" --appendonly no
+          docker run -d --name kividb --network host "$image" --port 6380 --protected-mode no
+          for port in 6379 6380; do
+            for _ in $(seq 1 30); do
+              (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
+              sleep 1
+            done
+          done
+          echo "KiviDB \`$image\` against Redis \`$REDIS_IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the suite
+        env:
+          CLIENTS: ${{ inputs.clients }}
+        run: |
+          python3 scripts/client_smoke/run.py --redis 127.0.0.1:6379 --kividb 127.0.0.1:6380 \
+            --clients "$CLIENTS" --work "$RUNNER_TEMP/client-smoke" --out client-smoke-results
+
+      - name: Keep the results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: client-smoke-results
+          path: client-smoke-results/
+          retention-days: 14

@@ -1,0 +1,2 @@
+redis==8.2.0
+valkey-glide==2.6.0

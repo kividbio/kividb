@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "description": "The Node runners of scripts/client_smoke: ioredis and node-redis",
+  "type": "module",
+  "dependencies": {
+    "ioredis": "6.1.0",
+    "redis": "6.4.0"
+  }
+}

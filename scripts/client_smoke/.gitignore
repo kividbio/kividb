@@ -1,0 +1,7 @@
+node/node_modules/
+java/target/
+rust/target/
+dotnet/bin/
+dotnet/obj/
+dotnet/out/
+.work/
