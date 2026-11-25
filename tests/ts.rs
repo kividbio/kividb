@@ -9,6 +9,8 @@ use std::net::TcpStream;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+mod common;
+
 // ── RESP client ───────────────────────────────────────────────────────────────
 
 struct Conn {
@@ -132,67 +134,68 @@ impl RespValue {
 
 // ── Server fixture ────────────────────────────────────────────────────────────
 
-/// Whether nothing has `port`. It is asked with a socket that is bound and
-/// never listens. One that listened, as this used to, could be given a
-/// connection: a server another test is starting holds, between its fork and
-/// its exec, a copy of every socket this process has open, and a client that
-/// dialled the port in that moment was connected to the copy and then reset
-/// ("Connection reset by peer", at the first command of a test).
-fn port_is_free(port: u16) -> bool {
-    let Ok(probe) = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None) else {
-        return false;
-    };
-    // As the server's own socket, so that a copy of this one, while it
-    // lasts, does not keep the server from the port.
-    #[cfg(unix)]
-    let _ = probe.set_reuse_address(true);
-    probe
-        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
-        .is_ok()
-}
-
-/// A port nothing is listening on — and not one the system hands out to
-/// outgoing connections. A client that starts dialling before its server is
-/// listening can otherwise be given, as its own end, the very port it is
-/// dialling: it is then connected to itself and reads back what it writes.
-fn free_port() -> u16 {
-    use std::sync::atomic::{AtomicU16, Ordering};
-    static NEXT: AtomicU16 = AtomicU16::new(0);
-    loop {
-        let step = NEXT.fetch_add(1, Ordering::Relaxed);
-        let from = (std::process::id() as u16).wrapping_mul(31);
-        let port = 10_000 + from.wrapping_add(step) % 20_000;
-        if port_is_free(port) {
-            return port;
+/// Start a server on a port of its own and return the port. A port was free
+/// when it was picked; another test process can take it before the server
+/// binds, and the server (which panics on a failed bind) then does not run.
+/// A client that only connected would talk to that other process's server. So
+/// the start is accepted only when the server answering on the port reports
+/// this process's id (these servers run on threads of the test process), and if
+/// the thread ended or another process answers, the server is started again
+/// on another port.
+fn start_server() -> u16 {
+    for _ in 0..10 {
+        let port = common::free_port();
+        let handle = thread::spawn(move || {
+            let config = kividb::config::Config {
+                port,
+                bind: "127.0.0.1".to_string(),
+                threads: 2,
+                aof: false,
+                databases: 16,
+                maxmemory: 0,
+                loglevel: "error".to_string(),
+                io_model: kividb::config::IoModel::Tokio,
+                replicaof: None,
+                replica_announced_port: 0,
+                requirepass: "".to_string(),
+                aclfile: "".to_string(),
+                slowlog_log_slower_than: 10_000,
+                slowlog_max_len: 128,
+                cluster_enabled: false,
+                cluster_node_timeout: 15000,
+                configfile: "./kividb.conf".to_string(),
+                enable_debug_command: kividb::config::DebugCommand::Yes,
+                ..Default::default()
+            };
+            kividb::run_for_test(config);
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            if handle.is_finished() {
+                eprintln!("the server could not take port {port}");
+                break;
+            }
+            match common::answer(port) {
+                common::Answer::Pid(pid) if pid == std::process::id() => return port,
+                common::Answer::Pid(pid) => {
+                    eprintln!("port {port} is answered by process {pid}, not by this one");
+                    // The server started here cannot listen: let its thread end.
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    while !handle.is_finished() && std::time::Instant::now() < until {
+                        thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    break;
+                }
+                _ => {}
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no server came up on {port}"
+            );
+            thread::sleep(std::time::Duration::from_millis(50));
         }
     }
-}
-
-fn start_server(port: u16) {
-    thread::spawn(move || {
-        let config = kividb::config::Config {
-            port,
-            bind: "127.0.0.1".to_string(),
-            threads: 2,
-            aof: false,
-            databases: 16,
-            maxmemory: 0,
-            loglevel: "error".to_string(),
-            io_model: kividb::config::IoModel::Tokio,
-            replicaof: None,
-            replica_announced_port: 0,
-            requirepass: "".to_string(),
-            aclfile: "".to_string(),
-            slowlog_log_slower_than: 10_000,
-            slowlog_max_len: 128,
-            cluster_enabled: false,
-            cluster_node_timeout: 15000,
-            configfile: "./kividb.conf".to_string(),
-            enable_debug_command: kividb::config::DebugCommand::Yes,
-            ..Default::default()
-        };
-        kividb::run_for_test(config);
-    });
+    panic!("no port could be had for the server");
 }
 
 fn now_ms() -> u64 {
@@ -207,8 +210,7 @@ fn now_ms() -> u64 {
 /// TS.CREATE basic — key created, TS.INFO returns correct metadata
 #[test]
 fn test_ts_create_basic() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.CREATE", "ts:basic"]).is_ok());
@@ -226,8 +228,7 @@ fn test_ts_create_basic() {
 /// TS.CREATE with all options
 #[test]
 fn test_ts_create_with_options() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -269,8 +270,7 @@ fn test_ts_create_with_options() {
 /// TS.CREATE on existing key returns error
 #[test]
 fn test_ts_create_duplicate_key() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.CREATE", "ts:dup"]).is_ok());
@@ -280,8 +280,7 @@ fn test_ts_create_duplicate_key() {
 /// TS.CREATE WRONGTYPE — key exists as string
 #[test]
 fn test_ts_create_wrongtype() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["SET", "ts:str", "hello"]);
@@ -294,8 +293,7 @@ fn test_ts_create_wrongtype() {
 /// TS.ALTER updates retention and duplicate policy
 #[test]
 fn test_ts_alter_retention_and_policy() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:alter"]);
@@ -329,8 +327,7 @@ fn test_ts_alter_retention_and_policy() {
 /// TS.ALTER updates labels — old label removed from index, new one added
 #[test]
 fn test_ts_alter_labels() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:alter:labels", "LABELS", "env", "prod"]);
@@ -365,8 +362,7 @@ fn test_ts_alter_labels() {
 /// TS.ALTER on non-existent key
 #[test]
 fn test_ts_alter_missing_key() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -380,8 +376,7 @@ fn test_ts_alter_missing_key() {
 /// TS.ADD basic — returns stored timestamp, TS.GET returns it
 #[test]
 fn test_ts_add_basic() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:add"]);
@@ -399,8 +394,7 @@ fn test_ts_add_basic() {
 /// TS.ADD auto-creates the key if it doesn't exist
 #[test]
 fn test_ts_add_auto_create() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // Key doesn't exist yet — ADD should create it
@@ -414,8 +408,7 @@ fn test_ts_add_auto_create() {
 /// TS.ADD with * timestamp (auto current time)
 #[test]
 fn test_ts_add_auto_timestamp() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     let before = now_ms();
@@ -433,8 +426,7 @@ fn test_ts_add_auto_timestamp() {
 /// TS.ADD duplicate policy: BLOCK
 #[test]
 fn test_ts_add_dup_block() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:block", "DUPLICATE_POLICY", "BLOCK"]);
@@ -449,8 +441,7 @@ fn test_ts_add_dup_block() {
 /// TS.ADD duplicate policy: FIRST — keeps original value
 #[test]
 fn test_ts_add_dup_first() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:first", "DUPLICATE_POLICY", "FIRST"]);
@@ -463,8 +454,7 @@ fn test_ts_add_dup_first() {
 /// TS.ADD duplicate policy: LAST — keeps latest value
 #[test]
 fn test_ts_add_dup_last() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:last", "DUPLICATE_POLICY", "LAST"]);
@@ -477,8 +467,7 @@ fn test_ts_add_dup_last() {
 /// TS.ADD duplicate policy: MIN — keeps smaller value
 #[test]
 fn test_ts_add_dup_min() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:min", "DUPLICATE_POLICY", "MIN"]);
@@ -492,8 +481,7 @@ fn test_ts_add_dup_min() {
 /// TS.ADD duplicate policy: MAX — keeps larger value
 #[test]
 fn test_ts_add_dup_max() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:max", "DUPLICATE_POLICY", "MAX"]);
@@ -507,8 +495,7 @@ fn test_ts_add_dup_max() {
 /// TS.ADD duplicate policy: SUM — accumulates values
 #[test]
 fn test_ts_add_dup_sum() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dup:sum", "DUPLICATE_POLICY", "SUM"]);
@@ -524,8 +511,7 @@ fn test_ts_add_dup_sum() {
 /// TS.MADD adds to multiple series in one call
 #[test]
 fn test_ts_madd_basic() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:madd:a"]);
@@ -559,8 +545,7 @@ fn test_ts_madd_basic() {
 /// for that sample, and the others are added.
 #[test]
 fn test_ts_madd_does_not_create_series() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
     c.cmds(&["TS.CREATE", "ts:madd:there"]);
 
@@ -590,8 +575,7 @@ fn test_ts_madd_does_not_create_series() {
 /// TS.INCRBY creates series, increments from 0
 #[test]
 fn test_ts_incrby_from_zero() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.INCRBY", "ts:inc", "5.0", "TIMESTAMP", "1000"]);
@@ -606,8 +590,7 @@ fn test_ts_incrby_from_zero() {
 /// TS.DECRBY decrements the running value
 #[test]
 fn test_ts_decrby() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.INCRBY", "ts:dec", "100.0", "TIMESTAMP", "1000"]);
@@ -623,8 +606,7 @@ fn test_ts_decrby() {
 /// TS.DEL removes samples in range, returns count
 #[test]
 fn test_ts_del_range() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:del"]);
@@ -647,8 +629,7 @@ fn test_ts_del_range() {
 /// TS.DEL on non-existent key returns error
 #[test]
 fn test_ts_del_missing_key() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.DEL", "ts:nokey", "0", "9999"]).is_error());
@@ -659,8 +640,7 @@ fn test_ts_del_missing_key() {
 /// TS.GET on empty series returns empty array
 #[test]
 fn test_ts_get_empty_series() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:empty"]);
@@ -671,8 +651,7 @@ fn test_ts_get_empty_series() {
 /// TS.GET returns the latest sample even with many samples
 #[test]
 fn test_ts_get_returns_latest() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:getlatest"]);
@@ -690,8 +669,7 @@ fn test_ts_get_returns_latest() {
 /// TS.GET on non-existent key returns nil
 #[test]
 fn test_ts_get_missing_key() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.GET", "ts:nokey"]).is_nil());
@@ -702,8 +680,7 @@ fn test_ts_get_missing_key() {
 /// TS.RANGE returns samples in forward order
 #[test]
 fn test_ts_range_forward() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:range"]);
@@ -728,8 +705,7 @@ fn test_ts_range_forward() {
 /// TS.REVRANGE returns samples in reverse order
 #[test]
 fn test_ts_revrange() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:revrange"]);
@@ -749,8 +725,7 @@ fn test_ts_revrange() {
 /// TS.RANGE with COUNT limits results
 #[test]
 fn test_ts_range_count() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:count"]);
@@ -765,8 +740,7 @@ fn test_ts_range_count() {
 /// TS.RANGE with FILTER_BY_VALUE
 #[test]
 fn test_ts_range_filter_by_value() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:filtval"]);
@@ -791,8 +765,7 @@ fn test_ts_range_filter_by_value() {
 /// TS.RANGE with AGGREGATION AVG
 #[test]
 fn test_ts_range_aggregation_avg() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:agg"]);
@@ -821,8 +794,7 @@ fn test_ts_range_aggregation_avg() {
 /// TS.RANGE with AGGREGATION SUM
 #[test]
 fn test_ts_range_aggregation_sum() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:agg:sum"]);
@@ -847,8 +819,7 @@ fn test_ts_range_aggregation_sum() {
 /// TS.RANGE with AGGREGATION COUNT
 #[test]
 fn test_ts_range_aggregation_count() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:agg:count"]);
@@ -873,8 +844,7 @@ fn test_ts_range_aggregation_count() {
 /// TS.RANGE with AGGREGATION MIN and MAX
 #[test]
 fn test_ts_range_aggregation_min_max() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:agg:minmax"]);
@@ -908,8 +878,7 @@ fn test_ts_range_aggregation_min_max() {
 /// TS.RANGE on non-existent key returns error
 #[test]
 fn test_ts_range_missing_key() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -923,8 +892,7 @@ fn test_ts_range_missing_key() {
 /// TS.MGET returns latest sample from each matching series
 #[test]
 fn test_ts_mget_basic() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:mget:a", "LABELS", "type", "sensor"]);
@@ -949,8 +917,7 @@ fn test_ts_mget_basic() {
 /// TS.MGET WITHLABELS includes label pairs
 #[test]
 fn test_ts_mget_withlabels() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:mget:wl", "LABELS", "region", "eu"]);
@@ -973,8 +940,7 @@ fn test_ts_mget_withlabels() {
 /// TS.MGET without FILTER returns error
 #[test]
 fn test_ts_mget_no_filter() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.MGET"]).is_error());
@@ -985,8 +951,7 @@ fn test_ts_mget_no_filter() {
 /// TS.MRANGE queries range across multiple series
 #[test]
 fn test_ts_mrange_basic() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:mr:a", "LABELS", "group", "x"]);
@@ -1015,8 +980,7 @@ fn test_ts_mrange_basic() {
 /// TS.MREVRANGE returns data in reverse order per series
 #[test]
 fn test_ts_mrevrange() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:mrr:a", "LABELS", "cat", "rev"]);
@@ -1035,8 +999,7 @@ fn test_ts_mrevrange() {
 /// TS.MRANGE with COUNT limits per-series results
 #[test]
 fn test_ts_mrange_count() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:mrc", "LABELS", "lim", "yes"]);
@@ -1052,8 +1015,7 @@ fn test_ts_mrange_count() {
 /// TS.MRANGE GROUPBY aggregates across series sharing a label value
 #[test]
 fn test_ts_mrange_groupby() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:gb:1", "LABELS", "zone", "east"]);
@@ -1092,8 +1054,7 @@ fn test_ts_mrange_groupby() {
 /// TS.INFO returns all expected fields
 #[test]
 fn test_ts_info_full() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&[
@@ -1147,8 +1108,7 @@ fn test_ts_info_full() {
 /// TS.INFO on missing key returns error
 #[test]
 fn test_ts_info_missing() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.INFO", "ts:no"]).is_error());
@@ -1159,8 +1119,7 @@ fn test_ts_info_missing() {
 /// TS.QUERYINDEX finds keys by label equality
 #[test]
 fn test_ts_queryindex_eq() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:qi:1", "LABELS", "env", "prod", "dc", "us1"]);
@@ -1178,8 +1137,7 @@ fn test_ts_queryindex_eq() {
 /// TS.QUERYINDEX with inequality filter
 #[test]
 fn test_ts_queryindex_ne() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:qi:ne:1", "LABELS", "env", "prod"]);
@@ -1197,8 +1155,7 @@ fn test_ts_queryindex_ne() {
 /// TS.QUERYINDEX with set filter l=(v1,v2)
 #[test]
 fn test_ts_queryindex_in_set() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:qi:set:a", "LABELS", "dc", "us1"]);
@@ -1216,8 +1173,7 @@ fn test_ts_queryindex_in_set() {
 /// TS.QUERYINDEX without filter returns error
 #[test]
 fn test_ts_queryindex_no_filter() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.QUERYINDEX"]).is_error());
@@ -1228,8 +1184,7 @@ fn test_ts_queryindex_no_filter() {
 /// TS.CREATERULE creates a compaction rule; TS.DELETERULE removes it
 #[test]
 fn test_ts_createrule_deleterule() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:src"]);
@@ -1280,8 +1235,7 @@ fn test_ts_createrule_deleterule() {
 /// its source (`sourceKey`), across a `DUMP` and `RESTORE` too.
 #[test]
 fn test_ts_compaction_writes_closed_buckets_and_latest_adds_the_open_one() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
     c.cmds(&["TS.CREATE", "ob:src"]);
     c.cmds(&["TS.CREATE", "ob:dst"]);
@@ -1372,8 +1326,7 @@ fn test_ts_compaction_writes_closed_buckets_and_latest_adds_the_open_one() {
 /// TS.CREATERULE duplicate rule rejected
 #[test]
 fn test_ts_createrule_duplicate() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:cr:src"]);
@@ -1402,8 +1355,7 @@ fn test_ts_createrule_duplicate() {
 /// TS.CREATERULE propagates samples to destination on TS.ADD
 #[test]
 fn test_ts_createrule_propagation() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:prop:src"]);
@@ -1431,8 +1383,7 @@ fn test_ts_createrule_propagation() {
 /// TS.DELETERULE on missing rule returns error
 #[test]
 fn test_ts_deleterule_missing() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:dr:src"]);
@@ -1448,8 +1399,7 @@ fn test_ts_deleterule_missing() {
 /// Retention trims old samples — after retention period they should not be returned
 #[test]
 fn test_ts_retention_trims_old_samples() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // Retention = 1000ms
@@ -1477,8 +1427,7 @@ fn test_ts_retention_trims_old_samples() {
 /// RANGE — FIRST aggregation returns first sample in each bucket
 #[test]
 fn test_ts_range_agg_first_last() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:fl"]);
@@ -1512,8 +1461,7 @@ fn test_ts_range_agg_first_last() {
 /// RANGE — RANGE aggregation returns max - min in each bucket
 #[test]
 fn test_ts_range_agg_range() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:rng"]);
@@ -1537,8 +1485,7 @@ fn test_ts_range_agg_range() {
 /// RANGE — STD.P aggregation (population std dev)
 #[test]
 fn test_ts_range_agg_std() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "ts:std"]);
@@ -1603,8 +1550,7 @@ fn query_index(c: &mut Conn, filter: &str) -> Vec<String> {
 /// were passed over, and the series made with the defaults (#555).
 #[test]
 fn test_ts_incrby_creates_the_series_with_its_options() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     let r = c.cmds(&[
@@ -1652,8 +1598,7 @@ fn test_ts_incrby_creates_the_series_with_its_options() {
 /// `TS.INCRBY` trims the series to its retention, as `TS.ADD` does (#555).
 #[test]
 fn test_ts_incrby_trims_to_the_retention() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -1675,8 +1620,7 @@ fn test_ts_incrby_trims_to_the_retention() {
 /// it too: it used to end the parse, silently (#565).
 #[test]
 fn test_ts_chunk_size_keyword() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -1739,8 +1683,7 @@ fn test_ts_chunk_size_keyword() {
 /// the options after it were dropped (#565).
 #[test]
 fn test_ts_unknown_option_is_passed_over() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(
@@ -1799,8 +1742,7 @@ fn test_ts_unknown_option_is_passed_over() {
 /// `CHUNK_SIZE 4096`, and `LABELS` with no pairs (#565).
 #[test]
 fn test_ts_alter_sets_default_values() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&[
@@ -1832,8 +1774,7 @@ fn test_ts_alter_sets_default_values() {
 /// keeps its own, as in RedisTimeSeries. It used to be passed over.
 #[test]
 fn test_ts_add_on_duplicate_is_for_the_sample() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "opt:d", "DUPLICATE_POLICY", "BLOCK"]);
@@ -1854,8 +1795,7 @@ fn test_ts_add_on_duplicate_is_for_the_sample() {
 /// behind was the master's alone.
 #[test]
 fn test_ts_add_refused_changes_nothing() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&["TS.CREATE", "opt:b", "DUPLICATE_POLICY", "BLOCK"]);
@@ -1889,8 +1829,7 @@ fn test_ts_add_refused_changes_nothing() {
 /// after them makes the option; otherwise they are labels.
 #[test]
 fn test_ts_labels_end_at_a_two_word_option_only() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&[
@@ -1931,8 +1870,7 @@ fn test_ts_labels_end_at_a_two_word_option_only() {
 /// logged as a negative number, which they refused (#592).
 #[test]
 fn test_ts_time_above_i64_max_is_refused() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     let max = i64::MAX.to_string();
@@ -1959,8 +1897,7 @@ fn test_ts_time_above_i64_max_is_refused() {
 /// command that takes a sample's time; nothing is made.
 #[test]
 fn test_ts_time_minus_zero_is_refused() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert!(c.cmds(&["TS.ADD", "z", "-0", "1"]).is_error());
@@ -1987,8 +1924,7 @@ fn test_ts_time_minus_zero_is_refused() {
 /// RedisTimeSeries, a payload is without links to other keys (#593).
 #[test]
 fn test_ts_dump_restore() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     c.cmds(&[
@@ -2106,8 +2042,7 @@ fn ts_source(c: &mut Conn, key: &str) -> Option<String> {
 /// (#593).
 #[test]
 fn test_ts_links_left_behind_are_dead() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
     let rule = |c: &mut Conn, s: &str, d: &str| {
         c.cmds(&["TS.CREATERULE", s, d, "AGGREGATION", "sum", "10"])
@@ -2200,8 +2135,7 @@ fn test_ts_links_left_behind_are_dead() {
 /// Inside `MULTI`, a time above `i64::MAX` is refused too (#592).
 #[test]
 fn test_ts_time_above_i64_max_is_refused_in_multi() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     let over = (i64::MAX as u64 + 1).to_string();
@@ -2223,8 +2157,7 @@ fn test_ts_time_above_i64_max_is_refused_in_multi() {
 /// the new name. `COPY` makes a series without links (#593).
 #[test]
 fn test_ts_rename_and_copy_keep_compactions_right() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
     let range_len = |c: &mut Conn, key: &str| c.cmds(&["TS.RANGE", key, "-", "+"]).as_array().len();
 
@@ -2315,8 +2248,7 @@ fn test_ts_rename_and_copy_keep_compactions_right() {
 /// source `lp:s`, as 1.2.0's `DUMP` wrote it.
 #[test]
 fn test_ts_restore_of_a_payload_with_links_leaves_them_out() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
     for key in ["lp:s", "lp:d"] {
         c.cmds(&["TS.CREATE", key]);
@@ -2402,8 +2334,7 @@ fn digest_of(c: &mut Conn, key: &str) -> String {
 /// `DEBUG DIGEST-VALUE`.
 #[test]
 fn test_ts_labels_keep_the_order_given() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     for round in 0..10 {
@@ -2468,8 +2399,7 @@ fn test_ts_labels_keep_the_order_given() {
 
 #[test]
 fn test_ts_create_and_alter_ignore() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // TS.CREATE with IGNORE
@@ -2507,8 +2437,7 @@ fn test_ts_create_and_alter_ignore() {
 
 #[test]
 fn test_ts_add_ignore_suppression() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // Create series with IGNORE 5000 (ms) and 0.5 (val delta)
@@ -2563,8 +2492,7 @@ fn test_ts_add_ignore_suppression() {
 
 #[test]
 fn test_ts_add_auto_create_with_ignore_and_override() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // Auto-create with IGNORE
@@ -2591,8 +2519,7 @@ fn test_ts_add_auto_create_with_ignore_and_override() {
 
 #[test]
 fn test_ts_ignore_malformed_syntax() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     let err_msg = "TSDB: Couldn't parse IGNORE";
@@ -2625,8 +2552,7 @@ fn test_ts_ignore_malformed_syntax() {
 
 #[test]
 fn test_ts_ignore_exact_boundaries() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert_eq!(
@@ -2661,8 +2587,7 @@ fn test_ts_ignore_exact_boundaries() {
 
 #[test]
 fn test_ts_ignore_timestamp_before_last_never_ignored() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert_eq!(
@@ -2678,8 +2603,7 @@ fn test_ts_ignore_timestamp_before_last_never_ignored() {
 
 #[test]
 fn test_ts_ignore_duplicate_policy_handling() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     // Series whose policy is SUM is never ignored
@@ -2737,8 +2661,7 @@ fn test_ts_ignore_duplicate_policy_handling() {
 
 #[test]
 fn test_ts_madd_with_ignore() {
-    let port = free_port();
-    start_server(port);
+    let port = start_server();
     let mut c = Conn::connect(port);
 
     assert_eq!(
@@ -2767,19 +2690,21 @@ fn test_ts_madd_with_ignore() {
 #[test]
 fn test_ts_ignore_persistence_across_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
-        .current_dir(dir.path())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
+    let spawn = |port: u16| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
+            .current_dir(dir.path())
+            .args([
+                "--port",
+                &port.to_string(),
+                "--bind",
+                "127.0.0.1",
+                "--dir",
+                dir.path().to_str().unwrap(),
+            ])
+            .spawn()
+            .unwrap()
+    };
+    let (mut child, port) = common::start_verified(&spawn);
 
     let mut c = Conn::connect(port);
     assert_eq!(
@@ -2796,18 +2721,7 @@ fn test_ts_ignore_persistence_across_restart() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
-        .current_dir(dir.path())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--bind",
-            "127.0.0.1",
-            "--dir",
-            dir.path().to_str().unwrap(),
-        ])
-        .spawn()
-        .unwrap();
+    let (mut child, port, _) = common::restart_verified(&spawn, port);
 
     let mut c = Conn::connect(port);
     let info = c.cmds(&["TS.INFO", "ts:restart"]);
@@ -2839,8 +2753,7 @@ fn test_ts_ignore_persistence_across_restart() {
 #[test]
 fn test_ts_ignore_through_the_aof_and_its_rewrite() {
     let dir = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let start = || {
+    let start = |port: u16| {
         std::process::Command::new(env!("CARGO_BIN_EXE_kividb"))
             .current_dir(dir.path())
             .args([
@@ -2874,7 +2787,7 @@ fn test_ts_ignore_through_the_aof_and_its_rewrite() {
         )
     };
 
-    let mut child = start();
+    let (mut child, port) = common::start_verified(&start);
     let mut c = Conn::connect(port);
     assert_eq!(
         c.cmds(&["TS.CREATE", "s", "IGNORE", "1000", "1.0"])
@@ -2887,7 +2800,7 @@ fn test_ts_ignore_through_the_aof_and_its_rewrite() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let mut child = start();
+    let (mut child, port, _) = common::restart_verified(&start, port);
     let mut c = Conn::connect(port);
     assert_eq!(c.cmds(&["GET", "after"]).as_str(), "v");
     let range = c.cmds(&["TS.RANGE", "s", "-", "+"]);
@@ -2912,7 +2825,7 @@ fn test_ts_ignore_through_the_aof_and_its_rewrite() {
     let _ = child.kill();
     let _ = child.wait();
 
-    let mut child = start();
+    let (mut child, port, _) = common::restart_verified(&start, port);
     let mut c = Conn::connect(port);
     assert_eq!(ignore_settings(&mut c), (2000, 2.5));
     assert_eq!(c.cmds(&["TS.ADD", "s", "2500", "12"]).as_int(), 1000);
