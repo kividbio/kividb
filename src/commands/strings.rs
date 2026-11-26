@@ -23,6 +23,10 @@ fn key_value_pairs<'a>(cmd: &[&'a [u8]]) -> Vec<(&'a [u8], &'a [u8])> {
         .collect()
 }
 
+fn strict_i64(raw: &[u8]) -> Option<i64> {
+    crate::commands::login::strict_integer(raw)
+}
+
 /// The shards a command's keys are in, each once, in the order they stand
 /// in the database.
 ///
@@ -599,30 +603,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let next = match map.get(key) {
                 None => 1i64,
-                Some(ValueRef::String(v)) => {
-                    let s = match std::str::from_utf8(v.as_ref()) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            return Some(resp_error("ERR value is not an integer or out of range"));
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
+                    // At i64::MAX it wrapped to i64::MIN, or panicked in a
+                    // debug build (#124).
+                    Some(n) => match n.checked_add(1) {
+                        Some(n) => n,
+                        None => {
+                            return Some(resp_error("ERR increment or decrement would overflow"));
                         }
-                    };
-
-                    match s.parse::<i64>() {
-                        // At i64::MAX it wrapped to i64::MIN, or panicked in a
-                        // debug build (#124).
-                        Ok(n) => match n.checked_add(1) {
-                            Some(n) => n,
-                            None => {
-                                return Some(resp_error(
-                                    "ERR increment or decrement would overflow",
-                                ));
-                            }
-                        },
-                        Err(_) => {
-                            return Some(resp_error("ERR value is not an integer or out of range"));
-                        }
+                    },
+                    None => {
+                        return Some(resp_error("ERR value is not an integer or out of range"));
                     }
-                }
+                },
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -971,7 +964,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let delta: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -981,10 +974,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Check overflow properly
             let next = match map.get(key) {
                 None => delta,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_add(delta) {
                         Some(result) => result,
                         None => {
@@ -1019,10 +1009,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let next = match map.get(key) {
                 None => -1i64,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_sub(1) {
                         Some(r) => r,
                         None => {
@@ -1050,7 +1037,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let delta: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -1058,11 +1045,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
             let next = match map.get(key) {
-                None => -delta,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                None => match delta.checked_neg() {
+                    Some(n) => n,
+                    None => return Some(resp_error("ERR decrement would overflow")),
+                },
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_sub(delta) {
                         Some(r) => r,
                         None => {
@@ -1944,7 +1931,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         let next = cmd.get(i + 1).copied();
         match (tok.as_str(), next) {
             ("BYINT", Some(raw)) if !mode_set => {
-                incr_int = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+                incr_int = match strict_i64(raw) {
                     Some(v) => v,
                     None => return resp_error("ERR Increment is not an integer or out of range"),
                 };
@@ -2003,11 +1990,9 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Int => {
             let bound = |raw: Option<&[u8]>, default: i64, what: &str| match raw {
                 None => Ok(default),
-                Some(raw) => parse_utf8(raw)
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .ok_or_else(|| {
-                        resp_error(&format!("ERR {what} is not an integer or out of range"))
-                    }),
+                Some(raw) => strict_i64(raw).ok_or_else(|| {
+                    resp_error(&format!("ERR {what} is not an integer or out of range"))
+                }),
             };
             let l = match bound(lbound_raw, i64::MIN, "LBOUND") {
                 Ok(v) => v,
@@ -2052,7 +2037,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         None if persist => IncrexExpiry::Persist,
         None => IncrexExpiry::Keep,
         Some((unit, raw)) => {
-            let n: i64 = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+            let n: i64 = match strict_i64(raw) {
                 Some(v) => v,
                 None => return resp_error(ERR_VALUE_NOT_INTEGER),
             };
@@ -2101,7 +2086,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Int => {
             let current: i64 = match existing {
                 None => 0,
-                Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                Some(v) => match strict_i64(v) {
                     Some(n) => n,
                     None => return resp_error(ERR_VALUE_NOT_INTEGER),
                 },

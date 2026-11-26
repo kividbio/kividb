@@ -405,6 +405,71 @@ fn test_incr_decr_variants() {
     assert_eq!(c.cmds(&["GET", "max"]).as_str(), "9223372036854775807");
 }
 
+#[test]
+fn test_integer_counters_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let value_error = "ERR value is not an integer or out of range";
+    for stored in ["01", "+1", "-0", " 1", "1 "] {
+        c.cmds(&["SET", "n", stored]);
+        assert_eq!(c.cmds(&["INCR", "n"]).error_str(), value_error);
+        assert_eq!(c.cmds(&["INCRBY", "n", "5"]).error_str(), value_error);
+        assert_eq!(c.cmds(&["DECR", "n"]).error_str(), value_error);
+        assert_eq!(c.cmds(&["DECRBY", "n", "5"]).error_str(), value_error);
+        assert_eq!(c.cmds(&["GET", "n"]).as_str(), stored);
+    }
+
+    for delta in ["01", "+1", "-0"] {
+        assert_eq!(c.cmds(&["INCRBY", "n", delta]).error_str(), value_error);
+        assert_eq!(c.cmds(&["DECRBY", "n", delta]).error_str(), value_error);
+    }
+
+    assert_eq!(
+        c.cmds(&["DECRBY", "fresh", "-9223372036854775808"])
+            .error_str(),
+        "ERR decrement would overflow"
+    );
+    assert!(c.cmds(&["GET", "fresh"]).is_nil());
+}
+
+#[test]
+fn test_increx_integers_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for stored in ["01", "+1", "-0"] {
+        c.cmds(&["SET", "ix", stored]);
+        assert_eq!(
+            c.cmds(&["INCREX", "ix"]).error_str(),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(c.cmds(&["GET", "ix"]).as_str(), stored);
+    }
+
+    for increment in ["01", "+1", "-0"] {
+        assert_eq!(
+            c.cmds(&["INCREX", "ix", "BYINT", increment]).error_str(),
+            "ERR Increment is not an integer or out of range"
+        );
+    }
+    for (option, error) in [
+        ("LBOUND", "ERR LBOUND is not an integer or out of range"),
+        ("UBOUND", "ERR UBOUND is not an integer or out of range"),
+    ] {
+        assert_eq!(c.cmds(&["INCREX", "ix", option, "01"]).error_str(), error);
+    }
+    for expire in ["010", "+10", "-0"] {
+        assert_eq!(
+            c.cmds(&["INCREX", "ix", "BYINT", "1", "EX", expire])
+                .error_str(),
+            "ERR value is not an integer or out of range"
+        );
+    }
+}
+
 // Manual test scenario:
 //   SET k 10.5
 //   INCRBYFLOAT k 0.1        → "10.6"
