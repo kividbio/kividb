@@ -672,11 +672,13 @@ impl VectorIndex {
                     && tally.on
                 {
                     if let Some(kth) = best.kth() {
-                        tally.decided += 1;
-                        if tally.decided.is_multiple_of(flat_int8::CUT_EVERY) {
+                        // Once the cut-off turns the pass off, it stays off for the rest of
+                        // this scan.
+                        if tally.decided > 0 && tally.decided.is_multiple_of(flat_int8::CUT_EVERY) {
                             tally.on = tally.window * flat_int8::CUT_SHARE <= flat_int8::CUT_EVERY;
                             tally.window = 0;
                         }
+                        tally.decided += 1;
                         if tally.on
                             && let Some(lb) = q.lower_bound(copy.slots.slot_bytes(slot))
                             && lb >= f64::from(kth)
@@ -1623,6 +1625,23 @@ mod tests {
         assert!(header("new").iter().all(|&b| b == 0));
         flat.code_now();
         assert!(header("new").iter().any(|&b| b != 0));
+    }
+
+    #[test]
+    fn writes_arriving_is_true_only_after_a_write_since_it_last_looked() {
+        let flat = VectorIndex::new();
+        flat.always.store(true, Relaxed);
+        for i in 0..1_100 {
+            flat.insert(format!("k{i}"), vec![i as f32 + 1.0; 256]);
+        }
+        flat.code_now();
+        flat.writes_arriving();
+        assert!(!flat.writes_arriving());
+        flat.insert("k3".into(), vec![-1.0; 256]);
+        assert!(flat.writes_arriving());
+        assert!(!flat.writes_arriving());
+        flat.code_now();
+        assert!(!flat.writes_arriving());
     }
 
     #[test]
