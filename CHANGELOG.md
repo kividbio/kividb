@@ -678,7 +678,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a number gets the place before it, as a string does, and is written
   `%.14g`, as Redis's Lua writes it: `error(42)` on line 2 is
   `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`;
-  `error(10/2, 0)` replies `ERR 5`. What a script catches is what it would catch in Redis: `pcall(error, 42)`
+  `error(10/2, 0)` replies `ERR 5`. A number a table raises as its `err`
+  is written so too: `error({err = -0.0})` replies `-0`, and
+  `error({err = 1e15})` `1e+15`. What a script catches is what it would catch in Redis: `pcall(error, 42)`
   gives the string `"42"`, where it gave the number; `pcall(error, 42, 0)`
   still gives the number.
 
@@ -696,7 +698,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A nil index error reads `attempt to index a nil value` however it is
   raised (#1054).** Caught and raised again with `error(e, 0)`, it replied
   the whole of Lua 5.4's message (`attempt to index a nil value (local
-  't')`); it is cut now as the one raised where it happened is.
+  't')`); it is cut now as the one raised where it happened is. Only
+  Lua's own note is cut: a message a script wrote itself, as
+  `attempt to index a nil value: bad key x`, is replied whole.
+
+- **A `__gc` a script sets runs inside a function of KiviDB's (#1054).**
+  `setmetatable` puts a `__gc` function inside one that counts the
+  finalizers running, so that a coroutine a finalizer starts is known to be
+  in it, and its `error` leaves alone the place of the call it runs in.
+  `getmetatable(t).__gc` is that function, not the one the script gave.
 
 - **A function library's lines are counted from its `#!lua` line, under
   Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
