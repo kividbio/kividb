@@ -674,8 +674,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   for every reply; server on 4 CPUs, client on 4 others, all in Docker, on an
   8-vCPU AWS host with Linux 4.14): `--threads 8` from 134,900-136,500 to
   170,300-171,100 operations a second (Redis 8.10.2: 162,100-164,000),
-  `--threads 2` 3.9-5.0 % up, `--threads 4` -1.7 % to +4.1 % by run (2.0 %
-  on average, with 10 % less server CPU), `--threads 1` level; at 500
+  `--threads 2` 3.9-5.0 % up, `--threads 4` -1.7 % to +4.1 % by run (1.6 %
+  on average, with 11 % less server CPU), `--threads 1` level; at 500
   connections `--threads 4` -0.3 % to +7.2 %, `--threads 2` -2.3 % to
   +0.2 %, `--threads 8` -3.0 % and +1.0 %. Pipelined (`redis-benchmark`
   `-P 16`, 50 connections, 1 KB) is level or up to 4 %, and an idle server
