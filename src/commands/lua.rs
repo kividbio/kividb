@@ -747,20 +747,14 @@ fn lua_error_message(error: &LuaError) -> String {
         LuaError::SyntaxError { message, .. } => message.clone(),
         other => other.to_string(),
     };
-    if let Some((_, msg)) = marked_table_error(&message) {
-        return msg.to_string();
-    }
-    // A string `error` raised, kept with its place (`remember_error_place`):
-    // its message. `error` is not there while a library loads, as in Redis,
-    // but nothing marked is let out if that changes.
-    if let Some(at) = message.find(PLACE_ERROR_MARK) {
-        let marked = &message[at + PLACE_ERROR_MARK.len()..];
-        let marked = &marked[..marked.find('\n').unwrap_or(marked.len())];
-        return marked
-            .splitn(3, '\u{1}')
-            .nth(2)
-            .unwrap_or(marked)
-            .to_string();
+    // A table's `err`, or what `error` raised kept with its place
+    // (`remember_error_place`): its message. `error` is not there while a
+    // library loads, as in Redis, but nothing marked is let out if that
+    // changes.
+    for mark in [TABLE_ERROR_MARK, PLACE_ERROR_MARK] {
+        if let Some((_, _, msg)) = marked_error(&message, mark) {
+            return msg.to_string();
+        }
     }
     message
         .lines()
@@ -4362,27 +4356,48 @@ fn normalize_redis_eval_nil_index_error(s: String) -> String {
 /// message: as `SCRIPT LOAD` says it ([`script_compiles`]).
 const SCRIPT_COMPILE_ERROR: &str = "ERR Error compiling script (new function): ";
 
+/// The place Lua puts before a message from a script's code
+/// (`user_script:3: `, `user_function:7: `): the chunk, the line and what
+/// follows.
+fn place_prefix(message: &str) -> Option<(&'static str, &str, &str)> {
+    ["user_script", "user_function"]
+        .into_iter()
+        .find_map(|chunk| {
+            let rest = message.strip_prefix(chunk)?.strip_prefix(':')?;
+            let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return None;
+            }
+            Some((chunk, &rest[..digits], rest[digits..].strip_prefix(": ")?))
+        })
+}
+
+/// `attempt to index a nil value`, behind whatever places come before it,
+/// without what Lua 5.4 adds after it (`(local 't')`, `(field 'x')`), as
+/// [`normalize_redis_eval_nil_index_error`] has it: Redis's suite matches
+/// `*attempt to index a nil value script*`. The same error reads the same,
+/// raised where it happened or caught and raised again (#1055 review).
+fn index_nil_trimmed(message: &str) -> &str {
+    const NIL_INDEX: &str = "attempt to index a nil value";
+    let mut rest = message;
+    while let Some((_, _, after)) = place_prefix(rest) {
+        rest = after;
+    }
+    if rest.starts_with(NIL_INDEX) {
+        &message[..message.len() - rest.len() + NIL_INDEX.len()]
+    } else {
+        message
+    }
+}
+
 /// A Lua error that says where in the script it happened (`user_script:3:
 /// …`, `user_function:7: …`), kept with that place for the reply's tail,
-/// the message as Lua gives it (#1054). `attempt to index a nil value` drops
-/// what Lua 5.4 adds after it, as [`normalize_redis_eval_nil_index_error`]
-/// has it, so that the reply reads `… nil value script: …` as Redis's does.
+/// the message as Lua gives it ([`index_nil_trimmed`]) (#1054).
 fn placed_error(message: &str) -> Option<String> {
-    let (chunk, rest) = ["user_script", "user_function"]
-        .into_iter()
-        .find_map(|chunk| Some((chunk, message.strip_prefix(chunk)?.strip_prefix(':')?)))?;
-    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
-    let (line, what) = (&rest[..digits], rest[digits..].strip_prefix(": ")?);
-    if line.is_empty() {
-        return None;
-    }
-    let what = if what.starts_with("attempt to index a nil value") {
-        "attempt to index a nil value"
-    } else {
-        what
-    };
+    let (chunk, line, _) = place_prefix(message)?;
     Some(format!(
-        "{PLACE_ERROR_MARK}{chunk}\u{1}{line}\u{1}{chunk}:{line}: {what}"
+        "{PLACE_ERROR_MARK}@{chunk}\u{1}{line}\u{1}{}",
+        index_nil_trimmed(message)
     ))
 }
 
@@ -4411,8 +4426,10 @@ fn redis_simple_error_has_category_prefix(s: &str) -> bool {
             .all(|c| c.is_ascii_uppercase() || c == '_' || c == '-')
 }
 
-/// What [`remember_error_table`] puts before a table's `err`, then the line
-/// and a `\u{1}`. Not NUL: mlua reads an error's message as a C string.
+/// What [`remember_error_table`] puts before a table's `err`, then the
+/// source as Redis names it (`@user_script`, `@user_function`, `=[C]`) and
+/// the line, each followed by a `\u{1}`. Not NUL: mlua reads an error's
+/// message as a C string.
 const TABLE_ERROR_MARK: &str = "\u{1}kividb-error\u{1}";
 
 thread_local! {
@@ -4429,16 +4446,21 @@ thread_local! {
     static RAISED_PLACE: RefCell<Option<Box<str>>> = const { RefCell::new(None) };
     /// Whether [`RAISED_TABLE`] or [`RAISED_PLACE`] may hold anything: a call
     /// that succeeds reads this, which is one load, and not those.
-    static TABLE_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ERROR_KEPT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// The line and the message of a table [`remember_error_table`] kept, from a
-/// Lua error's text.
-fn marked_table_error(s: &str) -> Option<(&str, &str)> {
-    let at = s.find(TABLE_ERROR_MARK)?;
-    let rest = &s[at + TABLE_ERROR_MARK.len()..];
+/// The source, the line and the message a mark (`TABLE_ERROR_MARK`,
+/// `PLACE_ERROR_MARK`) puts in a Lua error's text, up to the traceback
+/// after it.
+fn marked_error<'s>(s: &'s str, mark: &str) -> Option<(&'s str, &'s str, &'s str)> {
+    let at = s.find(mark)?;
+    let rest = &s[at + mark.len()..];
     let rest = &rest[..rest.find('\n').unwrap_or(rest.len())];
-    Some(rest.split_once('\u{1}').unwrap_or(("1", rest)))
+    let mut parts = rest.splitn(3, '\u{1}');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(source), Some(line), Some(message)) => Some((source, line, message)),
+        _ => Some(("@user_script", "1", rest)),
+    }
 }
 
 /// `error` in scripts: Lua's own (`luaB_error`), but a table it raises is
@@ -4579,14 +4601,22 @@ unsafe fn caught_as_redis(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
 /// Raise the value at 1 as Lua 5.1's `luaB_error` does, for `error`: a
 /// string or a number with the place at `level` before it (5.1 reads a
 /// number as a string here, as Redis's Lua does; 5.4 would not), a table
-/// kept. A string is kept with the place it leaves the script from.
+/// kept. Anything else is kept with the place it leaves the script from.
 unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::c_int) -> ! {
     use mlua::ffi;
     unsafe {
         let kind = ffi::lua_type(state, 1);
-        if (kind == ffi::LUA_TSTRING || kind == ffi::LUA_TNUMBER) && level > 0 {
+        if kind == ffi::LUA_TSTRING && level > 0 {
             ffi::luaL_where(state, level);
             ffi::lua_pushvalue(state, 1);
+            ffi::lua_concat(state, 2);
+        } else if kind == ffi::LUA_TNUMBER && level > 0 {
+            // Written as 5.1 writes it (`error(10/2)` is `…: 5`), in a
+            // buffer that needs no drop if a Lua call here fails.
+            let mut buf = [0u8; LUA51_NUMBER_BUF];
+            let written = lua51_number(ffi::lua_tonumber(state, 1), &mut buf);
+            ffi::luaL_where(state, level);
+            ffi::lua_pushlstring(state, written.as_ptr().cast(), written.len());
             ffi::lua_concat(state, 2);
         } else {
             remember_error_table(state);
@@ -4596,19 +4626,73 @@ unsafe fn raise_script_error(state: *mut mlua::ffi::lua_State, level: std::ffi::
     }
 }
 
-/// What [`remember_error_place`] puts before where a string `error` raised
-/// left the script from: the chunk, the line and the message, each after a
+/// Room for any number [`lua51_number`] writes, and its NUL.
+const LUA51_NUMBER_BUF: usize = 64;
+
+/// A number as Lua 5.1, and so Redis's Lua, writes it: `%.14g` of its
+/// double (`10/2` is `5`, not 5.4's `5.0`; `-0.0` is `-0`).
+fn lua51_number(n: f64, buf: &mut [u8; LUA51_NUMBER_BUF]) -> &[u8] {
+    // SAFETY: `buf` is as long as said, and `%.14g` of a double needs far
+    // less than it; what does not fit is cut, as `snprintf` cuts it.
+    let written = unsafe {
+        libc::snprintf(
+            buf.as_mut_ptr().cast(),
+            LUA51_NUMBER_BUF,
+            c"%.14g".as_ptr(),
+            n,
+        )
+    };
+    &buf[..usize::try_from(written)
+        .unwrap_or(0)
+        .min(LUA51_NUMBER_BUF - 1)]
+}
+
+/// Where the `error` running was called from, as Redis's message handler
+/// finds it: one frame past `error`, a C function, and no further. A Lua
+/// chunk of the script gives `@user_script` or `@user_function` and its
+/// line; a C function, as with `string.gsub(s, p, error)`, gives `=[C]` and
+/// -1, as Redis's reply has it. A chunk of KiviDB's own gives `None`.
+unsafe fn error_called_from(
+    state: *mut mlua::ffi::lua_State,
+) -> Option<(&'static str, std::ffi::c_int)> {
+    use mlua::ffi;
+    unsafe {
+        let mut ar: ffi::lua_Debug = std::mem::zeroed();
+        if ffi::lua_getstack(state, 1, &mut ar) == 0
+            || ffi::lua_getinfo(state, c"Sl".as_ptr(), &mut ar) == 0
+        {
+            return None;
+        }
+        if std::ffi::CStr::from_ptr(ar.what).to_bytes() == b"C" {
+            return Some(("=[C]", ar.currentline));
+        }
+        match std::ffi::CStr::from_ptr(ar.source).to_bytes() {
+            b"=user_script" => Some(("@user_script", ar.currentline)),
+            b"=user_function" => Some(("@user_function", ar.currentline)),
+            _ => None,
+        }
+    }
+}
+
+/// What [`remember_error_place`] puts before where what `error` raised left
+/// the script from: the source as Redis names it (`@user_script`,
+/// `@user_function`, `=[C]`), the line and the message, each after a
 /// `\u{1}`.
 const PLACE_ERROR_MARK: &str = "\u{1}kividb-place\u{1}";
 
-/// Keep the string at the top of the stack, that `error` is about to raise,
-/// with where it leaves the script from (#1054): the first frame past
-/// `error` that is not a C function, as Redis's message handler finds it.
-/// That is the line Redis puts in the reply's tail (`on @user_script:N.`),
-/// and not always the one in the message: `error(e, 0)` raises a message
-/// made elsewhere, with no place of its own. [`table_errors`] puts it in
-/// place of the message if the call fails with it; like a table, it costs
-/// nothing until a script raises one.
+/// Keep what `error` is about to raise, the value at the top of the stack,
+/// with where it leaves the script from (#1054): [`error_called_from`], the
+/// place Redis puts in the reply's tail (`on @user_script:N.`). It is not
+/// always the one in the message: `error(e, 0)` raises a message made
+/// elsewhere, with no place of its own. [`table_errors`] puts it in place of
+/// the message if the call fails with it; like a table, it costs nothing
+/// until a script raises one.
+///
+/// A string is said as it is; a number as Lua 5.1 writes it, from a copy, so
+/// that the number raised stays one (`pcall(error, 42, 0)`); `nil`, `true`
+/// and `false` as Redis's `tostring` says them. Anything else (a userdata
+/// or a function, whose `tostring` could run a script's `__tostring`) is
+/// left to mlua, as before.
 ///
 /// As in [`remember_error_table`], what can fail comes before any Rust value
 /// is made.
@@ -4621,53 +4705,61 @@ unsafe fn remember_error_place(state: *mut mlua::ffi::lua_State) {
         if in_finalizer(state) {
             return;
         }
-        if ffi::lua_type(state, -1) != ffi::LUA_TSTRING {
-            forget_raised_place();
-            return;
-        }
-        let mut ar: ffi::lua_Debug = std::mem::zeroed();
-        let mut line = None;
-        for level in 1..=3 {
-            if ffi::lua_getstack(state, level, &mut ar) != 0
-                && ffi::lua_getinfo(state, c"Sl".as_ptr(), &mut ar) != 0
-                && std::ffi::CStr::from_ptr(ar.what).to_bytes() != b"C"
-            {
-                line = Some(ar.currentline);
-                break;
-            }
-        }
-        // `source` is read only for the frame found, which filled it.
-        let Some(line) = line else {
-            forget_raised_place();
-            return;
-        };
-        let chunk = match std::ffi::CStr::from_ptr(ar.source).to_bytes() {
-            b"=user_script" => "user_script",
-            b"=user_function" => "user_function",
+        let kind = ffi::lua_type(state, -1);
+        let fixed: Option<&str> = match kind {
+            ffi::LUA_TSTRING | ffi::LUA_TNUMBER => None,
+            ffi::LUA_TNIL => Some("nil"),
+            ffi::LUA_TBOOLEAN if ffi::lua_toboolean(state, -1) != 0 => Some("true"),
+            ffi::LUA_TBOOLEAN => Some("false"),
             _ => {
                 forget_raised_place();
                 return;
             }
         };
-        let mut len = 0;
-        let p = ffi::lua_tolstring(state, -1, &mut len);
-        let message = String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), len));
-        let kept = format!(
-            "{message}{PLACE_ERROR_MARK}{chunk}\u{1}{line}\u{1}{}",
-            message.replace(['\r', '\n'], " ")
-        );
+        let Some((source, line)) = error_called_from(state) else {
+            forget_raised_place();
+            return;
+        };
+        // What mlua's message will start with (5.4's `tostring` of the
+        // value) and what the reply says of it.
+        let mut buf = [0u8; LUA51_NUMBER_BUF];
+        let (message, said) = if let Some(fixed) = fixed {
+            (std::borrow::Cow::Borrowed(fixed), fixed.to_string())
+        } else {
+            let number = kind == ffi::LUA_TNUMBER;
+            if number {
+                if ffi::lua_checkstack(state, 1) == 0 {
+                    forget_raised_place();
+                    return;
+                }
+                ffi::lua_pushvalue(state, -1);
+            }
+            let mut len = 0;
+            let p = ffi::lua_tolstring(state, -1, &mut len);
+            let message = String::from_utf8_lossy(std::slice::from_raw_parts(p.cast::<u8>(), len))
+                .into_owned();
+            let said = if number {
+                ffi::lua_pop(state, 1);
+                String::from_utf8_lossy(lua51_number(ffi::lua_tonumber(state, -1), &mut buf))
+                    .into_owned()
+            } else {
+                index_nil_trimmed(&message).replace(['\r', '\n'], " ")
+            };
+            (std::borrow::Cow::Owned(message), said)
+        };
+        let kept = format!("{message}{PLACE_ERROR_MARK}{source}\u{1}{line}\u{1}{said}");
         if RAISED_PLACE
             .try_with(|cell| *cell.borrow_mut() = Some(kept.into()))
             .is_ok()
         {
-            let _ = TABLE_KEPT.try_with(|kept| kept.set(true));
+            let _ = ERROR_KEPT.try_with(|kept| kept.set(true));
         }
     }
 }
 
 /// Forget what [`remember_error_place`] kept, if anything.
 fn forget_raised_place() {
-    if TABLE_KEPT.try_with(|kept| kept.get()).unwrap_or(false) {
+    if ERROR_KEPT.try_with(|kept| kept.get()).unwrap_or(false) {
         let _ = RAISED_PLACE.try_with(|kept| kept.take());
     }
 }
@@ -4704,18 +4796,10 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
             forget_raised_table();
             return;
         }
-        // The frame that raised it: past `error` itself.
-        let mut line = 1;
-        let mut ar: ffi::lua_Debug = std::mem::zeroed();
-        for level in 1..=3 {
-            if ffi::lua_getstack(state, level, &mut ar) != 0
-                && ffi::lua_getinfo(state, c"Sl".as_ptr(), &mut ar) != 0
-                && std::ffi::CStr::from_ptr(ar.what).to_bytes() != b"C"
-            {
-                line = ar.currentline;
-                break;
-            }
-        }
+        // Where `error` was called from, as Redis's message handler finds
+        // it ([`error_called_from`]): `@user_function` in a library (#1055
+        // review). Called from a chunk of KiviDB's own, the script's line 1.
+        let (source, line) = error_called_from(state).unwrap_or(("@user_script", 1));
         // As mlua will, with a `__tostring` of the table's own too. If that
         // fails, mlua's message is what it failed with.
         ffi::lua_pushcfunction(state, value_tostring);
@@ -4755,7 +4839,7 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
         let msg = bytes(-1);
         let msg = msg.split('\0').next().unwrap_or_default();
         let kept = format!(
-            "{}{TABLE_ERROR_MARK}{line}\u{1}{}",
+            "{}{TABLE_ERROR_MARK}{source}\u{1}{line}\u{1}{}",
             bytes(-2),
             msg.replace(['\r', '\n'], " ")
         );
@@ -4763,17 +4847,17 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
             .try_with(|cell| *cell.borrow_mut() = Some(kept.into()))
             .is_ok()
         {
-            let _ = TABLE_KEPT.try_with(|kept| kept.set(true));
+            let _ = ERROR_KEPT.try_with(|kept| kept.set(true));
         }
         ffi::lua_settop(state, 1);
     }
 }
 
-/// Forget what [`remember_error_table`] kept, if anything. [`TABLE_KEPT`]
+/// Forget what [`remember_error_table`] kept, if anything. [`ERROR_KEPT`]
 /// stays set for what [`remember_error_place`] may have kept; the call's end
 /// clears both ([`with_kept_message`]).
 fn forget_raised_table() {
-    if TABLE_KEPT.try_with(|kept| kept.get()).unwrap_or(false) {
+    if ERROR_KEPT.try_with(|kept| kept.get()).unwrap_or(false) {
         let _ = RAISED_TABLE.try_with(|kept| kept.take());
     }
 }
@@ -4811,7 +4895,7 @@ unsafe extern "C-unwind" fn value_tostring(state: *mut mlua::ffi::lua_State) -> 
 /// What was kept goes either way: it does not outlive the call.
 #[inline]
 fn table_errors<T>(result: LuaResult<T>) -> LuaResult<T> {
-    if !TABLE_KEPT.with(|kept| kept.get()) {
+    if !ERROR_KEPT.with(|kept| kept.get()) {
         return result;
     }
     with_kept_message(result)
@@ -4820,7 +4904,7 @@ fn table_errors<T>(result: LuaResult<T>) -> LuaResult<T> {
 /// [`table_errors`], with something kept.
 #[cold]
 fn with_kept_message<T>(result: LuaResult<T>) -> LuaResult<T> {
-    TABLE_KEPT.with(|kept| kept.set(false));
+    ERROR_KEPT.with(|kept| kept.set(false));
     let table = RAISED_TABLE.with(|kept| kept.take());
     let place = RAISED_PLACE.with(|kept| kept.take());
     let Err(LuaError::RuntimeError(text)) = &result else {
@@ -4889,18 +4973,18 @@ fn redis_lua_runtime_abort_shape(stripped: &str) -> String {
 
 /// `name` is the script's SHA1, or the function's name.
 fn script_error_to_resp(cleaned: &str, name: &str) -> Vec<u8> {
-    if let Some(rest) = cleaned.strip_prefix(TABLE_ERROR_MARK) {
-        let (line, msg) = rest.split_once('\u{1}').unwrap_or(("1", rest));
-        return resp_error(&format!("{msg} script: {name}, on @user_script:{line}."));
+    if cleaned.starts_with(TABLE_ERROR_MARK)
+        && let Some((source, line, msg)) = marked_error(cleaned, TABLE_ERROR_MARK)
+    {
+        return resp_error(&format!("{msg} script: {name}, on {source}:{line}."));
     }
     // An error that says where it happened ([`placed_error`]) or was raised
     // ([`remember_error_place`]): Redis's message handler's form, `ERR`
     // before what Lua says, and the place it left the script from after.
-    if let Some(rest) = cleaned.strip_prefix(PLACE_ERROR_MARK) {
-        let mut parts = rest.splitn(3, '\u{1}');
-        if let (Some(chunk), Some(line), Some(msg)) = (parts.next(), parts.next(), parts.next()) {
-            return resp_error(&format!("ERR {msg} script: {name}, on @{chunk}:{line}."));
-        }
+    if cleaned.starts_with(PLACE_ERROR_MARK)
+        && let Some((source, line, msg)) = marked_error(cleaned, PLACE_ERROR_MARK)
+    {
+        return resp_error(&format!("ERR {msg} script: {name}, on {source}:{line}."));
     }
     if cleaned.starts_with(SCRIPT_COMPILE_ERROR) {
         return resp_error(cleaned);
@@ -5152,17 +5236,14 @@ fn eval_script(
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
 
-    let result = match table_errors(
-        compiled_script(lua, source, lua_body).and_then(|f| f.call::<LuaValue>(())),
+    // The call and the reply made of it under one `table_errors`: nothing
+    // kept while the reply is made outlives the call, and a call that
+    // succeeds reads `ERROR_KEPT` once.
+    let resp = match table_errors(
+        compiled_script(lua, source, lua_body)
+            .and_then(|f| f.call::<LuaValue>(()))
+            .and_then(|v| lua_value_to_resp(lua, v)),
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            *ctx.selected_db = saved_db;
-            return Err(clean_lua_error(&e));
-        }
-    };
-
-    let resp = match lua_value_to_resp(lua, result) {
         Ok(r) => r,
         Err(e) => {
             *ctx.selected_db = saved_db;
@@ -5277,17 +5358,11 @@ fn eval_function_call(
 
     let keys_t: LuaTable = lua.globals().get("KEYS").map_err(|e| e.to_string())?;
     let argv_t: LuaTable = lua.globals().get("ARGV").map_err(|e| e.to_string())?;
-    let result = match table_errors(
-        func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t))),
+    // As in `eval_script`: the call and its reply under one `table_errors`.
+    let resp = match table_errors(
+        func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t)))
+            .and_then(|v| lua_value_to_resp(lua, v)),
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            *ctx.selected_db = saved_db;
-            return Err(clean_lua_error(&e));
-        }
-    };
-
-    let resp = match lua_value_to_resp(lua, result) {
         Ok(r) => r,
         Err(e) => {
             *ctx.selected_db = saved_db;
