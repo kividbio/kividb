@@ -1196,7 +1196,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         // Overwrites bytes at a given offset, zero-padding if needed.
         // Creates the key if it doesn't exist (treats it as empty string).
         // Written where the string is kept when nothing else holds it and its
-        // block has room; otherwise copied once (`edit_str_in_place`).
+        // block has room; otherwise copied once (`edit_str_in_place`). A
+        // string written from its end on grows as an `APPEND` grows it
+        // (`append_after`).
         "SETRANGE" => {
             if cmd.len() != 4 {
                 return Some(resp_error(
@@ -1228,9 +1230,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            let len = match map.get(key) {
-                None => 0,
-                Some(ValueRef::String(v)) => v.len(),
+            let (len, found) = match map.get(key) {
+                None => (0, false),
+                Some(ValueRef::String(v)) => (v.len(), true),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -1238,25 +1240,49 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             };
             // Nothing to write: the string is as it was, and a key that was
-            // not there is not created. Checked here because the helper
-            // grows the string to `offset` even for an empty patch. Not a
+            // not there is not created. Checked here because the helpers
+            // grow the string to `offset` even for an empty patch. Not a
             // write, as in Redis: nothing propagated or counted, and no
             // `WATCH` broken.
             if patch.is_empty() {
                 ctx.skip_write_side_effects = true;
                 return Some(resp_integer(len as i64));
             }
-            let Some(written) = map.edit_str_in_place(key, offset, patch) else {
-                // Not reached: the key was a string or absent under this
-                // lock, and the length was checked above.
-                return Some(resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                ));
+            let (new_len, written) = if found && offset >= len {
+                // From its end on, the string grows as an `APPEND` grows it:
+                // in the room its block keeps, else its block grown, or
+                // copied once if something else holds it, with room for the
+                // next. A key made here is made at its length, and a patch
+                // that starts inside the string is an edit.
+                match map.append_after(key, offset - len, patch, MAX_STRING_LEN) {
+                    Ok(grown) => grown,
+                    // Neither is reached: the key is a string under this
+                    // lock, and the length was checked above.
+                    Err(store::AppendRefused::TooLong) => {
+                        return Some(resp_error(
+                            "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+                        ));
+                    }
+                    Err(store::AppendRefused::WrongType) => {
+                        return Some(resp_error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        ));
+                    }
+                }
+            } else {
+                let Some(written) = map.edit_str_in_place(key, offset, patch) else {
+                    // Not reached: the key was a string or absent under this
+                    // lock, and the length was checked above.
+                    return Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
+                };
+                (len.max(offset + patch.len()), written)
             };
             drop(map);
             // A copied string's old entry is freed with the shard unlocked.
             drop(written);
-            Some(resp_integer(len.max(offset + patch.len()) as i64))
+            Some(resp_integer(new_len as i64))
         }
 
         // ── GETEX ─────────────────────────────────────────────────────────────────────
@@ -2492,9 +2518,10 @@ mod setrange_tests {
     }
 
     /// Growth stays where the string is while its block keeps its class,
-    /// the gap zero-filled; past the class, or for a block of the system
-    /// allocator's, the string is copied once into a new block, zero-filled
-    /// the same way.
+    /// the gap zero-filled. A patch that starts inside the string and runs
+    /// past its block copies it once into a new block; one from its end on
+    /// grows a block of the system allocator's as an `APPEND` does, by a
+    /// quarter (moved only if the allocator must), not copied.
     #[test]
     fn a_setrange_grows_in_place_only_within_its_block() {
         counting(
@@ -2511,6 +2538,7 @@ mod setrange_tests {
                     (16 << 10, top, true),
                     (top, top + 1, false),
                     (64 << 10, (64 << 10) + 1, false),
+                    (64 << 10, (64 << 10) + 10, false),
                     (1 << 20, (1 << 20) + 10, false),
                 ] {
                     let store = store::new_store(1);
@@ -2524,10 +2552,16 @@ mod setrange_tests {
                     value.extend_from_slice(b"ab");
                     let (now, moved_to) = stored(&store, b"k").unwrap();
                     assert_eq!(now, value, "{len}");
-                    assert_eq!(moved_to == at, stays, "{len}");
+                    let from_end = end - 2 >= len;
                     if stays {
+                        assert_eq!(moved_to, at, "{len}");
                         assert!(peak < SMALL, "{len}: {peak} bytes");
+                    } else if from_end && slab(len).is_none() {
+                        // The block grown by its room: no copy allocated.
+                        let most = (end / 4 + 2) as isize + SMALL;
+                        assert!(peak < most, "{len} to {end}: {peak}");
                     } else {
+                        assert_ne!(moved_to, at, "{len}");
                         let most = (end + end / 2) as isize + SMALL;
                         assert!(peak >= len as isize && peak < most, "{len}: {peak}");
                     }
@@ -2744,5 +2778,213 @@ mod setrange_tests {
                 _ => panic!("{key} not in the image"),
             }
         }
+    }
+
+    /// Through the dispatcher, a `SETRANGE` that grows a string from its
+    /// end (by growing its block, in its room, or copied from a holder)
+    /// breaks a `WATCH` on its key and announces `setrange`, and the holder
+    /// keeps the bytes it held. Alone: the event flags are the process's.
+    #[test]
+    fn a_setrange_grown_from_the_end_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::strings::setrange_tests::a_setrange_grown_from_the_end_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                let len = 64 << 10;
+                put(&store, b"k", &pattern(len));
+                let mut want = pattern(len);
+                for (gap, held) in [(5, false), (0, false), (3, true)] {
+                    let shard = store::get_shard(&store[0], b"k");
+                    let held = held.then(|| shard.read().get_ref(b"k"));
+                    let before = want.clone();
+                    let broken = Arc::new(AtomicBool::new(false));
+                    watches.watch(0, b"k", Arc::clone(&broken), false);
+                    events::hold();
+                    let offset = want.len() + gap;
+                    let line = format!("SETRANGE k {offset} ab");
+                    let reply = dispatched(&store, &line, &watches);
+                    let announced = events::release();
+                    want.resize(offset, 0);
+                    want.extend_from_slice(b"ab");
+                    let case = format!("{line:?}, held: {}", held.is_some());
+                    assert_eq!(reply, resp_integer(want.len() as i64), "{case}");
+                    assert_eq!(stored(&store, b"k").unwrap().0, want, "{case}");
+                    assert!(broken.load(Relaxed), "{case}: the watch");
+                    let want_events: Vec<(Vec<u8>, Arc<[u8]>)> = vec![
+                        (b"__keyspace@0__:k".to_vec(), Arc::from(&b"setrange"[..])),
+                        (b"__keyevent@0__:setrange".to_vec(), Arc::from(&b"k"[..])),
+                    ];
+                    assert_eq!(announced, want_events, "{case}: the events");
+                    if let Some(Some(entry)) = &held {
+                        let kept =
+                            matches!(entry.value(), ValueRef::String(b) if b[..] == before[..]);
+                        assert!(kept, "{case}: the holder's bytes");
+                    }
+                }
+            },
+        );
+    }
+
+    /// How many of the calls that grow a string from `from` to `to` bytes
+    /// may allocate when growth leaves a quarter more room each time (as
+    /// `shared_bytes::room_for_append` does under 64 MiB): one per growth
+    /// of the block.
+    fn growths(from: usize, to: usize) -> usize {
+        ((to as f64 / from as f64).ln() / 1.25f64.ln()).ceil() as usize + 1
+    }
+
+    /// `SETRANGE`s from the end of a string with a block of its own grow it
+    /// as `APPEND`s do: a call that allocates grows the block by a quarter
+    /// (the allocator moves it if it must), and the calls after it write in
+    /// that room. No call allocates a second whole copy, and a gap before
+    /// the patch is zero-filled.
+    #[test]
+    fn setranges_from_the_end_of_a_large_string_grow_it_in_its_room() {
+        counting(
+            "commands::strings::setrange_tests::setranges_from_the_end_of_a_large_string_grow_it_in_its_room",
+            || {
+                for len in [64 << 10, 1 << 20, 64 << 20] {
+                    for gap in [0, 4095] {
+                        let store = store::new_store(1);
+                        let mut value = pattern(len);
+                        put(&store, b"k", &value);
+                        let mut allocating = 0;
+                        for _ in 0..100 {
+                            let offset = value.len() + gap;
+                            let line = format!("SETRANGE k {offset} x");
+                            let (reply, skipped, peak) = counted(&store, &line);
+                            value.resize(offset, 0);
+                            value.push(b'x');
+                            let case = format!("{len} +{gap}");
+                            assert_eq!(
+                                (reply, skipped),
+                                (resp_integer(value.len() as i64), false),
+                                "{case}"
+                            );
+                            if peak >= SMALL {
+                                allocating += 1;
+                                // The block grown by its room, not copied.
+                                let most = value.len() / 4 + gap + 1;
+                                assert!(peak < most as isize + SMALL, "{case}: {peak}");
+                            }
+                        }
+                        let most = growths(len, value.len());
+                        assert!(allocating <= most, "{len} +{gap}: {allocating} > {most}");
+                        assert_eq!(stored(&store, b"k").unwrap().0, value, "{len} +{gap}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// Held by a snapshot (the entry) or a reply (the bytes), a string a
+    /// `SETRANGE` grows from its end is copied once, into a block with
+    /// room, and the holder keeps the bytes it held; the growths after it
+    /// write in that room while the holder still holds the old bytes.
+    /// Alone: it holds over 300 MB at once, more than the process's count
+    /// may move by while `memory_use`'s tests run beside it.
+    #[test]
+    fn a_held_string_grown_from_its_end_is_copied_once() {
+        alone(
+            "commands::strings::setrange_tests::a_held_string_grown_from_its_end_is_copied_once",
+            || {
+                for len in [64 << 10, 64 << 20] {
+                    for holder in [Holder::Entry, Holder::Bytes] {
+                        let store = store::new_store(1);
+                        let mut value = pattern(len);
+                        put(&store, b"k", &value);
+                        let shard = store::get_shard(&store[0], b"k");
+                        let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                        let bytes =
+                            (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                                Some(ValueRef::String(b)) => b.to_shared(),
+                                _ => panic!("no string"),
+                            });
+                        let case = format!("{len} {holder:?}");
+                        let mut peaks = vec![];
+                        for _ in 0..10 {
+                            let line = format!("SETRANGE k {} ab", value.len());
+                            let (reply, _, peak) = counted(&store, &line);
+                            value.extend_from_slice(b"ab");
+                            assert_eq!(reply, resp_integer(value.len() as i64), "{case}");
+                            peaks.push(peak);
+                        }
+                        // One copy, with an append's room: a quarter more.
+                        let most = (len + len / 4) as isize + 64 + SMALL;
+                        assert!(
+                            peaks[0] >= len as isize && peaks[0] < most,
+                            "{case}: {peaks:?}"
+                        );
+                        assert!(peaks[1..].iter().all(|&p| p < SMALL), "{case}: {peaks:?}");
+                        assert_eq!(stored(&store, b"k").unwrap().0, value, "{case}");
+                        if let Some(Some(entry)) = &entry {
+                            let kept = matches!(entry.value(), ValueRef::String(b) if b[..] == pattern(len)[..]);
+                            assert!(kept, "{case}");
+                        }
+                        if let Some(bytes) = &bytes {
+                            assert!(bytes[..] == pattern(len)[..], "{case}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// A `SETRANGE` that makes its key allocates the string at its length,
+    /// as Redis's `sdsnewlen` does: no room is kept for growth nobody asked
+    /// for.
+    #[test]
+    fn a_setrange_on_a_missing_key_keeps_no_room() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_on_a_missing_key_keeps_no_room",
+            || {
+                for offset in [64 << 10, 64 << 20] {
+                    let store = store::new_store(1);
+                    // The table made first: only the string is counted.
+                    put(&store, b"other", b"v");
+                    let line = format!("SETRANGE m {offset} x");
+                    let (reply, _, peak) = counted(&store, &line);
+                    assert_eq!(reply, resp_integer(offset as i64 + 1));
+                    assert!(
+                        peak >= offset as isize && peak < offset as isize + SMALL,
+                        "{offset}: {peak}"
+                    );
+                }
+            },
+        );
+    }
+
+    /// A key's time to live stays across growth from the end, in the room
+    /// and copied from a holder.
+    #[test]
+    fn a_setrange_grown_from_the_end_keeps_the_time_to_live() {
+        let store = store::new_store(1);
+        let later = crate::commands::helpers::now_ms() + 3_600_000;
+        let len = 1 << 20;
+        let shard = store::get_shard(&store[0], b"k");
+        drop(
+            shard
+                .write()
+                .insert_str_expiring(b"k", pattern(len), Some(later)),
+        );
+        let held = shard.read().get_ref(b"k");
+        assert_eq!(
+            run(&store, &format!("SETRANGE k {len} a")).0,
+            resp_integer(len as i64 + 1)
+        );
+        drop(held);
+        assert_eq!(
+            run(&store, &format!("SETRANGE k {} b", len + 5)).0,
+            resp_integer(len as i64 + 6)
+        );
+        assert_eq!(shard.read().expires(b"k"), Some(later));
+        let mut want = pattern(len);
+        want.extend_from_slice(b"a\0\0\0\0b");
+        assert_eq!(stored(&store, b"k").unwrap().0, want);
     }
 }
