@@ -2434,6 +2434,13 @@ end
     let compat51 = super::lua_compat51::prepare(&lua).unwrap();
     lua.globals().set("__kividb_compat51", compat51).unwrap();
 
+    // What the sandbox's `setmetatable` wraps a script's `__gc` in, so that a
+    // finalizer is known as one in a coroutine it starts too (`counted_gc`);
+    // the final setup below takes it.
+    // SAFETY: `make_counted_gc` keeps to the rules of a Lua C function.
+    let counted = unsafe { lua.create_c_function(make_counted_gc) }.unwrap();
+    lua.globals().set("__kividb_counted_gc", counted).unwrap();
+
     // `string.format` with Lua 5.1's integer conversions, as Redis's
     // scripts have them (#747): a patched copy of the library's own
     // `str_format` (#771), see [`super::lua_format`].
@@ -2469,6 +2476,12 @@ end
 -- The function that makes the Lua 5.1 library functions (see lua_compat51.rs).
 local _compat51 = __kividb_compat51
 __kividb_compat51 = nil
+
+-- What a script's `__gc` is wrapped in (`counted_gc` in lua.rs), and the
+-- wrapped ones, so that none is wrapped twice.
+local _counted_gc = __kividb_counted_gc
+__kividb_counted_gc = nil
+local _gc_counted = setmetatable({}, { __mode = "k" })
 
 -- cjson state globals and the array metatable.
 local _guard = {}
@@ -2620,9 +2633,21 @@ _setmetatable(_globals_mt, {
     end,
 })
 
+local _type, _rawget, _rawset = type, rawget, rawset
+
 function setmetatable(t, mt)
     if t == _G_ref then
         error("Attempt to modify a readonly table", 2)
+    end
+    -- A `__gc` runs counted, so that a coroutine it starts is known to be
+    -- in a finalizer too (`counted_gc`, #1058 review).
+    if _type(mt) == "table" then
+        local gc = _rawget(mt, "__gc")
+        if _type(gc) == "function" and not _gc_counted[gc] then
+            gc = _counted_gc(gc)
+            _gc_counted[gc] = true
+            _rawset(mt, "__gc", gc)
+        end
     end
     return _setmetatable(t, mt)
 end
@@ -4376,18 +4401,38 @@ fn place_prefix(message: &str) -> Option<(&'static str, &str, &str)> {
 /// without what Lua 5.4 adds after it (`(local 't')`, `(field 'x')`), as
 /// [`normalize_redis_eval_nil_index_error`] has it: Redis's suite matches
 /// `*attempt to index a nil value script*`. The same error reads the same,
-/// raised where it happened or caught and raised again (#1055 review).
+/// raised where it happened or caught and raised again (#1055 review). Only
+/// Lua's note is taken off ([`is_lua_variable_note`]): a message a script
+/// wrote itself, `attempt to index a nil value: bad key x`, stays whole, as
+/// Redis replies it (#1058 review).
 fn index_nil_trimmed(message: &str) -> &str {
     const NIL_INDEX: &str = "attempt to index a nil value";
     let mut rest = message;
     while let Some((_, _, after)) = place_prefix(rest) {
         rest = after;
     }
-    if rest.starts_with(NIL_INDEX) {
-        &message[..message.len() - rest.len() + NIL_INDEX.len()]
-    } else {
-        message
+    match rest.strip_prefix(NIL_INDEX) {
+        Some(note) if note.is_empty() || is_lua_variable_note(note) => {
+            &message[..message.len() - note.len()]
+        }
+        _ => message,
     }
+}
+
+/// What Lua 5.4 puts after a type error to name what it was used as, and
+/// all that follows: ` (local 't')`, ` (global 'x')`, ` (field 'k')`,
+/// ` (upvalue 'u')`, ` (method 'm')`, ` (constant 'c')`.
+fn is_lua_variable_note(note: &str) -> bool {
+    let Some(inner) = note.strip_prefix(" (").and_then(|n| n.strip_suffix("')")) else {
+        return false;
+    };
+    ["local", "global", "field", "upvalue", "method", "constant"]
+        .into_iter()
+        .any(|kind| {
+            inner
+                .strip_prefix(kind)
+                .is_some_and(|r| r.starts_with(" '"))
+        })
 }
 
 /// A Lua error that says where in the script it happened (`user_script:3:
@@ -4815,13 +4860,12 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
         match ffi::lua_rawget(state, 1) {
             ffi::LUA_TSTRING => {}
             ffi::LUA_TNUMBER => {
-                let mut integer = 0;
-                let n = ffi::lua_tointegerx(state, -1, &mut integer);
-                if integer != 0 {
-                    ffi::lua_pushfstring(state, c"%I".as_ptr(), n);
-                } else {
-                    ffi::lua_pushfstring(state, c"%f".as_ptr(), ffi::lua_tonumber(state, -1));
-                }
+                // As Lua 5.1 writes it, and so Redis (`lua51_number`): `-0`,
+                // `1e+15`, `1.2345678901234e+14`, in a buffer that needs no
+                // drop if the push fails (#1058 review).
+                let mut buf = [0u8; LUA51_NUMBER_BUF];
+                let written = lua51_number(ffi::lua_tonumber(state, -1), &mut buf);
+                ffi::lua_pushlstring(state, written.as_ptr().cast(), written.len());
                 ffi::lua_replace(state, -2);
             }
             _ => {
@@ -4862,9 +4906,55 @@ fn forget_raised_table() {
     }
 }
 
-/// Whether a `__gc` metamethod is on the stack.
+thread_local! {
+    /// How many `__gc` functions a script set are running on this thread
+    /// ([`counted_gc`]). A coroutine one of them starts runs in its
+    /// finalizer too, with no `__gc` on its own stack (#1058 review).
+    static FINALIZER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A script's `__gc`, the closure's upvalue, run with [`FINALIZER_DEPTH`]
+/// up. What it raises is raised again once the depth is back down.
+unsafe extern "C-unwind" fn counted_gc(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        let args = ffi::lua_gettop(state);
+        ffi::luaL_checkstack(state, 1, std::ptr::null());
+        ffi::lua_pushvalue(state, ffi::lua_upvalueindex(1));
+        ffi::lua_insert(state, 1);
+        let _ = FINALIZER_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
+        let status = ffi::lua_pcall(state, args, 0, 0);
+        let _ = FINALIZER_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+        if status != ffi::LUA_OK {
+            ffi::lua_error(state);
+        }
+        0
+    }
+}
+
+/// `__kividb_counted_gc(f)`, for the sandbox's `setmetatable`: `f` as a
+/// [`counted_gc`].
+unsafe extern "C-unwind" fn make_counted_gc(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
+    use mlua::ffi;
+    unsafe {
+        ffi::luaL_checktype(state, 1, ffi::LUA_TFUNCTION);
+        ffi::lua_settop(state, 1);
+        ffi::lua_pushcclosure(state, counted_gc, 1);
+        1
+    }
+}
+
+/// Whether a finalizer is running: a `__gc` a script set, counted
+/// ([`FINALIZER_DEPTH`]), whatever thread it started, or a `__gc` metamethod
+/// on this thread's stack (one set some other way).
 unsafe fn in_finalizer(state: *mut mlua::ffi::lua_State) -> bool {
     use mlua::ffi;
+    if FINALIZER_DEPTH
+        .try_with(|depth| depth.get() > 0)
+        .unwrap_or(false)
+    {
+        return true;
+    }
     unsafe {
         let mut ar: ffi::lua_Debug = std::mem::zeroed();
         let mut level = 0;
