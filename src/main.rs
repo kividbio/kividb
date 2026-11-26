@@ -1957,7 +1957,8 @@ async fn async_main_tokio(
     );
     start_configured_replication(&config, &cluster_state, &replica_starter);
 
-    // ONE listener — tokio's multi-thread runtime handles distribution
+    // ONE listener; each connection it accepts goes to a worker runtime of
+    // its own (`conn_runtimes`).
     // Port 0: none, until `CONFIG SET port` opens one.
     let listener = match listener_early {
         Some(l) => Some(l),

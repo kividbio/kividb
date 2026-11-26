@@ -660,6 +660,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **On the tokio loop each plaintext connection stays on one worker (#1015).**
+  The tokio I/O model (`--io-model tokio`, and `auto` where io_uring is not
+  there: kernels before 5.1, Docker's default seccomp profile) runs its
+  plaintext client connections on `--threads` runtimes of one worker thread
+  each, a connection on the one with the fewest when it is accepted. A worker
+  waits on its own connections' sockets only, so a request that comes while
+  it waits wakes that worker alone, and no worker wakes another to hand it
+  part of what one wait returned. A long command still hands the worker's
+  other connections to another thread, which serves them meanwhile. TLS
+  connections, the accept loop and the background tasks stay where they
+  were. Measured with `@keyv/redis`'s benchmark (48 connections, each waiting
+  for every reply; server on 4 CPUs, client on 4 others, all in Docker, on an
+  8-vCPU AWS host with Linux 4.14): `--threads 8` from 134,900-136,500 to
+  170,300-171,100 operations a second (Redis 8.10.2: 162,100-164,000),
+  `--threads 2` 3.9-5.0 % up, `--threads 4` -1.7 % to +4.1 % by run (2.0 %
+  on average, with 10 % less server CPU), `--threads 1` level; at 500
+  connections `--threads 4` -0.3 % to +7.2 %, `--threads 2` -2.3 % to
+  +0.2 %, `--threads 8` -3.0 % and +1.0 %. Pipelined (`redis-benchmark`
+  `-P 16`, 50 connections, 1 KB) is level or up to 4 %, and an idle server
+  uses what it did (0.13 % of a CPU).
+
 - **Rows with equal `SORTBY` values come in the order their documents were
   written, as in Redis (#1043).** `SORTBY … ASC` gives documents with the
   same value first written first, and `DESC` the reverse; documents without
