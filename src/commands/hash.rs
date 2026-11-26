@@ -406,7 +406,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
             let field: &[u8] = cmd[2];
-            let incr: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let incr: i64 = match crate::commands::login::strict_integer(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -420,7 +420,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let result = match write_hash(ctx, key, |fields, _expiries| {
                 let current: i64 = match fields.get(field) {
                     None => 0,
-                    Some(v) => match std::str::from_utf8(&v).ok().and_then(|s| s.parse().ok()) {
+                    Some(v) => match crate::commands::login::strict_integer(&v) {
                         Some(n) => n,
                         None => return Err(resp_error("ERR hash value is not an integer")),
                     },
