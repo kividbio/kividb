@@ -1138,11 +1138,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            let end: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let end: i64 = match strict_i64(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -1204,7 +1204,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let offset: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse::<i64>().ok()) {
+            let offset: usize = match strict_i64(cmd[2]) {
                 Some(n) if n >= 0 => n as usize,
                 Some(_) => return Some(resp_error("ERR offset is out of range")),
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
