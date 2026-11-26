@@ -998,7 +998,7 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   allocator may do by moving it, and a string held elsewhere is copied
   once, each into a block with room for a quarter more, at most 16 MiB.
   Before this change such a `SETRANGE` copied a string of more than
-  26,208 bytes whole on every call. A key `SETRANGE` makes is made at its
+  26,208 bytes whole on every call. A missing key is made at its
   length, and a value that starts inside the string is written as
   before. The room is allocated memory: `used_memory`, `maxmemory` and
   `MEMORY USAGE` count it. Replies, time to live, `WATCH`, keyspace

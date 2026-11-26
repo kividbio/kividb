@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """#1016: writes to a large string cost the same whatever its length.
 
-Three changes of 1.3.0 make a command on a long string cost what the bytes
+Four changes of 1.3.0 make a command on a long string cost what the bytes
 it touches cost, not what the string's length does: #1027 reads a bit or a
 field where the string is kept (a `SETBIT` that leaves the bit as it is, a
 `BITFIELD` with only `GET`s), #1031 writes a `SETBIT` that changes a bit in
-place when nothing but its key holds the string, and #1016's `APPEND`
+place when nothing but its key holds the string, #1016's `APPEND`
 writes in place too, a long string keeping room for the next appends
 (a quarter of its length, at most 16 MiB) and growing by `realloc` when it
-has none left. In v1.2.2 each of these copied the whole string, twice for
-a `SETBIT` that changed a bit.
+has none left, and #1065 grows a string a `SETRANGE` writes at or past its
+end as an `APPEND` does. In v1.2.2 each of these copied the whole string,
+twice for a `SETBIT` that changed a bit.
 
 Dataset, one server, one key per case: a string of 64 MiB (`SETRANGE k
 67108863 a`: zero bytes and an `a`), made afresh for each case.
@@ -23,13 +24,17 @@ warm-up of a few calls; 3 rounds, the median of them (candidate and Redis:
   setbit_change   SETBIT k <bit> 1, then SETBIT k <bit> 0, by turns
   append_3b       APPEND k abc
   append_1k       APPEND k <1,024 bytes>
+  setrange_grow   SETRANGE k <length> abc (at the string's end)
+  setrange_gap    SETRANGE k <length + 1,024> abc (1,024 zero bytes before it)
 
 Each emits `<case>_srv_us`, the server's own microseconds a call (`INFO
 commandstats`, reset before each round), and `<case>_us`, the client's wall
 time a call, round trip included. `bad_replies` counts replies that are not
 what the case makes them (0 for the no-op `SETBIT`, `[0]` for the field,
-the old bit, the new length); `append_3b_strlen` and `append_1k_strlen` are
-the lengths the appends end at.
+the old bit, the new length); `append_3b_strlen`, `append_1k_strlen`,
+`setrange_grow_strlen` and `setrange_gap_strlen` are the lengths the strings
+end at. Every `SETRANGE` writes from the end its key's string has then, so
+each call grows it, and none makes the key or writes inside the string.
 
 Gates, all in the same session, with large fixed margins rather than
 recorded values: every `<case>_srv_us` at most 0.01x v1.2.2's (at least
@@ -38,7 +43,7 @@ microsecond or two, so the margin is a thousandfold); every `<case>_us`
 at most 0.05x v1.2.2's (the round trip, about 50 us from Python, bounds
 what can be seen) and at most 2x Redis's. The server times are not gated
 against Redis's: both are around a microsecond, and the server clock counts
-whole microseconds. `bad_replies` exactly 0, and the two lengths as
+whole microseconds. `bad_replies` exactly 0, and the four lengths as
 recorded (they follow from the call counts).
 """
 import os
@@ -54,8 +59,10 @@ S = Suite("53-large-string-writes", [
 LEN = 64 << 20
 ROUNDS = 3
 WARM = 3
-CASES = ["setbit_noop", "bitfield_get", "setbit_change", "append_3b", "append_1k"]
+CASES = ["setbit_noop", "bitfield_get", "setbit_change", "append_3b", "append_1k",
+         "setrange_grow", "setrange_gap"]
 KILO = b"x" * 1024
+GAP = 1024
 
 
 def calls_for(ctx):
@@ -84,6 +91,12 @@ def plan(case, key, length):
         return (lambda i: (["BITFIELD", key, "GET", "u8", LEN // 2], [0])), "bitfield"
     if case == "setbit_change":
         return (lambda i: (["SETBIT", key, bit, 1 - i % 2], i % 2)), "setbit"
+    if case.startswith("setrange"):
+        # Call i writes at the end calls 0..i-1 left, after the gap.
+        gap = GAP if case == "setrange_gap" else 0
+        step = gap + 3
+        return (lambda i: (["SETRANGE", key, length + step * i + gap, "abc"],
+                           length + step * (i + 1))), "setrange"
     step = 3 if case == "append_3b" else 1024
     extra = b"abc" if case == "append_3b" else KILO
     return (lambda i: (["APPEND", key, extra], length + step * (i + 1))), "append"
@@ -122,7 +135,7 @@ def run(ctx):
         ctx.raw["cases"][case] = {"wall_us": wall, "server_us": server, "strlen": c.strlen(key)}
         ctx.emit(case + "_srv_us", median(server), "us", "lower", gate=vs_v1_2_2(0.01), samples=server)
         ctx.emit(case + "_us", median(wall), "us", "lower", gate=gate_wall, samples=wall)
-        if case.startswith("append"):
+        if case.startswith(("append", "setrange")):
             ctx.emit(case + "_strlen", c.strlen(key), "bytes", "higher", gate=EXACT)
         c.delete(key)
     ctx.emit("bad_replies", bad, "replies", "lower", gate=EXACT)
