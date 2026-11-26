@@ -677,10 +677,26 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`error` reads a number as Lua 5.1 does (#1054).** Raised with a level,
   a number gets the place before it, as a string does, and is written
   `%.14g`, as Redis's Lua writes it: `error(42)` on line 2 is
-  `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`.
-  What a script catches is what it would catch in Redis: `pcall(error, 42)`
+  `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`;
+  `error(10/2, 0)` replies `ERR 5`. What a script catches is what it would catch in Redis: `pcall(error, 42)`
   gives the string `"42"`, where it gave the number; `pcall(error, 42, 0)`
   still gives the number.
+
+- **`error` of a value that is not a string replies it with no place of its
+  own (#1054).** `error(nil)`, `error(true)`, `error(false)`, `error()` and
+  `error(42, 0)` reply `ERR nil`, `ERR true`, `ERR false`, `ERR nil` and
+  `ERR 42`, then `script: <sha>, on @user_script:N.` with the line they
+  were raised on, as in Redis; they replied `ERR user_script:1: nil …`
+  whatever the line. Inside `coroutine.wrap`, `N` is the line in the
+  coroutine, where Redis names the line of the call: Lua 5.4's `wrap`
+  places a string only and raises anything else as it is (Redis's, Lua
+  5.1's, places a number too, so that `error(42, 0)` there replies
+  `ERR user_script:4: 42 …`).
+
+- **A nil index error reads `attempt to index a nil value` however it is
+  raised (#1054).** Caught and raised again with `error(e, 0)`, it replied
+  the whole of Lua 5.4's message (`attempt to index a nil value (local
+  't')`); it is cut now as the one raised where it happened is.
 
 - **A function library's lines are counted from its `#!lua` line, under
   Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
@@ -2564,7 +2580,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `EVAL`'d script that does not compile is reported as `SCRIPT LOAD`
   reports it, `Error compiling script (new function): user_script:N: …`,
   where it said `user_script:1` whatever the line. `error(nil)`,
-  `error(true)` and `error(42, 0)` name the line they were raised on.
+  `error(true)`, `error(false)`, `error()` and `error(42, 0)` name the line
+  they were raised on.
   `FCALL` names `user_function` and the function, a table error too.
 
 - **`CONFIG REWRITE` writes every setting the server runs with, and no
