@@ -1433,8 +1433,7 @@ fn a_hash_that_gets_its_first_field_ttl_mid_growth_is_still_finished() {
 }
 
 /// Snapshot capture and full sync keep values while writes replace their
-/// arrays. Exercise chunk-slab arrays and the larger aligned fallback,
-/// including frees on a different worker from the one that allocated them.
+/// arrays. Exercise chunk-slab arrays and the larger padded fallback.
 #[test]
 fn saving_and_full_sync_keep_hashes_that_grow_and_shrink() {
     use std::sync::Arc;
