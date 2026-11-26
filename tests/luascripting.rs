@@ -4170,6 +4170,14 @@ fn fcall_error_of_a_value_that_is_not_a_string_names_user_function() {
     );
 }
 
+/// `error('boom', 0)` on line 2, unwinding through a `<close>` that collects
+/// and so runs what a call before it left to finalize, then starts the
+/// collector again. That call stops it (`collectgarbage('stop')`): a step
+/// that collected its object sooner would leave nothing to test.
+const RAISE_WHILE_COLLECTING: &str = "local c <close> = setmetatable({}, {__close = function() \
+                                      collectgarbage('collect') collectgarbage('restart') end})\n\
+                                      error('boom', 0)";
+
 /// A finalizer that raises while another call's error unwinds (a `<close>`
 /// collects then) leaves the place that call kept.
 #[test]
@@ -4179,19 +4187,18 @@ fn a_finalizer_raising_during_another_call_leaves_its_place() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let raise = "local c <close> = setmetatable({}, \
-                 {__close = function() collectgarbage('collect') end})\n\
-                 error('boom', 0)";
     for raised in ["error(nil)", "error(42, 0)", "error(true)"] {
-        let leave =
-            format!("local t = setmetatable({{}}, {{__gc = function() {raised} end}}) return 1");
+        let leave = format!(
+            "collectgarbage('stop') \
+             local t = setmetatable({{}}, {{__gc = function() {raised} end}}) return 1"
+        );
         assert!(
             matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
             "{raised}"
         );
         assert_script_error(
             &mut c,
-            raise,
+            RAISE_WHILE_COLLECTING,
             &["0"],
             "ERR boom script: {sha}, on @user_script:2.",
         );
@@ -4305,12 +4312,6 @@ fn a_coroutine_in_a_finalizer_leaves_another_call_s_place() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    // The collector is stopped until the `<close>` collects, while `boom`
-    // unwinds: a step that collected `t` before that would leave nothing
-    // to test.
-    let raise = "local c <close> = setmetatable({}, {__close = function() \
-                 collectgarbage('collect') collectgarbage('restart') end})\n\
-                 error('boom', 0)";
     for raised in ["error('inner', 0)", "error(nil)"] {
         let leave = format!(
             "collectgarbage('stop') local t = setmetatable({{}}, {{__gc = function() \
@@ -4322,7 +4323,7 @@ fn a_coroutine_in_a_finalizer_leaves_another_call_s_place() {
         );
         assert_script_error(
             &mut c,
-            raise,
+            RAISE_WHILE_COLLECTING,
             &["0"],
             "ERR boom script: {sha}, on @user_script:2.",
         );
@@ -4339,9 +4340,6 @@ fn a_coroutine_in_a_gc_set_later_leaves_another_call_s_place() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let raise = "local c <close> = setmetatable({}, {__close = function() \
-                 collectgarbage('collect') collectgarbage('restart') end})\n\
-                 error('boom', 0)";
     for started in [
         "coroutine.wrap(function() error('inner', 0) end)()",
         "coroutine.resume(coroutine.create(function() error('inner', 0) end))",
@@ -4357,7 +4355,7 @@ fn a_coroutine_in_a_gc_set_later_leaves_another_call_s_place() {
         );
         assert_script_error(
             &mut c,
-            raise,
+            RAISE_WHILE_COLLECTING,
             &["0"],
             "ERR boom script: {sha}, on @user_script:2.",
         );
