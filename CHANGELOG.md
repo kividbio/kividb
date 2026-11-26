@@ -660,6 +660,30 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A script's error reply begins `ERR`, as in Redis (#1054).** Redis
+  makes `ERR` and the message of whatever a script raises with `error`.
+  `error('MYERR bad')` replied `-MYERR bad`, and now replies
+  `-ERR user_script:1: MYERR bad script: <sha>, on @user_script:1.`;
+  `error('MYERR bad', 0)` replies `-ERR MYERR bad script: …`, and a
+  `redis.call` error caught and raised again with `error(e, 0)` replies
+  `-ERR ERR value is not an integer or out of range script: …`. A client
+  that reads such a reply's code reads `ERR` now. `redis.error_reply` and
+  `error({err = ...})` keep the code they give.
+
+- **A script's error counts in `errorstat_ERR` and `total_error_replies`,
+  once, as in Redis (#1054).** A runtime error such as `attempt to perform
+  arithmetic on a nil value` was not counted at all.
+
+- **`error` reads a number as Lua 5.1 does (#1054).** Raised with a level,
+  a number gets the place before it, as a string does: `error(42)` on
+  line 2 is `user_script:2: 42`. What a script catches is what it would
+  catch in Redis: `pcall(error, 42)` gives the string `"42"`, where it gave
+  the number; `pcall(error, 42, 0)` still gives the number.
+
+- **A function library's lines are counted from its `#!lua` line, under
+  Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
+  `user_function:4:` where it said `library:3:`.
+
 - **Rows with equal `SORTBY` values come in the order their documents were
   written, as in Redis (#1043).** `SORTBY … ASC` gives documents with the
   same value first written first, and `DESC` the reverse; documents without
@@ -2529,6 +2553,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **A script's error says where in the script it happened, as in Redis
+  (#1054).** A runtime error keeps the `user_script:N:` Lua gives it, and
+  its reply ends `script: <sha>, on @user_script:N.`, `N` being the line
+  it left the script from. An `EVAL`'d script that does not compile is
+  reported as `SCRIPT LOAD` reports it, `Error compiling script (new
+  function): user_script:N: …`, where it said `user_script:1` whatever the
+  line. `FCALL` names `user_function` and the function.
 
 - **`CONFIG REWRITE` writes every setting the server runs with, and no
   `replicaof` after `REPLICAOF NO ONE`.** It writes each setting
