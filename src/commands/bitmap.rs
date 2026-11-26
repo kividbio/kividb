@@ -382,59 +382,49 @@ fn cmd_bitpos(ctx: &mut Ctx) -> Vec<u8> {
     drop(map);
 
     let len = bytes.len() as i64;
+    let total = if bit_mode { len * 8 } else { len };
+    let mut start = start_byte;
+    let mut end = if end_given { end_byte } else { total - 1 };
+
+    if start < 0 {
+        start += total;
+    }
+    if end < 0 {
+        end += total;
+    }
+    if start < 0 {
+        start = 0;
+    }
+    if end < 0 {
+        end = 0;
+    }
+    if end >= total {
+        end = total - 1;
+    }
+    if start > end {
+        return resp_integer(-1);
+    }
 
     if bit_mode {
         // BIT mode: indices are bit positions
-        let total_bits = len * 8;
-        let s = if start_byte < 0 {
-            (total_bits + start_byte).max(0)
-        } else {
-            start_byte
-        } as usize;
-        let e = if end_byte < 0 {
-            (total_bits + end_byte).max(0)
-        } else {
-            end_byte
-        } as usize;
-        for bit in s..=e.min((total_bits - 1).max(0) as usize) {
+        for bit in start..=end {
             let (bi, mask) = bit_byte_and_mask(bit as u64);
-            if bi < bytes.len() {
-                let found = (bytes[bi] & mask != 0) == (search_bit == 1);
-                if found {
-                    return resp_integer(bit as i64);
-                }
-            } else if search_bit == 0 {
-                return resp_integer(bit as i64);
+            let found = (bytes[bi] & mask != 0) == (search_bit == 1);
+            if found {
+                return resp_integer(bit);
             }
         }
         return resp_integer(-1);
     }
 
     // BYTE mode
-    let s = if start_byte < 0 {
-        (len + start_byte).max(0)
-    } else {
-        start_byte.min(len)
-    } as usize;
-    let e = if end_byte < 0 {
-        (len + end_byte).max(0)
-    } else if end_given {
-        end_byte.min(len - 1)
-    } else {
-        len - 1
-    } as usize;
-
-    for byte_i in s..=e {
-        let b = if byte_i < bytes.len() {
-            bytes[byte_i]
-        } else {
-            0u8
-        };
+    for byte_i in start..=end {
+        let b = bytes[byte_i as usize];
         for bit_i in 0..8u64 {
             let mask = 1u8 << (7 - bit_i);
             let is_set = b & mask != 0;
             if is_set == (search_bit == 1) {
-                return resp_integer((byte_i as i64) * 8 + bit_i as i64);
+                return resp_integer(byte_i * 8 + bit_i as i64);
             }
         }
     }
