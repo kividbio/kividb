@@ -675,10 +675,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arithmetic on a nil value` was not counted at all.
 
 - **`error` reads a number as Lua 5.1 does (#1054).** Raised with a level,
-  a number gets the place before it, as a string does: `error(42)` on
-  line 2 is `user_script:2: 42`. What a script catches is what it would
-  catch in Redis: `pcall(error, 42)` gives the string `"42"`, where it gave
-  the number; `pcall(error, 42, 0)` still gives the number.
+  a number gets the place before it, as a string does, and is written
+  `%.14g`, as Redis's Lua writes it: `error(42)` on line 2 is
+  `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`.
+  What a script catches is what it would catch in Redis: `pcall(error, 42)`
+  gives the string `"42"`, where it gave the number; `pcall(error, 42, 0)`
+  still gives the number.
 
 - **A function library's lines are counted from its `#!lua` line, under
   Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
@@ -2557,10 +2559,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A script's error says where in the script it happened, as in Redis
   (#1054).** A runtime error keeps the `user_script:N:` Lua gives it, and
   its reply ends `script: <sha>, on @user_script:N.`, `N` being the line
-  it left the script from. An `EVAL`'d script that does not compile is
-  reported as `SCRIPT LOAD` reports it, `Error compiling script (new
-  function): user_script:N: …`, where it said `user_script:1` whatever the
-  line. `FCALL` names `user_function` and the function.
+  it left the script from (`=[C]:-1` when `error` was called by a C
+  function, as with `string.gsub(s, p, error)`, as Redis has it). An
+  `EVAL`'d script that does not compile is reported as `SCRIPT LOAD`
+  reports it, `Error compiling script (new function): user_script:N: …`,
+  where it said `user_script:1` whatever the line. `error(nil)`,
+  `error(true)` and `error(42, 0)` name the line they were raised on.
+  `FCALL` names `user_function` and the function, a table error too.
 
 - **`CONFIG REWRITE` writes every setting the server runs with, and no
   `replicaof` after `REPLICAOF NO ONE`.** It writes each setting
