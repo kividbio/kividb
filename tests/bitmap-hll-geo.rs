@@ -355,6 +355,29 @@ fn test_bitpos_find_clear_bit() {
     assert_eq!(c.cmds(&["BITPOS", "nosuch", "1"]).as_int(), -1);
 }
 
+#[test]
+fn test_bitpos_empty_and_outside_range() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "empty", ""]);
+    assert_eq!(c.cmds(&["BITPOS", "empty", "0"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "empty", "1", "0", "0"]).as_int(), -1);
+    assert_eq!(
+        c.cmds(&["BITPOS", "empty", "0", "0", "0", "BIT"]).as_int(),
+        -1
+    );
+
+    for i in 0..8 {
+        c.cmds(&["SETBIT", "bm", &i.to_string(), "1"]);
+    }
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "0"]).as_int(), 8);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "0", "0"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "1"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "1", "1"]).as_int(), -1);
+}
+
 // BITOP AND / OR / XOR / NOT
 #[test]
 fn test_bitop_and_or_xor() {
