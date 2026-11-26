@@ -322,6 +322,9 @@ pub mod scripts {
         out.push_str(&format!(
             "scripts_alone_runs:{closes}\r\nscripts_in_alone_runs:{scripts}\r\n"
         ));
+        // Whether keys without a hash tag are locked, and how often that was
+        // switched (`tag_locks::lock_untagged_keys_for`).
+        crate::tag_locks::key_locks_info(out);
     }
 }
 

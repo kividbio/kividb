@@ -155,6 +155,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`CONFIG REWRITE` writes the ACL users when no `aclfile` is set, as
+  Redis does; the config file takes `user` lines.** A `user <name>
+  <rule>...` line in the config file is read as a line of an ACL file is,
+  and defines that user at startup; a `user default` line wins over
+  `requirepass`, as in Redis. `CONFIG REWRITE` writes one `user` line for
+  each user, `default` first, the passwords as `#<sha256>` hashes; the
+  default user has a line only when it is not the user `requirepass`
+  gives by itself. With an
+  `aclfile`, the users stay in it (`ACL SAVE`), and a config file with
+  `user` lines and `aclfile` both is refused at startup, as Redis refuses
+  it. `CONFIG GET` lists no users.
+
 - **Prometheus and Grafana: a check of redis_exporter, a dashboard, and
   `docs/MONITORING.md`.** The compat workflow runs redis_exporter v1.66.0
   (the KiviDB operator's metrics sidecar) against KiviDB and Redis 8.10.3
@@ -200,6 +212,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   later that lists it, or an `ARRIVED` at that very epoch, and asks again
   for the others.
 
+- **`search-flat-int8`: an int8 first pass for FLAT KNN over many candidates (#1033).**
+  Off by default; `CONFIG SET search-flat-int8 yes` turns it on. A FLAT field of 256
+  dimensions or more gets an int8 copy of its vectors (rotated, one scale a vector, made off
+  the write path by one thread), and a scan of 1,024 candidates or more measures a candidate
+  exactly only when its bound could beat the k-th held: the reply is the exact scan's. The
+  copy adds about a quarter of the FLOAT32 vectors' memory. `FT.INFO` shows it under
+  `flat_int8_indexes`. x86_64 only.
+
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
   `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client
@@ -207,9 +227,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   RESP3 connection for `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, and
   for `FT.HYBRID` the count, then each row as a flat array (no `warnings`, no `execution_time`).
   That is the reply GLIDE converts. The `ON_TIMEOUT` warning is not in it, and a KNN `WITHSCORES`
-  gives the distance where valkey-search gives 0. `FT.PROFILE` and the other search commands keep
-  the Redis shape in every mode. `redis` and `valkey` give every connection one or the other. It is
-  set in the configuration file, on the command line, and with `CONFIG SET`, which acts on
+  gives the distance where valkey-search gives 0. `FT.PROFILE` has its own layout there (see
+  #1039 below), and the other search commands keep the Redis shape in every mode. `redis` and
+  `valkey` give every connection one or the other. It is set in the configuration file, on the
+  command line, and with `CONFIG SET`, which acts on
   connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
   replies, a script's, and what the masters of a cluster tell one another are the same in each.
 
@@ -639,6 +660,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Rows with equal `SORTBY` values come in the order their documents were
+  written, as in Redis (#1043).** `SORTBY … ASC` gives documents with the
+  same value first written first, and `DESC` the reverse; documents without
+  the value come last, in the same order. A query without `SORTBY` gives the
+  matches that score the same in the order they were written, and a KNN
+  query the vectors it returns that are as near (in an index with TAG,
+  NUMERIC or TEXT fields). `FT.AGGREGATE` rows come in that order (but for
+  rows that go into a `GROUPBY` of `COUNT`, `MIN`, `MAX` or `COUNT_DISTINCT`
+  only, which are read in any; groups come in the order of their first
+  documents written), and rows
+  level on every `SORTBY` key keep it, or its reverse where the last key is
+  `DESC`. A write that names a field of the index (`HSET`,
+  `HINCRBY`, `HDEL` of an indexed field, a field of it that expires), a JSON
+  write, or a value put under the key whole makes the document the last
+  written; a write of other fields of the hash leaves it where it is, and a
+  `RENAME` keeps its place. The
+  documents an `FT.CREATE` finds already written come before those written
+  after it, by key. The order is kept in snapshots (a last section,
+  `KIVIDO1`, which 1.2 passes over), replayed from the AOF, and sent to
+  replicas; documents loaded from a snapshot without it go by key. In a
+  cluster each master's order is kept, and level rows of different masters
+  come by their place in their master's order, then by key. Each document
+  of an index with TAG, NUMERIC or TEXT fields takes 8 bytes more.
+
+- **`INFO server` has `valkey_version` (#1039).** It is `9.0.1`, after `redis_version`, which stays
+  `8.10.0`. Clients that take a server for Valkey read it: Open WebUI's Valkey vector store asks for
+  9.0.1 or later before it uses valkey-search's commands. It is the lowest release it accepts, not
+  valkey-bundle 9.2.0's:
+  the hash field commands of Valkey 9 and valkey-search 1.2's search commands are answered, not every
+  command of 9.x (`COMMANDLOG`, `DELIFEQ`, `CLUSTER MIGRATESLOTS`). `HELLO` still says `server redis`,
+  version `8.10.0`.
+
+- **An index that does not exist is named in valkey-search's words for a valkey-glide client (#1039).**
+  `FT.INFO`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.HYBRID`, `FT.DROPINDEX`, `FT.CURSOR` and every other
+  `FT.*` command that takes an index name answers `Index with name '<name>' not found in database <n>`
+  to a connection that takes valkey-search's shape (`search-resp3-reply`: a client that named itself
+  GLIDE under `auto`, or every client under `valkey`), on RESP2 and RESP3. Every other connection gets
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does. valkey-glide's callers look for
+  `not found in database` to know an index is not there (Open WebUI's Valkey vector store creates its
+  index on that answer). `FT.HYBRID` on an index that does not exist says so whatever follows the name,
+  as Redis 8.10 does. A node answering a coordinator of its cluster, and a script, always get
+  Redis's words.
+
+- **`FT.INFO` and `FT.PROFILE` in valkey-search's shape (#1039).** In the shape a valkey-glide client is
+  answered in (`search-resp3-reply`), `FT.INFO` lists a vector field's dimensions, metric, data type and
+  algorithm in an `index` list, as valkey-search does, where the Redis shape lists them one after
+  another (Open WebUI reads the dimensions of an index from there). `FT.PROFILE` is an array of the
+  search's reply in that shape and a flat list of names and numbers (`parse.time`, `total.time`,
+  `all.count`), which is the layout valkey-glide converts; valkey-search 1.2 has no `FT.PROFILE`, so
+  there is no reply of its own to match. The Redis shape of both is unchanged.
+
 - **A FLAT vector index keeps its vectors in fixed blocks by slot, and a
   filtered KNN goes from each matching document id to its vector (#1020).**
   The vectors of a FLAT index are in blocks of slots that never move, each
@@ -872,6 +944,29 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   place (master: 37,467 µs every call). Suite 53 of
   `benchmarks/1.3.0/regressions` gates these and the `SETBIT` and
   `BITFIELD` rows at 64 MiB against v1.2.2 (38,110 µs an `APPEND` there).
+- **`SETRANGE` and `BITFIELD` write where the string is kept (part of
+  #1016).** Both go through the same in-place string edit as `SETBIT`:
+  when nothing but its key holds the string and the result still fits
+  where it is kept, the new bytes are written there and the string is not
+  copied. Otherwise (a `SETRANGE` that outgrows the string's block, or a
+  string shared with another key since a `COPY`, being read by a `DUMP`,
+  or captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) it
+  is copied once, and a holder keeps the bytes from before. The time to
+  live is kept. A `SETRANGE` with an empty value writes nothing, does not
+  create a missing key, and is not a write: it is not logged, replicated
+  or counted, and fails no `WATCH`, as in Redis.
+  `BITFIELD` runs its operations in order on the stored bytes, with the
+  key's shard locked from the first to the last, each reading and writing
+  only its field's bytes. It grows a string as an `APPEND` does, in its
+  block when there is room, else into a block with room for more,
+  zero-filled to the field. An `OVERFLOW FAIL` write that is refused
+  writes nothing and grows nothing. A `BITFIELD` is a write when an
+  applied `SET` or `INCRBY` changes its field or grows the string, also
+  when a later one puts the bits back, as in Redis 8; one that changes
+  nothing is not logged, replicated or announced, and fails no `WATCH`.
+  A write counts one change, as any write command does. A signed
+  `INCRBY` that wraps past the field's largest value replies with the
+  value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
@@ -902,6 +997,47 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   go on, and the previous dump stays. A checkpoint whose capture fails
   removes the `appendonly.aof.rewrite.tmp` it prepared. A replica's full
   sync and an online backup make their image in memory.
+- **A script that keeps to its keys runs beside others when they have no
+  hash tag (#1049).** With `lua-parallel-scripts yes` (the default), a
+  script whose `KEYS` all lack a hash tag runs beside other commands, under
+  its keys' locks, when it is sent by `EVAL` or `EVALSHA` and its source
+  shows that it touches no other key: every `redis.call`/`redis.pcall` names
+  its command with a string literal, of a list of commands whose keys are
+  known (`GET`, `SET`, `DEL`, `INCR`, `EXPIRE`, `HSET`, ...), and gives each
+  key as `KEYS[n]`; `KEYS` and `redis` are only read, never assigned or
+  passed on; and nothing that reaches the globals another way (`_G`, `_ENV`,
+  `loadstring`, `setmetatable`, ...) is named. That is read from the text
+  once per thread and script, before it runs, and only chooses where the
+  script runs: while it runs, the server holds it to its keys. Any other
+  script with a key without a tag runs alone, as before, and may touch what
+  it likes (BullMQ's and Sidekiq's scripts are of that kind). From the first
+  run of such a script, which is alone, a command on a key without a tag
+  takes that key's lock, shared: it waits for a script on the key, not for
+  other commands. Every key a command names is then locked, tagged or not,
+  wherever it comes among them. Once no such script has run for a minute,
+  or with `lua-parallel-scripts tags` or `no`, those locks are let go of
+  again, at a moment the command gate can be held alone, tried for a few
+  milliseconds at a time;
+  `INFO stats` says whether they are taken (`untagged_key_locks`), how often
+  that was switched (`untagged_key_locks_on`, `untagged_key_locks_off`) and
+  how often the switch off waited for a later moment
+  (`untagged_key_locks_off_later`). Eviction and active expiry leave a key
+  whose lock a script running beside others holds until it is done;
+  eviction never leaves a key because a client's command is at it. See
+  "Scripts that keep to their keys" in
+  [docs/SCRIPTS.md](docs/SCRIPTS.md); regression suite 54 records
+  yii2-redis's `Mutex` cycle.
+- **`lua-parallel-scripts` takes `yes`, `tags` or `no` (#1049).** `tags`
+  runs beside others only scripts whose `KEYS` all carry a hash tag, as
+  1.2.2 does, and never locks keys without a tag; `yes` (the default) adds
+  the scripts that keep to keys without a tag; `no` runs every script
+  alone. `true` and `false` are taken for `yes` and `no`, on the command
+  line, in the config file and by `CONFIG SET`; `CONFIG REWRITE` writes the
+  value set at run time. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+- **In a build with Lua, a command takes the lock of each tagged key it
+  names whatever `lua-parallel-scripts` says (#1049).** The setting decides
+  whether scripts run beside others; a script that started under the other
+  setting finds its tags locked all the same.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first
@@ -2405,7 +2541,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where they are set, so a build without TLS reads its own file back. A
   server restarted from the file opens the same data directory, serves
   TLS as it did and has the role it had: Redis Sentinel sends
-  `CONFIG REWRITE` after every `REPLICAOF` it gives.
+  `CONFIG REWRITE` after every `REPLICAOF` it gives. It writes the current
+  `requirepass`, `masterauth` and `masteruser`, quoted as Redis quotes
+  them, and every value is written quoted where it needs it. The new file
+  is synced before it replaces the old one, and the directory after; when
+  the new file cannot be made, the old one is left as it is and the command
+  replies with an error.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the

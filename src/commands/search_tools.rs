@@ -974,6 +974,10 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         return Some(resp_error("The QUERY keyword is expected"));
     }
     let index = text(cmd[1]).to_string();
+    // A GLIDE client (or `search-resp3-reply valkey`) gets the layout its
+    // converter reads: the search's reply in valkey-search's shape, then a
+    // flat list of names and numbers.
+    let valkey = crate::commands::search::valkey_shape(ctx);
 
     // The query's plan, for the profile. Parsed here as the command itself
     // will parse it; a query that does not parse fails there, with its error.
@@ -1005,7 +1009,8 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .chain(saved[at + 1..].iter().copied())
         .collect();
     let started = Instant::now();
-    let profiling = crate::commands::search::Profiling::start();
+    // The search inside keeps the Redis shape, unless it is the valkey one.
+    let profiling = (!valkey).then(crate::commands::search::Profiling::start);
     let reply = match kind.as_str() {
         "SEARCH" => crate::commands::search::ft_search(ctx),
         "AGGREGATE" => crate::commands::vector::ft_aggregate(ctx),
@@ -1020,6 +1025,20 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
 
     let results = total_of(&reply);
+    if valkey {
+        let names = |items: Vec<Vec<u8>>| crate::commands::search::simple_names(items, true);
+        return Some(resp_array(vec![
+            reply,
+            resp_array(names(vec![
+                resp_bulk_str("parse.time"),
+                millis(parsing),
+                resp_bulk_str("total.time"),
+                millis(total + parsing),
+                resp_bulk_str("all.count"),
+                resp_bulk_str(&results.to_string()),
+            ])),
+        ]));
+    }
     let processor = |kind: &str| -> Vec<u8> {
         resp_array(vec![
             resp_bulk_str("Type"),

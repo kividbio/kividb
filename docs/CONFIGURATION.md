@@ -90,6 +90,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--search-resp3-reply <auto\|redis\|valkey>` | `auto` | The shape of the search commands' replies over RESP3 (see [Search reply shape over RESP3](#search-reply-shape-over-resp3)) |
+| `--search-flat-int8 <no\|yes>` | `no` | An int8 first pass in FLAT KNN scans of many candidates, the reply still the exact scan's; `CONFIG SET` takes it (see [FLAT int8 first pass](#flat-int8-first-pass)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -101,7 +102,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--log-format <text\|json>` | `text` | Log line format |
 | `--io-model` | `auto` | `auto`, `uring` or `tokio` (io_uring is Linux only) |
 | `--requirepass <password>` | none | Password for the `default` user |
-| `--aclfile <path>` | none | ACL file to load users from |
+| `--aclfile <path>` | none | ACL file to load users from. Not together with `user` lines in the config file |
 | `--replicaof <HOST> <PORT>` | none | Replicate from a primary |
 | `--replica-announced-port <port>` | server port (the TLS port with `--tls-replication yes` or `--port 0`) | Port announced to the primary via `REPLCONF listening-port` |
 | `--replica-priority <n>` | `100` | Sentinel promotes the replica of lowest priority first, and never one of `0`. New in 1.2.1: 1.2.0 has no such flag, and ignores the setting in the file |
@@ -117,6 +118,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--tls-auth-clients <yes\|optional\|no>` | `yes` | Whether clients must present a certificate (only with `--tls-ca-cert-file`) |
 | `--tls-auth-clients-allowed-names <names>` | none | Names a client certificate's CN or DNS name must match; `*.` is one label |
 | `--update-check <yes\|no>` | `yes` | The [startup update check](#startup-update-check) |
+| `--lua-parallel-scripts <yes\|tags\|no>` | `yes` | Which scripts run beside other commands, in a build with Lua: `yes` a script whose `KEYS` all carry a hash tag, under its tags' locks, and a script that keeps to `KEYS` none of which has a tag, under those keys' locks; `tags` only the first kind, as 1.2.2 does, and keys without a tag stop being locked (at once, or, if such a script is running at the switch, at the next look of the thread that lets them go, within 15 s); `no` none, every script alone, as in Redis. In a build without Lua there are no scripts: the server starts at `no`, and `yes` or `tags` set at run time make commands take the locks of their keys' tags. `true` and `false` are taken for `yes` and `no`. Changeable with `CONFIG SET`, written by `CONFIG REWRITE`. See [Scripts](SCRIPTS.md) |
 
 `DEBUG` is refused by default from 1.3.0, as in Redis 7 and later: `enable-debug-command`
 is `no`, and every client gets Redis's `ERR DEBUG command not allowed ...`. Start the server
@@ -166,6 +168,25 @@ system as soon as its last member or field is removed. A list's chunks are block
 their own. `INFO memory` reports those slabs (the sets', sorted sets',
 hashes' and lists') as `value_slab_pool_bytes`, apart from `value_slab_bytes` (the keyspace's slabs, which defrag
 compacts).
+
+### ACL users in the config file
+
+The config file takes `user <name> <rule>...` lines, as Redis's does: each
+is read as a line of an ACL file (the rules of `ACL SETUSER`, a quoted word
+read with `\"`, `\\` and `\xHH`), and defines that user at startup. A
+`user default` line wins over `requirepass`. With no `aclfile` set,
+`CONFIG REWRITE` writes one such line for each user, `default` first, the
+passwords as `#<sha256>` hashes, and `requirepass` beside it as it is set;
+the default user has a line only when it is not the user `requirepass`
+gives by itself. A file with `user` lines is read by 1.3.0 and later.
+`user` lines and `aclfile` together are refused at startup; with an
+`aclfile`, `ACL SAVE` writes the users there. `CONFIG GET` lists no users.
+
+```
+requirepass change-me
+user default on #<sha256 of change-me> ~* &* +@all
+user reader on >reader-password ~cache:* +@read
+```
 
 ### Active defrag
 
@@ -332,8 +353,19 @@ query cut short by `ON_TIMEOUT` carries in RESP3's `warning` (the client gets th
 with no signal, as over RESP2). A `WITHSCORES` on a KNN query gives each document's distance as
 its score, as Redis does; valkey-search gives `0`.
 
-`FT.PROFILE` has no valkey-search counterpart, and keeps the Redis shape, as do `FT.SPELLCHECK`,
-`FT.CONFIG GET`, `FT.TAGVALS`, the alias list and every other search command, in every mode.
+`FT.INFO` lists a vector field's `dimensions`, `distance_metric`, `data_type` and `algorithm` in an
+`index` list in the valkey shape, as valkey-search does (Open WebUI reads the dimensions from there).
+
+valkey-search 1.2 has no `FT.PROFILE`. In the valkey shape it is the array valkey-glide converts: the
+search's reply in that shape, then a flat list of simple-string names and numbers (`parse.time`,
+`total.time` in milliseconds, `all.count`). `FT.SPELLCHECK`, `FT.CONFIG GET`, `FT.TAGVALS`, the alias
+list and every other search command keep the Redis shape in every mode.
+
+The text of the error for an index that does not exist follows the same setting, on RESP2 and RESP3:
+in the valkey shape (`valkey`, or `auto` and a GLIDE client) it is valkey-search's, `Index with name
+'<name>' not found in database <n>`, for every `FT.*` command that takes an index name; otherwise it is
+Redis 8.10's, `SEARCH_INDEX_NOT_FOUND Index not found: <name>`. valkey-glide's callers look for `not
+found in database` (Open WebUI's Valkey vector store), and Redis's clients for `Index not found`.
 
 A client is valkey-glide when its library name begins with `Glide`, in any case (`GlidePy`,
 `GlidePySync`, `GlideJS`, `GlideJava`, `GlideGo`, `GlideFFI`, and any of them followed by a tag in
@@ -343,6 +375,53 @@ another.
 
 The setting belongs to the node: in a cluster, the node that is asked writes the reply, so set
 every node alike.
+
+### FLAT int8 first pass
+
+`--search-flat-int8` (`search-flat-int8` in the configuration file; `CONFIG GET` and
+`CONFIG SET` take it) gives each FLAT vector field of 256 dimensions or more, once it holds
+1,024 vectors, an int8 copy of its vectors, and lets a KNN scan of 1,024 candidates or more
+(and at least 8 times `k`) measure each candidate against the copy first. A candidate is
+measured exactly unless the k nearest are already held and the copy's lower bound on its
+distance is at least the k-th, so the reply is the exact scan's, ties and order included.
+Once the k nearest are held, the scan looks at each 1,024 candidates in turn: if more than
+half of them had to be measured exactly, the pass is not paying for itself, and the scan
+measures the rest of its candidates exactly, without the pass. x86_64 only; elsewhere the
+switch is taken and the pass is not used.
+
+The copy is made and kept up to date by one thread, `flat-int8`, not by the writes: a write
+marks its slot, and the thread codes what is marked with no lock held, stores each code
+under the write lock only if the slot still holds the same vector, and lets writers and
+searches in every 50 µs. Until a slot is coded again a scan measures it exactly. Switched
+on at run time, the switch makes no copy by itself: an index's copy is started by the first
+search or write that reaches that index afterwards. After each run the thread sleeps as long
+as the run took, three times as long while writes to the index keep arriving; on an Azure
+D8s_v5 it took about 30% of a CPU under steady overwrites, and none with no traffic. While
+the copy is kept up to date, writes to the index are a little slower: loading 1M vectors of
+1,536 dimensions there was 7% slower on average with the switch on than with it off. The copy
+takes 16 bytes plus one a dimension per vector, is counted in `used_memory`, is not saved,
+and is made again after a restart. `FT.INFO` shows it under `flat_int8_indexes`: the field,
+its bytes, and how many candidates the pass skipped and measured exactly since the index
+was made (`CONFIG RESETSTAT` leaves them). Turning the switch off stops the pass at once,
+but a copy already made keeps its memory, and is kept up to date, until the index is
+dropped.
+
+The copy counts against `maxmemory` like any other memory. An index whose copy would take
+`used_memory` past `maxmemory` gets none, and a warning says so; setting `search-flat-int8`
+again (`CONFIG SET search-flat-int8 yes`) lets it try once more. Made near the limit, a copy
+can still leave too little room for the writes that follow, which then evict keys or, under
+`noeviction`, are refused.
+
+While a copy is being made, the median search of its index is already faster than with the
+switch off, but the slowest are slower; once it is made, both are faster. On an Azure
+D8s_v5 (server on 4 CPUs) with 1M vectors of 1,536 dimensions and 4 clients each running a
+KNN 5 over 100,000 candidates, the p50 / p99 was 71 / 74 ms with the switch off, 31 / 133 ms
+while the copy was made, and 31 / 36 ms after. Making it took about 80 s under those 4
+clients, and 37 s after a load with no clients. Switching it on over a large index is best
+done when the index is not busiest.
+
+A scan the query's timeout cuts returns the nearest of the candidates it reached, as it
+does without the pass.
 
 ### Search index threads
 

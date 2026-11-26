@@ -1,8 +1,9 @@
 #![allow(clippy::disallowed_methods)]
 // tests/bitmap_in_place.rs
 //
-// A SETBIT that changes a bit writes it where the value is, unless something
-// else holds the value, as a snapshot or a full sync being written does.
+// A SETBIT or BITFIELD that changes bits writes them where the value is,
+// unless something else holds the value, as a snapshot or a full sync being
+// written does.
 // Whatever held it keeps the bytes it had. A reply is a copy. Real `kividb`
 // processes; a server started with `held` stops each snapshot once it has
 // captured the dataset (`failpoint.snapshot-writing.<n>` in its directory),
@@ -112,6 +113,24 @@ impl Conn {
 
     fn get(&mut self, key: &str) -> V {
         self.cmd(&[b"GET", key.as_bytes()])
+    }
+
+    /// `BITFIELD key` and the words of `ops`.
+    fn bitfield(&mut self, key: &str, ops: &str) -> V {
+        let mut args: Vec<&[u8]> = vec![b"BITFIELD", key.as_bytes()];
+        args.extend(ops.split_whitespace().map(str::as_bytes));
+        self.cmd(&args)
+    }
+
+    fn ttl(&mut self, key: &str) -> i64 {
+        match self.cmd(&[b"TTL", key.as_bytes()]) {
+            V::Int(ttl) => ttl,
+            other => panic!("TTL: {other:?}"),
+        }
+    }
+
+    fn dirty(&mut self) -> i64 {
+        self.info("rdb_changes_since_last_save").parse().unwrap()
     }
 }
 
@@ -683,7 +702,7 @@ fn aof_replays_setbits_written_in_place_and_skips_those_that_change_nothing() {
     assert_eq!(c.setbit(&key(len), 8 * len - 1, 1), V::Int(0));
     let after: i64 = c.info("rdb_changes_since_last_save").parse().unwrap();
     assert_eq!(after - before.parse::<i64>().unwrap(), 2, "dirty");
-    let logged = logged_setbits(&server.dir);
+    let logged = logged(&server.dir, b"SETBIT");
     assert_eq!(logged, 2, "SETBITs in the AOF");
     let server = server.restart(&aof);
     let mut c = server.conn();
@@ -693,8 +712,8 @@ fn aof_replays_setbits_written_in_place_and_skips_those_that_change_nothing() {
     assert!(c.get(&key(len)) == V::Str(want), "replayed");
 }
 
-/// How many `SETBIT`s the AOF files under `dir` hold.
-fn logged_setbits(dir: &Path) -> usize {
+/// How many times the AOF files under `dir` name `command`.
+fn logged(dir: &Path, command: &[u8]) -> usize {
     let mut count = 0;
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -705,11 +724,256 @@ fn logged_setbits(dir: &Path) -> usize {
             } else if path.to_string_lossy().contains(".aof") {
                 let bytes = std::fs::read(&path).unwrap();
                 count += bytes
-                    .windows(6)
-                    .filter(|w| w.eq_ignore_ascii_case(b"SETBIT"))
+                    .windows(command.len())
+                    .filter(|w| w.eq_ignore_ascii_case(command))
                     .count();
             }
         }
     }
     count
+}
+
+/// A BITFIELD reply.
+fn ints(values: &[Option<i64>]) -> V {
+    V::Arr(values.iter().map(|v| v.map_or(V::Nil, V::Int)).collect())
+}
+
+/// The keyspace events `sub` has had since the last call: up to a marker's,
+/// which `c` sets.
+fn events(c: &mut Conn, sub: &mut Conn) -> Vec<String> {
+    assert_eq!(c.cmd(&[b"SET", b"marker", b"x"]), V::Str(b"OK".to_vec()));
+    let mut events = Vec::new();
+    loop {
+        let V::Arr(message) = sub.read() else {
+            panic!("not an event");
+        };
+        let [_, _, V::Str(channel), V::Str(event)] = &message[..] else {
+            panic!("{message:?}");
+        };
+        let channel = String::from_utf8_lossy(channel).into_owned();
+        if channel.ends_with(":marker") {
+            return events;
+        }
+        events.push(format!("{channel} {}", String::from_utf8_lossy(event)));
+    }
+}
+
+/// A BITFIELD that changes bits, even to put them back, or grows the value
+/// fails a `WATCH` on its key, counts as a change and announces itself, and
+/// keeps the time to live. One that fails, finds the bits as asked or only
+/// reads does none of the first two.
+#[test]
+fn bitfield_writes_fail_a_watch_and_count_as_changes() {
+    let server = Server::start(&["--notify-keyspace-events", "KA"], false);
+    let mut c = server.conn();
+    let mut sub = server.conn();
+    assert!(matches!(
+        sub.cmd(&[b"PSUBSCRIBE", b"__keyspace@0__:*"]),
+        V::Arr(_)
+    ));
+    let mut w = server.conn();
+    fill(&mut c, &SIZES);
+    for len in SIZES {
+        let k = key(len);
+        assert_eq!(c.cmd(&[b"EXPIRE", k.as_bytes(), b"1000"]), V::Int(1));
+        events(&mut c, &mut sub);
+        let grow = format!("SET u8 {} 0", len * 8);
+        // The value starts 0, 1, 2.
+        let cases: [(&str, &[Option<i64>], bool); 9] = [
+            ("SET u8 0 1", &[Some(0)], true),
+            ("SET u8 8 255 SET u8 8 1", &[Some(1), Some(255)], true),
+            ("INCRBY u8 16 1 INCRBY u8 16 -1", &[Some(3), Some(2)], true),
+            ("SET u8 0 1", &[Some(1)], false),
+            ("INCRBY u8 0 0", &[Some(1)], false),
+            (
+                "OVERFLOW FAIL SET u8 0 256 INCRBY u8 8 255",
+                &[None, None],
+                false,
+            ),
+            ("GET u8 0", &[Some(1)], false),
+            (&grow, &[Some(0)], true),
+            ("SET i16 4 -1", &[Some(0x1010)], true),
+        ];
+        let mut now = len;
+        for (ops, replies, writes) in cases {
+            let at = format!("{len}: {ops}");
+            assert_eq!(w.cmd(&[b"WATCH", k.as_bytes()]), V::Str(b"OK".to_vec()));
+            assert_eq!(w.cmd(&[b"MULTI"]), V::Str(b"OK".to_vec()));
+            assert_eq!(
+                w.cmd(&[b"STRLEN", k.as_bytes()]),
+                V::Str(b"QUEUED".to_vec())
+            );
+            let dirty = c.dirty();
+            assert_eq!(c.bitfield(&k, ops), ints(replies), "{at}");
+            assert_eq!(c.dirty() > dirty, writes, "{at}: dirty");
+            if ops == grow {
+                now += 1;
+            }
+            let exec = w.cmd(&[b"EXEC"]);
+            let kept = V::Arr(vec![V::Int(now as i64)]);
+            assert_eq!(exec, if writes { V::Nil } else { kept }, "{at}: EXEC");
+            // A write's events are its own `setbit`.
+            let events = events(&mut c, &mut sub);
+            if writes {
+                assert_eq!(events, [format!("__keyspace@0__:{k} setbit")], "{at}");
+            }
+            let ttl = c.ttl(&k);
+            assert!(ttl > 900 && ttl <= 1000, "{at}: TTL {ttl}");
+        }
+        let mut want = pattern(len);
+        want[..3].copy_from_slice(&[0x0F, 0xFF, 0xF2]);
+        want.push(0);
+        assert!(c.get(&k) == V::Str(want), "{len}");
+    }
+    // One that fails on a missing key leaves it missing.
+    let dirty = c.dirty();
+    assert_eq!(
+        c.bitfield("missing", "OVERFLOW FAIL SET u8 80 256"),
+        ints(&[None])
+    );
+    assert_eq!(c.dirty(), dirty);
+    assert_eq!(c.cmd(&[b"EXISTS", b"missing"]), V::Int(0));
+}
+
+/// A `BGSAVE` holds each string it captured until it has written it:
+/// BITFIELD writes meanwhile copy the value, then go in place. The dump
+/// has the bytes from before them; the live value has them all. Both keep
+/// the time to live.
+#[test]
+fn a_bgsave_writes_the_bytes_from_before_a_bitfield() {
+    let server = Server::start(&[], true);
+    let mut c = server.conn();
+    fill(&mut c, &SIZES);
+    for len in SIZES {
+        assert_eq!(c.cmd(&[b"EXPIRE", key(len).as_bytes(), b"1000"]), V::Int(1));
+    }
+    assert_eq!(
+        c.cmd(&[b"BGSAVE"]),
+        V::Str(b"Background saving started".to_vec())
+    );
+    let held = server.snapshot_held(1);
+    for len in SIZES {
+        let k = key(len);
+        let grow = format!("SET u8 {} 9", len * 8);
+        for (ops, replies) in [
+            // A copy from the capture, then in place.
+            ("SET u8 0 1", &[Some(0)][..]),
+            ("SET u8 8 255 SET u8 8 1", &[Some(1), Some(255)]),
+            ("INCRBY u8 16 1", &[Some(3)]),
+            ("OVERFLOW FAIL SET u8 0 256", &[None]),
+            (&grow, &[Some(0)]),
+        ] {
+            assert_eq!(c.bitfield(&k, ops), ints(replies), "{len}: {ops}");
+        }
+    }
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("rdb_last_bgsave_status"), "ok");
+    for len in SIZES {
+        let mut now = pattern(len);
+        now[0] = 1;
+        now[2] = 3;
+        now.push(9);
+        assert!(c.get(&key(len)) == V::Str(now), "{len}");
+        assert!(c.ttl(&key(len)) > 0, "{len}");
+    }
+    let server = server.restart(&[]);
+    let mut c = server.conn();
+    for len in SIZES {
+        assert!(
+            c.get(&key(len)) == V::Str(pattern(len)),
+            "{len} in the dump"
+        );
+        assert!(c.ttl(&key(len)) > 0, "{len} in the dump");
+    }
+}
+
+/// BITFIELD writes on the master while a full sync holds the values, and
+/// after, reach the replica, which ends with the master's bytes and time to
+/// live. Those that write nothing change neither.
+#[test]
+fn a_replica_synced_across_bitfields_ends_with_the_masters_bytes() {
+    let master = Server::start(&[], true);
+    let mut m = master.conn();
+    let sizes = &SIZES[..3];
+    fill(&mut m, sizes);
+    for &len in sizes {
+        assert_eq!(m.cmd(&[b"EXPIRE", key(len).as_bytes(), b"1000"]), V::Int(1));
+    }
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port], false);
+    let held = master.snapshot_held(1);
+    for &len in sizes {
+        let k = key(len);
+        assert_eq!(m.bitfield(&k, "SET u8 0 1"), ints(&[Some(0)]), "{len}");
+        let back = m.bitfield(&k, "SET u8 8 255 SET u8 8 1");
+        assert_eq!(back, ints(&[Some(1), Some(255)]), "{len}");
+    }
+    std::fs::remove_file(held).unwrap();
+    let mut r = replica.conn();
+    r.wait_for("master_link_status", "up");
+    for &len in sizes {
+        let k = key(len);
+        let grow = format!("SET u8 {} 15", len * 8 + 4);
+        for (ops, replies) in [
+            ("INCRBY u8 16 1 INCRBY u8 24 -1", &[Some(3), Some(2)][..]),
+            ("OVERFLOW FAIL SET u8 0 256", &[None]),
+            ("SET u8 0 1", &[Some(1)]),
+            (&grow, &[Some(0)]),
+        ] {
+            assert_eq!(m.bitfield(&k, ops), ints(replies), "{len}: {ops}");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for &len in sizes {
+        let k = key(len);
+        let want = m.get(&k);
+        let mut now = pattern(len);
+        now[..4].copy_from_slice(&[1, 1, 3, 2]);
+        now.extend_from_slice(&[0x00, 0xF0]);
+        assert!(want == V::Str(now), "{len} on the master");
+        while r.get(&k) != want {
+            assert!(Instant::now() < deadline, "{len}: the replica differs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(r.ttl(&k) > 0, "{len} on the replica");
+    }
+}
+
+/// BITFIELD writes are logged and replayed, a put-back among them; those
+/// that fail, find the bits as asked or only read are not logged.
+#[test]
+fn aof_replays_bitfields_and_skips_those_that_write_nothing() {
+    let aof = ["--appendonly", "yes", "--appendfsync", "always"];
+    let server = Server::start(&aof, false);
+    let mut c = server.conn();
+    let len = 64 << 10;
+    let k = key(len);
+    fill(&mut c, &[len]);
+    assert_eq!(c.cmd(&[b"EXPIRE", k.as_bytes(), b"1000"]), V::Int(1));
+    let grow = format!("SET u8 {} 5", len * 8);
+    for (ops, replies) in [
+        ("SET u8 0 1", &[Some(0)][..]),
+        ("SET u8 8 255 SET u8 8 1", &[Some(1), Some(255)]),
+        ("SET u8 0 1", &[Some(1)]),
+        ("INCRBY u8 0 0", &[Some(1)]),
+        ("OVERFLOW FAIL SET u8 0 256", &[None]),
+        ("GET u8 0", &[Some(1)]),
+        (&grow, &[Some(0)]),
+    ] {
+        assert_eq!(c.bitfield(&k, ops), ints(replies), "{ops}");
+    }
+    let ro = c.cmd(&[b"BITFIELD_RO", k.as_bytes(), b"GET", b"u8", b"0"]);
+    assert_eq!(ro, ints(&[Some(1)]));
+    let missing = c.bitfield("missing", "OVERFLOW FAIL SET u8 80 256");
+    assert_eq!(missing, ints(&[None]));
+    assert_eq!(logged(&server.dir, b"BITFIELD"), 3, "BITFIELDs in the AOF");
+    let server = server.restart(&aof);
+    let mut c = server.conn();
+    let mut want = pattern(len);
+    want[0] = 1;
+    want.push(5);
+    assert!(c.get(&k) == V::Str(want), "replayed");
+    assert!(c.ttl(&k) > 0, "replayed");
+    assert_eq!(c.cmd(&[b"EXISTS", b"missing"]), V::Int(0));
 }

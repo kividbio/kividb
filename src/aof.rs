@@ -4104,6 +4104,7 @@ pub fn replay_aof(
             hnsw_graphs,
             expiries,
             functions,
+            document_orders,
         } = loaded;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         stats.preamble_keys = crate::snapshot::restore_into_store(dbs, store) as u64;
@@ -4111,6 +4112,7 @@ pub fn replay_aof(
         // Schemas and graphs travel inside the image, so the replay never has
         // to re-execute an `FT.CREATE` or rebuild a graph it already has.
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
+        crate::vector::restore_document_orders(index_store, document_orders);
         crate::snapshot::restore_functions(functions)?;
     }
 
@@ -4302,6 +4304,7 @@ pub fn recover_local(
                     hnsw_graphs,
                     expiries,
                     functions,
+                    document_orders,
                 } = loaded;
                 if let Err(e) = crate::snapshot::restore_functions(functions) {
                     fatal_persistence(&format!("dump.kdb cannot be loaded: {e}"));
@@ -4320,6 +4323,7 @@ pub fn recover_local(
                         &index_schemas,
                         &hnsw_graphs,
                     );
+                    crate::vector::restore_document_orders(index_store, document_orders);
                     recovery.index_names = index_schemas.iter().map(|s| s.name.clone()).collect();
                     if recovery.hnsw_loaded {
                         log_info!("HNSW graph(s) loaded from snapshot — precision preserved");
@@ -4714,12 +4718,14 @@ fn preload(
             hnsw_graphs,
             expiries,
             functions,
+            document_orders,
         } = crate::snapshot::load_snapshot(&base_str)?;
         crate::snapshot::restore_functions(functions)?;
         crate::vector::restore_dictionaries(index_store, dictionaries);
         let keys = crate::snapshot::restore_into_store(dbs, store);
         crate::snapshot::restore_expiries_into_store(expiries, store);
         crate::vector::register_index_schemas(index_store, &index_schemas, &hnsw_graphs);
+        crate::vector::restore_document_orders(index_store, document_orders);
         index_names = index_schemas.into_iter().map(|s| s.name).collect();
         keys
     };

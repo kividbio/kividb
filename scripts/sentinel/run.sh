@@ -8,19 +8,28 @@
 #   manual   SENTINEL FAILOVER, the master up throughout;
 #   pause    the master is paused (SIGSTOP, or docker pause) until a replica
 #            has been promoted, then let go: it comes back as a master, and
-#            Sentinel turns it into a replica.
+#            Sentinel turns it into a replica;
+#   passwords  `requirepass` and `masterauth` are changed at run time on
+#            every node (CONFIG SET), and an ACL user is added (ACL SETUSER),
+#            then CONFIG REWRITE; the Sentinels are given the new password
+#            with SENTINEL SET auth-pass. The master is killed and started
+#            again, as in a kill round, and has the ACL user after.
 #
-# A kill round runs for each client; the manual and pause rounds run with
-# the first. In every round:
+# A kill round runs for each client; the manual, pause and passwords rounds
+# run with the first. In every round:
 #
-#   1. the client connects through the Sentinels and writes to the master;
+#   1. the client connects through the Sentinels and writes to the master,
+#      and a write the master acknowledged with WAIT 1 is made;
 #   2. the Sentinels promote a replica, and the other replica follows it;
 #   3. the client goes on writing, to the new master, with no restart;
 #   4. the old master comes back as a replica of the new one, with the
 #      client's writes;
 #   5. the config files say so (Sentinel follows each REPLICAOF with CONFIG
 #      REWRITE): no `replicaof` in the new master's, the new master in the
-#      others'.
+#      others';
+#   6. all three nodes hold the client's last write and the write
+#      acknowledged with WAIT 1, and each node's config file has `dir` its
+#      own directory, which CONFIG GET dir gives too.
 #
 # The clients are redis-py, ioredis and Lettuce (follow_*.*). Each is run
 # with SENTINELS, SENTINEL_PASSWORD, MASTER, PASSWORD, KEY and DEADLINE in
@@ -58,6 +67,7 @@ WORK=$(cd "$WORK" && pwd)
 PASSWORD=sentinel-test-password
 SENTINEL_PASSWORD=sentinel-test-sentinels-password
 MASTER=m
+ACL_USER=sentinel-test-reader
 NODES=(17101 17102 17103)
 SENTINEL_PORTS=(27101 27102 27103)
 SENTINELS=$(printf '127.0.0.1:%s,' "${SENTINEL_PORTS[@]}")
@@ -206,6 +216,14 @@ EOF
 moved_from() { [ "$(master_port)" != "$1" ]; }
 # The node on port $1 reads $3 from key $2.
 holds() { [ "$(cli "$1" "$PASSWORD" GET "$2")" = "$3" ]; }
+# The node on port $1 has `dir` its own directory, in its config file (Redis
+# quotes it) and in CONFIG GET dir.
+dir_is_its_own() {
+  local want
+  want=$(node_dir_seen "$1")
+  [ "$(sed -n 's/^dir //p' "$WORK/$1/node.conf" | tr -d '"')" = "$want" ] &&
+    [ "$(cli "$1" "$PASSWORD" CONFIG GET dir | tail -n 1)" = "$want" ]
+}
 master_port() { cli "${SENTINEL_PORTS[0]}" "$SENTINEL_PASSWORD" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1; }
 # What every Sentinel names as the master is $1.
 all_name() { for s in "${SENTINEL_PORTS[@]}"; do [ "$(cli "$s" "$SENTINEL_PASSWORD" SENTINEL GET-MASTER-ADDR-BY-NAME "$MASTER" | tail -n 1)" = "$1" ] || return 1; done; }
@@ -267,23 +285,55 @@ wait_for 30 "the replicas syncing" replica_of "${NODES[2]}" "${NODES[0]}"
 wait_for 60 "every Sentinel seeing both replicas and the other Sentinels" sentinels_see
 summary "### Redis Sentinel ($REDIS_IMAGE) managing $NODE_KIND ${KIVIDB_IMAGE:-${KIVIDB_BIN:-$REDIS_IMAGE}}"
 summary ""
-summary "| Round | Client | Old master | Promoted | Client followed | Old master back |"
-summary "|---|---|---|---|---|---|"
+summary "| Round | Client | Old master | Promoted | Client followed | Old master back | Three nodes agree, WAIT 1 write kept, own dir |"
+summary "|---|---|---|---|---|---|---|"
 
-# round HOW CLIENT: fails the master over HOW (kill, manual or pause), with
-# CLIENT writing through the Sentinels, and checks steps 1 to 5 above.
+# change_passwords NEW: `masterauth` and then `requirepass` set to NEW on
+# every node with CONFIG SET, and written with CONFIG REWRITE; the Sentinels
+# told the new one.
+change_passwords() {
+  local new=$1 p s
+  say "changing the nodes' passwords at run time"
+  for p in "${NODES[@]}"; do
+    cli "$p" "$PASSWORD" CONFIG SET masterauth "$new" >/dev/null || fail "CONFIG SET masterauth on $p"
+  done
+  for p in "${NODES[@]}"; do
+    cli "$p" "$PASSWORD" CONFIG SET requirepass "$new" >/dev/null || fail "CONFIG SET requirepass on $p"
+  done
+  PASSWORD=$new
+  for p in "${NODES[@]}"; do
+    cli "$p" "$PASSWORD" ACL SETUSER "$ACL_USER" on ">$ACL_USER-password" "~sentinel-test:*" +@read >/dev/null ||
+      fail "ACL SETUSER on $p"
+  done
+  for s in "${SENTINEL_PORTS[@]}"; do
+    cli "$s" "$SENTINEL_PASSWORD" SENTINEL SET "$MASTER" auth-pass "$new" >/dev/null ||
+      fail "SENTINEL SET auth-pass on $s"
+  done
+  for p in "${NODES[@]}"; do
+    cli "$p" "$PASSWORD" CONFIG REWRITE >/dev/null || fail "CONFIG REWRITE on $p"
+  done
+}
+
+# round HOW CLIENT: fails the master over HOW (kill, manual, pause or
+# passwords), with CLIENT writing through the Sentinels, and checks steps 1
+# to 6 above.
 round() {
-  local how=$1 client=$2 old new out pid t0 promoted n p
+  local how=$1 client=$2 old new out pid t0 promoted n p acked acks
+  [ "$how" = passwords ] && change_passwords "$PASSWORD-changed at run time"
   old=$(master_port)
   say "$how, $client: writing through the Sentinels to the master on $old"
   out=$WORK/$how-$client.out
   run_client "$client" "$out" &
   pid=$!
   wait_for 60 "$client writing to the master" grep -q "^ready $old" "$out"
+  acked=sentinel-test:acked:$how-$client
+  acks=$(cli "$old" "$PASSWORD" SET "$acked" "$how-$client" ";;" WAIT 1 5000 | tail -n 1) ||
+    fail "SET and WAIT on $old"
+  [ "$acks" -ge 1 ] || fail "WAIT 1 on $old: $acks replicas acknowledged the write"
 
   t0=$SECONDS
   case $how in
-  kill) say "killing the master on $old" && kill_node "$old" ;;
+  kill | passwords) say "killing the master on $old" && kill_node "$old" ;;
   manual)
     say "SENTINEL FAILOVER"
     cli "${SENTINEL_PORTS[1]}" "$SENTINEL_PASSWORD" SENTINEL FAILOVER "$MASTER" >/dev/null ||
@@ -306,10 +356,14 @@ round() {
   say "$client: $(tail -n 1 "$out")"
 
   case $how in
-  kill) say "starting the old master on $old again" && start_node "$old" ;;
+  kill | passwords) say "starting the old master on $old again" && start_node "$old" ;;
   pause) say "letting the old master on $old go on" && resume_node "$old" ;;
   esac
   wait_for 60 "$old back as a replica of $new" replica_of "$old" "$new"
+  if [ "$how" = passwords ]; then
+    [ "$(cli "$old" "" AUTH "$ACL_USER" "$ACL_USER-password" ";;" GET "sentinel-test:$client" | head -n 1)" = OK ] ||
+      fail "$old, restarted, does not let $ACL_USER in"
+  fi
   n=$(cli "$new" "$PASSWORD" GET "sentinel-test:$client")
   wait_for 30 "$old holding $client's writes" holds "$old" "sentinel-test:$client" "$n"
 
@@ -321,14 +375,20 @@ round() {
     wait_for 30 "$p's config file naming $new" grep -qi "^replicaof 127.0.0.1 $new" "$WORK/$p/node.conf"
   done
   wait_for 60 "every Sentinel seeing both replicas of $new" sentinels_see
-  summary "| $how | $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes |"
+  for p in "${NODES[@]}"; do
+    wait_for 30 "$p holding $client's last write" holds "$p" "sentinel-test:$client" "$n"
+    holds "$p" "$acked" "$how-$client" || fail "$p does not hold $acked, which WAIT 1 acknowledged before the $how"
+    dir_is_its_own "$p" || fail "$p's dir: file '$(sed -n 's/^dir //p' "$WORK/$p/node.conf")', CONFIG GET '$(cli "$p" "$PASSWORD" CONFIG GET dir | tail -n 1)', expected $(node_dir_seen "$p")"
+  done
+  summary "| $how | $client | $old | $new after ${promoted}s | $(sed -n 's/^followed .* after \(.*\)/yes, \1/p' "$out") | yes | yes |"
 }
 
 for client in $CLIENTS; do round kill "$client"; done
 first=${CLIENTS%% *}
 round manual "$first"
 round pause "$first"
+round passwords "$first"
 
-say "passed: kill with $CLIENTS, manual and pause with $first"
+say "passed: kill with $CLIENTS; manual, pause and passwords with $first"
 summary ""
 summary "✅ every failover was followed"

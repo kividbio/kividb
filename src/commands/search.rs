@@ -196,7 +196,12 @@ fn misplaced_option(option: &str, owner: &str, previous: Option<&SchemaField>) -
 }
 
 /// A field as `FT.INFO` describes it, and as `FT.CREATE` would be given it.
-fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
+///
+/// `valkey`: valkey-search's layout of a vector field, which keeps what the
+/// index holds in an `index` list (`dimensions`, `distance_metric`,
+/// `data_type` and `algorithm`) where Redis lists them one after another.
+/// valkey-glide's callers (Open WebUI) read the dimensions from there.
+fn describe_field(field: &SchemaField, valkey: bool) -> Vec<Vec<u8>> {
     let mut out = vec![
         resp_bulk_str("identifier"),
         resp_bulk_str(&field.name),
@@ -205,7 +210,47 @@ fn describe_field(field: &SchemaField) -> Vec<Vec<u8>> {
         resp_bulk_str("type"),
         resp_bulk_str(field.type_name()),
     ];
-    if let FieldType::Vector {
+    if valkey
+        && let FieldType::Vector {
+            algo,
+            dim,
+            metric,
+            data_type,
+        } = &field.field_type
+    {
+        let algorithm = match algo {
+            VectorAlgo::Flat => vec![resp_simple("name"), resp_simple("FLAT")],
+            VectorAlgo::Hnsw {
+                m,
+                ef_construction,
+                ef_runtime,
+            } => vec![
+                resp_simple("name"),
+                resp_simple("HNSW"),
+                resp_simple("m"),
+                resp_integer(*m as i64),
+                resp_simple("ef_construction"),
+                resp_integer(*ef_construction as i64),
+                resp_simple("ef_runtime"),
+                resp_integer(*ef_runtime as i64),
+            ],
+        };
+        out.push(resp_simple("index"));
+        out.push(resp_array(vec![
+            resp_simple("dimensions"),
+            resp_integer(*dim as i64),
+            resp_simple("distance_metric"),
+            resp_simple(match metric {
+                DistanceMetric::L2 => "L2",
+                DistanceMetric::Cosine => "COSINE",
+                DistanceMetric::InnerProduct => "IP",
+            }),
+            resp_simple("data_type"),
+            resp_simple(data_type.name()),
+            resp_simple("algorithm"),
+            resp_array(algorithm),
+        ]));
+    } else if let FieldType::Vector {
         algo,
         dim,
         metric,
@@ -579,7 +624,7 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         resp_array(
             def.fields
                 .iter()
-                .map(|field| resp_array(simple_names(describe_field(field), valkey)))
+                .map(|field| resp_array(simple_names(describe_field(field, valkey), valkey)))
                 .collect(),
         ),
     );
@@ -757,6 +802,33 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         );
     }
 
+    let copies: Vec<Vec<u8>> = def
+        .fields
+        .iter()
+        .filter_map(|f| match def.indexes.get(&f.name) {
+            Some(LiveIndex::Flat(flat)) => flat.int8_copy().map(|c| (f.name.as_str(), c)),
+            _ => None,
+        })
+        .map(|(field, (bytes, skipped, rescored))| {
+            resp_array(simple_names(
+                vec![
+                    resp_bulk_str("field"),
+                    resp_bulk_str(field),
+                    resp_bulk_str("bytes"),
+                    resp_bulk_str(&bytes.to_string()),
+                    resp_bulk_str("skipped"),
+                    resp_bulk_str(&skipped.to_string()),
+                    resp_bulk_str("rescored"),
+                    resp_bulk_str(&rescored.to_string()),
+                ],
+                valkey,
+            ))
+        })
+        .collect();
+    if !copies.is_empty() {
+        put("flat_int8_indexes", resp_array(copies));
+    }
+
     Some(resp_map_for(resp, out))
 }
 
@@ -772,7 +844,63 @@ pub(crate) fn no_such_index(name: &str) -> String {
 /// before it.
 pub(crate) fn is_no_such_index(error: &str) -> bool {
     let error = error.trim_end();
-    error.starts_with("SEARCH_INDEX_NOT_FOUND ") || error.ends_with("no such index")
+    error.starts_with("SEARCH_INDEX_NOT_FOUND ")
+        || error.ends_with("no such index")
+        || (error.starts_with("Index with name '") && error.contains("' not found in database "))
+}
+
+/// Whether the error text for a missing index is valkey-search's for this
+/// connection: `search-resp3-reply valkey`, or `auto` and a connection that
+/// named itself a GLIDE client. Like the shape of a RESP3 reply, but on
+/// every protocol. Not for a node answering a coordinator of its cluster
+/// (a forwarded search or schema command), and not inside a script, which
+/// reads the Redis text whoever calls it.
+pub(crate) fn valkey_wording(ctx: &Ctx) -> bool {
+    let setting = RESP3_REPLY.load(std::sync::atomic::Ordering::Relaxed);
+    if setting == RESP3_REDIS {
+        return false;
+    }
+    let glide = setting == RESP3_AUTO && ctx.client_registry.get_glide(ctx.client_id);
+    let forwarded =
+        crate::cluster::search::is_forwarded(ctx) || crate::cluster::ddl::is_forwarded(ctx);
+    #[cfg(feature = "lua")]
+    let in_script = crate::commands::lua::script_eval_script_resp().is_some();
+    #[cfg(not(feature = "lua"))]
+    let in_script = false;
+    wording_is_valkey(setting, glide, forwarded, in_script)
+}
+
+/// The decision of [`valkey_wording`]: `setting` is the value of
+/// `search-resp3-reply`, `glide` whether an `auto` connection is a GLIDE
+/// client's.
+fn wording_is_valkey(setting: u8, glide: bool, forwarded: bool, in_script: bool) -> bool {
+    if forwarded || in_script {
+        return false;
+    }
+    match setting {
+        RESP3_REDIS => false,
+        RESP3_VALKEY => true,
+        _ => glide,
+    }
+}
+
+/// `reply`, if it is the error [`no_such_index`] makes, worded as
+/// valkey-search words it: `Index with name '<name>' not found in database
+/// <db>`. Any other reply is returned as it is.
+pub(crate) fn valkey_missing_index(reply: Vec<u8>, db: usize) -> Vec<u8> {
+    const HEAD: &[u8] = b"-SEARCH_INDEX_NOT_FOUND Index not found: ";
+    if let Some(name) = reply
+        .strip_prefix(HEAD)
+        .and_then(|rest| rest.strip_suffix(b"\r\n"))
+        && !name.contains(&b'\r')
+        && !name.contains(&b'\n')
+    {
+        let mut out = b"-Index with name '".to_vec();
+        out.extend_from_slice(name);
+        out.extend_from_slice(format!("' not found in database {db}\r\n").as_bytes());
+        return out;
+    }
+    reply
 }
 
 // ── Running a filter ──────────────────────────────────────────────────────────
@@ -1234,6 +1362,35 @@ pub(crate) fn plan_keys(def: &IndexDef, plan: &Plan) -> (Vec<Arc<str>>, bool) {
     (keys, plan.exact && p.given_back() == plan.given_back)
 }
 
+/// [`plan_keys`], each with the number of its document's last write, with
+/// `in_order` in the order the documents were written
+/// (`Postings::first_written`), to `deadline`: cut short, the first of those
+/// found, and true last. Without, in id order, as [`plan_keys`].
+pub(crate) fn plan_keys_for(
+    def: &IndexDef,
+    plan: &Plan,
+    in_order: bool,
+    deadline: Option<Instant>,
+) -> (Vec<(Arc<str>, u64)>, bool, bool) {
+    let p = def.postings.peek();
+    let numbered = |id: u32| p.key(id).map(|key| (Arc::clone(key), p.written(id)));
+    if !in_order {
+        let keys = plan.ids.iter().filter_map(numbered).collect();
+        return (keys, plan.exact && p.given_back() == plan.given_back, false);
+    }
+    let all = plan.ids.count();
+    let mut clock = Clock::new(deadline);
+    let keys = first_written(&p, &plan.ids, all, all, false, &mut clock)
+        .into_iter()
+        .filter_map(numbered)
+        .collect();
+    (
+        keys,
+        plan.exact && p.given_back() == plan.given_back,
+        clock.out,
+    )
+}
+
 /// Relevance of the document at `key`, whose fields are `fields`, for the
 /// query `scoring` was made for: as Redis 8 scores it (see `vector::score`).
 pub(crate) fn relevance(
@@ -1555,9 +1712,11 @@ struct Posted {
 /// What a page picked from postings is in the order of.
 #[derive(Clone, Copy)]
 enum PageOrder<'a> {
-    /// The key: what relevance comes down to when every match scores the same.
-    Key,
-    /// The number in the NUMERIC field read from `field`, then the key.
+    /// The order the documents were written in (`Postings::first_written`):
+    /// what relevance comes down to when every match scores the same.
+    Written,
+    /// The number in the NUMERIC field read from `field`, then the order the
+    /// documents were written in; descending, the reverse of the two.
     Number { field: &'a str, ascending: bool },
 }
 
@@ -1589,7 +1748,8 @@ impl Clock {
 }
 
 /// Whether every document `filter` matches has the same relevance, so that
-/// without SORTBY the order is the key's alone (the full path's tie-break).
+/// without SORTBY the order is the one they were written in (the full
+/// path's, for matches that score the same).
 /// Scored as `vector::score` scores (Redis 8's way): a word by its
 /// frequency; a TAG value by how many documents hold it, against the
 /// document's TEXT length, and `*` against that length too; a NUMERIC
@@ -1627,6 +1787,45 @@ fn every_match_scores_the_same(
     }
 }
 
+/// Each run of `items` that `level` finds level, in the order its documents
+/// were written in `def` (as Redis orders them, by its document ids), or the
+/// reverse with `descending`. `items` are in order otherwise, each run by
+/// key: documents numbered alike (put in by one walk), and those of an index
+/// that numbers none (of vectors alone), stay by key, or by key reversed.
+/// Nothing is looked up where no two are level.
+pub(crate) fn level_in_written_order<T>(
+    def: &IndexDef,
+    items: &mut [T],
+    key: impl Fn(&T) -> &str,
+    level: impl Fn(&T, &T) -> bool,
+    descending: bool,
+) {
+    let mut postings = None;
+    let mut start = 0;
+    while start < items.len() {
+        let mut end = start + 1;
+        while end < items.len() && level(&items[start], &items[end]) {
+            end += 1;
+        }
+        if end - start > 1 {
+            let run = &mut items[start..end];
+            if descending {
+                run.reverse();
+            }
+            if def.gives_ids() {
+                let p = postings.get_or_insert_with(|| def.postings.read());
+                let written = |item: &T| {
+                    let n = p.id(key(item)).map_or(u64::MAX, |id| p.written(id));
+                    if descending { !n } else { n }
+                };
+                // Stable: those numbered alike keep their keys' order.
+                run.sort_by_cached_key(written);
+            }
+        }
+        start = end;
+    }
+}
+
 /// FT.SEARCH's page and count from postings, reading only the documents of
 /// the page: see above. `None` where the full path is to answer.
 fn page_from_postings(
@@ -1653,7 +1852,7 @@ fn page_from_postings(
     let (order, numeric) = match &args.sortby {
         // Only the count (LIMIT 0 0): no order to keep.
         None if args.count == 0 || every_match_scores_the_same(def, filter, scorer) => {
-            (PageOrder::Key, None)
+            (PageOrder::Written, None)
         }
         None => return None,
         Some((name, ascending)) => {
@@ -1745,7 +1944,7 @@ fn page_from_postings(
         let need = need.min(total);
         let mut clock = Clock::new(deadline);
         let first: Vec<(u32, Option<f64>)> = match order {
-            PageOrder::Key => first_by_key(&p, &ids, need, total, &mut clock)
+            PageOrder::Written => first_written(&p, &ids, need, total, false, &mut clock)
                 .into_iter()
                 .map(|id| (id, None))
                 .collect(),
@@ -1811,18 +2010,28 @@ fn key_of(p: &Postings, id: u32) -> &str {
     p.key(id).map_or("", |key| &**key)
 }
 
-/// The first `need` of `ids` (`of` of them) in the order of their keys,
-/// from the postings' order of them (`Postings::first_by_key`). Cut short
-/// when `clock` runs out: then the first of those found.
-fn first_by_key(p: &Postings, ids: &Bits, need: usize, of: usize, clock: &mut Clock) -> Vec<u32> {
-    p.first_by_key(ids, need, of, &mut || clock.ran_out())
+/// The first `need` of `ids` (`of` of them) in the order their documents
+/// were written, or the last ones, last first, with `descending`
+/// (`Postings::first_written`). Cut short when `clock` runs out: then the
+/// first of those found.
+fn first_written(
+    p: &Postings,
+    ids: &Bits,
+    need: usize,
+    of: usize,
+    descending: bool,
+    clock: &mut Clock,
+) -> Vec<u32> {
+    p.first_written(ids, need, of, descending, &mut || clock.ran_out())
 }
 
 /// The first `need` of `ids` in the order SORTBY gives the NUMERIC field
-/// read from `field`: by the number (`f64::total_cmp`), ascending or not,
-/// then by key; those without a number last, by key. Each with its number.
-/// `None` if a document holds NaN, which has no place in the postings'
-/// order. Cut short when `clock` runs out.
+/// read from `field`: by the number (`f64::total_cmp`), then by the order
+/// the documents were written in (as Redis, by its document ids), and
+/// descending the reverse of both; those without a number last, in the
+/// order they were written in, or its reverse. Each with its number. `None`
+/// if a document holds NaN, which has no place in the postings' order. Cut
+/// short when `clock` runs out.
 fn first_by_number(
     p: &Postings,
     field: &str,
@@ -1843,9 +2052,11 @@ fn first_by_number(
     if want > 0 {
         let value = |id: u32| numbers.value(id).unwrap_or(0.0);
         let cmp = |a: &(f64, u32), b: &(f64, u32)| {
-            let order = a.0.total_cmp(&b.0);
-            let order = if ascending { order } else { order.reverse() };
-            order.then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)))
+            let order =
+                a.0.total_cmp(&b.0)
+                    .then_with(|| p.written(a.1).cmp(&p.written(b.1)))
+                    .then_with(|| key_of(p, a.1).cmp(key_of(p, b.1)));
+            if ascending { order } else { order.reverse() }
         };
         // Going through the numbers in order meets the `want` first after
         // about want * ordered / with_number of them; taking the number of
@@ -1857,8 +2068,8 @@ fn first_by_number(
         let mut gave_up = false;
         if walked < with_number as u128 {
             let mut budget = (walked * 4).max(4096);
-            // Those equal to the last one wanted are taken too: their keys
-            // decide which of them are on the page.
+            // Those equal to the last one wanted are taken too: the order
+            // they were written in decides which of them are on the page.
             let mut last: Option<u64> = None;
             numbers.walk(ascending, |place, id| {
                 if clock.ran_out() || last.is_some_and(|last| last != place) {
@@ -1900,7 +2111,7 @@ fn first_by_number(
         let mut rest = ids.clone();
         rest.and_not(numbers.has());
         let of = rest.count();
-        let more = first_by_key(p, &rest, need - with_number, of, clock);
+        let more = first_written(p, &rest, need - with_number, of, !ascending, clock);
         first.extend(more.into_iter().map(|id| (id, None)));
     }
     Some(first)
@@ -2500,6 +2711,15 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 );
                 scorer.nearest()
             };
+            let mut nearest = nearest;
+            // As near, in the order they were written.
+            level_in_written_order(
+                &def,
+                &mut nearest,
+                |found| &found.key,
+                |a, b| a.score.to_bits() == b.score.to_bits(),
+                false,
+            );
             nearest
                 .into_iter()
                 .map(|found| Hit {
@@ -2535,16 +2755,31 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
             if no_time_for(deadline, matches.len()) {
                 timed_out = true;
             } else if by_distance {
-                // Nearest first.
+                // Nearest first; as near, in the order they were written.
+                let distance = |m: &Match| m.distance.unwrap_or(f32::MAX);
                 matches.sort_by(|a, b| {
-                    a.distance
-                        .unwrap_or(f32::MAX)
-                        .total_cmp(&b.distance.unwrap_or(f32::MAX))
+                    distance(a)
+                        .total_cmp(&distance(b))
                         .then_with(|| a.key.cmp(&b.key))
                 });
+                level_in_written_order(
+                    &def,
+                    &mut matches,
+                    |m| &m.key,
+                    |a, b| distance(a).to_bits() == distance(b).to_bits(),
+                    false,
+                );
             } else {
-                // Most relevant first.
+                // Most relevant first; as relevant, in the order they were
+                // written.
                 matches.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key)));
+                level_in_written_order(
+                    &def,
+                    &mut matches,
+                    |m| &m.key,
+                    |a, b| a.score.to_bits() == b.score.to_bits(),
+                    false,
+                );
             }
             matches
                 .into_iter()
@@ -2627,6 +2862,20 @@ fn search(ctx: &mut Ctx) -> Result<Vec<u8>, String> {
                 let order = if *ascending { order } else { order.reverse() };
                 order.then_with(|| a.key.cmp(&b.key))
             });
+            // Level values (and those without one), in the order the
+            // documents were written, or its reverse.
+            level_in_written_order(
+                &def,
+                &mut hits,
+                |hit| &hit.key,
+                |a, b| match (&a.sort_key, &b.sort_key) {
+                    (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y).is_eq(),
+                    (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x == y,
+                    (None, None) => true,
+                    _ => false,
+                },
+                !*ascending,
+            );
         }
     }
     // ── The page ─────────────────────────────────────────────────────────────
@@ -2875,9 +3124,11 @@ fn encode_page(
 thread_local! {
     /// Set while a coordinator runs its own part of a search.
     static SHARD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    /// Set while `FT.PROFILE` runs the query it profiles: valkey-search has
-    /// no `FT.PROFILE`, so its reply, and the one inside it, keep the Redis
-    /// shape in every mode.
+    /// Set while `FT.PROFILE` runs the query it profiles for a connection that
+    /// gets the Redis shape, so that the reply inside the profile is Redis's
+    /// too. A connection that takes valkey-search's shape does not set it: its
+    /// profile is the array valkey-glide converts, with the search's reply in
+    /// that shape.
     static PROFILING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3098,6 +3349,11 @@ fn coordinate(
     use crate::cluster::search::Reply;
     let mut total = 0usize;
     let mut hits: Vec<PageHit> = Vec::new();
+    // Each hit's place in its master's order: of hits that are level, the
+    // one earlier in its master's order first, and of two at the same place,
+    // the one whose key sorts first. So each master's order of its own is
+    // kept, and the order is the same whichever node coordinates.
+    let mut places: Vec<usize> = Vec::new();
     let mut timed_out = false;
     for reply in replies {
         let (reply, shard_timed_out) = crate::cluster::search::decode_search(reply)?;
@@ -3109,6 +3365,7 @@ fn coordinate(
         if let Some(Reply::Int(n)) = items.next() {
             total += n.max(0) as usize;
         }
+        let mut place = 0;
         while let Some(key) = items.next() {
             // A master sends the key's bytes (`bytes_of` of its name): it is
             // a name again by `text_of`, as `encode_page` expects. It was
@@ -3166,13 +3423,19 @@ fn coordinate(
                 sort_key,
                 fields,
             });
+            places.push(place);
+            place += 1;
         }
     }
 
     // One order over all of them, as one node orders its own.
     use std::cmp::Ordering;
+    let mut placed: Vec<(usize, PageHit)> = places.into_iter().zip(hits).collect();
+    let level = |a: &(usize, PageHit), b: &(usize, PageHit)| {
+        a.0.cmp(&b.0).then_with(|| a.1.key.cmp(&b.1.key))
+    };
     match &args.sortby {
-        Some((_, ascending)) => hits.sort_by(|a, b| {
+        Some((_, ascending)) => placed.sort_by(|(pa, a), (pb, b)| {
             let order = match (&a.sort_key, &b.sort_key) {
                 (Some(SortKey::Number(x)), Some(SortKey::Number(y))) => x.total_cmp(y),
                 (Some(SortKey::Text(x)), Some(SortKey::Text(y))) => x.cmp(y),
@@ -3183,13 +3446,16 @@ fn coordinate(
                 (None, None) => Ordering::Equal,
             };
             let order = if *ascending { order } else { order.reverse() };
-            order.then_with(|| a.key.cmp(&b.key))
+            order
+                .then_with(|| pa.cmp(pb))
+                .then_with(|| a.key.cmp(&b.key))
         }),
         None if by_distance => {
-            hits.sort_by(|a, b| a.score.total_cmp(&b.score).then_with(|| a.key.cmp(&b.key)))
+            placed.sort_by(|a, b| a.1.score.total_cmp(&b.1.score).then_with(|| level(a, b)))
         }
-        None => hits.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.key.cmp(&b.key))),
+        None => placed.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then_with(|| level(a, b))),
     }
+    let mut hits: Vec<PageHit> = placed.into_iter().map(|(_, hit)| hit).collect();
     // KNN k: the k nearest of the cluster, not k from each master.
     if let Some(k) = nearest {
         hits.truncate(k);
@@ -3638,20 +3904,20 @@ mod tests {
         p
     }
 
-    /// `ids` in the full path's SORTBY order: every one sorted.
+    /// `ids` in the full path's SORTBY order: every one sorted. By the
+    /// number, then the order written, both reversed descending; those
+    /// without a number last, in the order written or its reverse.
     fn sorted_whole(p: &Postings, ids: &Bits, ascending: bool) -> Vec<u32> {
         use std::cmp::Ordering;
         let numbers = p.numbers("n").unwrap();
+        let written = |id: u32| (p.written(id), key_of(p, id));
+        let way = |order: Ordering| if ascending { order } else { order.reverse() };
         let mut all: Vec<u32> = ids.iter().collect();
-        all.sort_by(|&a, &b| {
-            let order = match (numbers.value(a), numbers.value(b)) {
-                (Some(x), Some(y)) if ascending => x.total_cmp(&y),
-                (Some(x), Some(y)) => y.total_cmp(&x),
-                (Some(_), None) => Ordering::Less,
-                (None, Some(_)) => Ordering::Greater,
-                (None, None) => Ordering::Equal,
-            };
-            order.then_with(|| key_of(p, a).cmp(key_of(p, b)))
+        all.sort_by(|&a, &b| match (numbers.value(a), numbers.value(b)) {
+            (Some(x), Some(y)) => way(x.total_cmp(&y).then_with(|| written(a).cmp(&written(b)))),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => way(written(a).cmp(&written(b))),
         });
         all
     }
@@ -3700,14 +3966,18 @@ mod tests {
                     assert!(!clock.out);
                 }
             }
-            let mut by_key: Vec<u32> = ids.iter().collect();
-            by_key.sort_by(|&a, &b| key_of(&p, a).cmp(key_of(&p, b)));
+            let mut written: Vec<u32> = ids.iter().collect();
+            written.sort_by_key(|&id| (p.written(id), key_of(&p, id)));
+            let mut last_first = written.clone();
+            last_first.reverse();
             for need in [0, 1, 3, of / 5, of / 3, of]
                 .into_iter()
                 .filter(|&n| n <= of)
             {
-                let first = first_by_key(&p, &ids, need, of, &mut Clock::new(None));
-                assert_eq!(first.as_slice(), &by_key[..need], "round {round}");
+                let first = first_written(&p, &ids, need, of, false, &mut Clock::new(None));
+                assert_eq!(first.as_slice(), &written[..need], "round {round}");
+                let last = first_written(&p, &ids, need, of, true, &mut Clock::new(None));
+                assert_eq!(last.as_slice(), &last_first[..need], "round {round}");
             }
         }
         // A NaN anywhere in the field: no order from the postings.
@@ -3723,7 +3993,7 @@ mod tests {
         };
         // The clock is read after 1024 documents: the first of those.
         let mut clock = Clock::new(Some(past));
-        let first = first_by_key(&p, p.live(), 3000, 5000, &mut clock);
+        let first = first_written(&p, p.live(), 3000, 5000, false, &mut clock);
         assert!(clock.out);
         assert!(first.len() < 3000, "{}", first.len());
         let mut clock = Clock::new(Some(past));
@@ -3763,5 +4033,62 @@ mod tests {
         assert!(!no_time_for(None, usize::MAX));
         let later = Some(Instant::now() + Duration::from_secs(60));
         assert!(!no_time_for(later, usize::MAX));
+    }
+
+    #[test]
+    fn a_missing_index_is_worded_as_valkey_search_words_it() {
+        let redis = format!("-{}\r\n", no_such_index("idx:a b"));
+        assert_eq!(
+            redis,
+            "-SEARCH_INDEX_NOT_FOUND Index not found: idx:a b\r\n"
+        );
+        assert_eq!(
+            valkey_missing_index(redis.into_bytes(), 3),
+            b"-Index with name 'idx:a b' not found in database 3\r\n"
+        );
+        // Another reply is returned as it is.
+        for other in [
+            "-ERR wrong number of arguments for 'FT.INFO' command\r\n",
+            "+OK\r\n",
+            "-SEARCH_INDEX_NOT_FOUND Index not found: a\r\nb\r\n",
+        ] {
+            assert_eq!(
+                valkey_missing_index(other.as_bytes().to_vec(), 0),
+                other.as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn the_wording_follows_the_setting_except_for_a_forwarded_command_or_a_script() {
+        // (setting, glide, forwarded, in a script) -> valkey's words
+        for (setting, glide, forwarded, script, want) in [
+            (RESP3_AUTO, false, false, false, false),
+            (RESP3_AUTO, true, false, false, true),
+            (RESP3_REDIS, true, false, false, false),
+            (RESP3_VALKEY, false, false, false, true),
+            // A node answering its cluster's coordinator speaks Redis's words.
+            (RESP3_VALKEY, false, true, false, false),
+            (RESP3_AUTO, true, true, false, false),
+            // A script reads the Redis text whoever runs it.
+            (RESP3_VALKEY, false, false, true, false),
+            (RESP3_AUTO, true, false, true, false),
+        ] {
+            assert_eq!(
+                wording_is_valkey(setting, glide, forwarded, script),
+                want,
+                "{setting} {glide} {forwarded} {script}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_wordings_of_a_missing_index_are_known_to_a_coordinator() {
+        assert!(is_no_such_index(&no_such_index("idx")));
+        assert!(is_no_such_index(
+            "Index with name 'idx' not found in database 0\r\n"
+        ));
+        assert!(is_no_such_index("ERR no such index"));
+        assert!(!is_no_such_index("ERR wrong number of arguments"));
     }
 }

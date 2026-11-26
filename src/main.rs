@@ -459,7 +459,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
     // Without Lua there are no scripts to run beside each other, and the
     // commands are spared looking for a tag to wait on.
-    tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
+    tag_locks::set_mode(if cfg!(feature = "lua") {
+        config.lua_parallel_scripts
+    } else {
+        config::ParallelScripts::No
+    });
+    vector::flat_int8::set_enabled(config.search_flat_int8);
     eviction::configure(&config);
     compaction::configure(&config);
     give_back::set_enabled(config.allocator_give_back);
@@ -890,6 +895,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                 std::process::exit(1);
             }
         }
+    }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
     }
     // start_hub needs a tokio runtime — give it its own single-thread runtime
     // just like the AOF writer, so it never competes with the io_uring workers.
@@ -1784,6 +1796,13 @@ async fn async_main_tokio(
                 std::process::exit(1);
             }
         }
+    }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
     }
 
     let addr: SocketAddr = config.addr().parse()?;

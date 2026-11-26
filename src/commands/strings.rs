@@ -1208,6 +1208,8 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         // ── SETRANGE ──────────────────────────────────────────────────────────────────
         // Overwrites bytes at a given offset, zero-padding if needed.
         // Creates the key if it doesn't exist (treats it as empty string).
+        // Written where the string is kept when nothing else holds it and its
+        // block has room; otherwise copied once (`edit_str_in_place`).
         "SETRANGE" => {
             if cmd.len() != 4 {
                 return Some(resp_error(
@@ -1239,36 +1241,35 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // In the string's own entry, when it has room.
-            if !patch.is_empty()
-                && let Some(len) = map.set_range_in_place(key, offset, patch)
-            {
-                return Some(resp_integer(len as i64));
-            }
-            let existing: Vec<u8> = match map.get(key) {
-                None => vec![],
-                Some(ValueRef::String(v)) => v.to_vec(), // copy into owned Vec to mutate
+            let len = match map.get(key) {
+                None => 0,
+                Some(ValueRef::String(v)) => v.len(),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ));
                 }
             };
-            // Nothing to write: the string is as it was, and a key that
-            // was not there is not created.
+            // Nothing to write: the string is as it was, and a key that was
+            // not there is not created. Checked here because the helper
+            // grows the string to `offset` even for an empty patch. Not a
+            // write, as in Redis: nothing propagated or counted, and no
+            // `WATCH` broken.
             if patch.is_empty() {
-                return Some(resp_integer(existing.len() as i64));
+                ctx.skip_write_side_effects = true;
+                return Some(resp_integer(len as i64));
             }
-            let required_len = offset + patch.len();
-            let mut buf = existing;
-            if buf.len() < required_len {
-                buf.resize(required_len, 0u8); // zero-pad
-            }
-            buf[offset..offset + patch.len()].copy_from_slice(patch);
-            let new_len = buf.len() as i64;
-            drop(map.set_str(key, buf.as_slice()));
+            let Some(written) = map.edit_str_in_place(key, offset, patch) else {
+                // Not reached: the key was a string or absent under this
+                // lock, and the length was checked above.
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            };
             drop(map);
-            Some(resp_integer(new_len))
+            // A copied string's old entry is freed with the shard unlocked.
+            drop(written);
+            Some(resp_integer(len.max(offset + patch.len()) as i64))
         }
 
         // ── GETEX ─────────────────────────────────────────────────────────────────────
@@ -2380,6 +2381,383 @@ mod write_shards_tests {
             .collect();
         for writer in writers {
             writer.join().unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod setrange_tests {
+    use super::*;
+    use crate::commands::bitmap::tests::{
+        Holder, SIZES, SMALL, alone, counting, dispatched, in_entry, put, stored, with_ctx,
+    };
+    use std::sync::Arc;
+
+    /// `line`, split at spaces (a trailing space is an empty patch), run by
+    /// the strings handler on `store`'s database 0: the reply, whether the
+    /// write is left unpropagated, and the most the handler allocated at
+    /// once, if this thread counts it.
+    fn run(store: &store::Store, line: &str) -> (Vec<u8>, bool, Option<isize>) {
+        with_ctx(store, line, &crate::watch::NoopWatchRegistry, |mut ctx| {
+            let name = line.split(' ').next().unwrap();
+            let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
+            (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
+    }
+
+    /// [`run`] in a test that counts allocations (see `counting`).
+    fn counted(store: &store::Store, line: &str) -> (Vec<u8>, bool, isize) {
+        let (reply, skipped, peak) = run(store, line);
+        (
+            reply,
+            skipped,
+            peak.expect("a thread that counts its allocations"),
+        )
+    }
+
+    /// `len` bytes that differ from their neighbours.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    const WRONGTYPE: &[u8] = b"-WRONGTYPE";
+
+    /// A patch inside a string nothing else holds is written where the
+    /// string is, at every size up to 64 MiB: no copy, and the reply is the
+    /// length.
+    #[test]
+    fn a_setrange_inside_a_string_nothing_else_holds_copies_nothing() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_inside_a_string_nothing_else_holds_copies_nothing",
+            || {
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    for offset in [0, len / 2, len - 3] {
+                        let line = format!("SETRANGE k {offset} abc");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!((reply, skipped), (resp_integer(len as i64), false));
+                        assert!(peak < SMALL, "{len} {offset}: {peak} bytes");
+                        value[offset..offset + 3].copy_from_slice(b"abc");
+                        assert_eq!(stored(&store, b"k"), Some((value.clone(), at)), "{len}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// Held by a snapshot (the entry) or a reply (the bytes), the string is
+    /// copied once and the holder keeps the bytes it held; bytes in the
+    /// entry that a reply copied out are not held, and stay in place.
+    #[test]
+    fn a_setrange_of_a_held_string_copies_it_once_and_the_holder_keeps_its_bytes() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_of_a_held_string_copies_it_once_and_the_holder_keeps_its_bytes",
+            || {
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let inline = in_entry(&store, b"k");
+                    let holders = [Holder::Nothing, Holder::Entry, Holder::Bytes];
+                    for (holder, offset) in holders.into_iter().zip([0, 2, 4]) {
+                        let (old, at) = stored(&store, b"k").unwrap();
+                        let shard = store::get_shard(&store[0], b"k");
+                        let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                        let bytes =
+                            (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                                Some(ValueRef::String(b)) => b.to_shared(),
+                                _ => panic!("no string"),
+                            });
+                        let line = format!("SETRANGE k {offset} zz");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        let case = format!("{len} {holder:?}");
+                        assert_eq!(
+                            (reply, skipped),
+                            (resp_integer(len as i64), false),
+                            "{case}"
+                        );
+                        value[offset..offset + 2].copy_from_slice(b"zz");
+                        let (now, moved_to) = stored(&store, b"k").unwrap();
+                        assert_eq!(now, value, "{case}");
+                        let copied = holder == Holder::Entry || holder == Holder::Bytes && !inline;
+                        assert_eq!(moved_to != at, copied, "{case}");
+                        if copied {
+                            // One copy, not a copy to change and then another to store.
+                            let most = (len + len / 2) as isize + SMALL;
+                            assert!(peak >= len as isize && peak < most, "{case}: {peak}");
+                        } else {
+                            assert!(peak < SMALL, "{case}: {peak} bytes");
+                        }
+                        if let Some(Some(entry)) = &entry {
+                            assert!(
+                                matches!(entry.value(), ValueRef::String(b) if b[..] == old[..]),
+                                "{case}"
+                            );
+                        }
+                        if let Some(bytes) = &bytes {
+                            assert_eq!(bytes[..], old[..], "{case}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Growth stays where the string is while its block keeps its class,
+    /// the gap zero-filled; past the class, or for a block of the system
+    /// allocator's, the string is copied once into a new block, zero-filled
+    /// the same way.
+    #[test]
+    fn a_setrange_grows_in_place_only_within_its_block() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_grows_in_place_only_within_its_block",
+            || {
+                let slab = |len: usize| crate::value_slab::class_of(len + 8);
+                let top = crate::value_slab::block_size(slab(16 << 10).unwrap()) - 8;
+                assert!(top > (16 << 10) + 2, "no room in the class");
+                // "k" and 110 bytes make a 123-byte entry, in the class of 113
+                // to 128, as 100 bytes do; 120 bytes pass it.
+                for (len, end, stays) in [
+                    (100, 110, true),
+                    (100, 120, false),
+                    (16 << 10, top, true),
+                    (top, top + 1, false),
+                    (64 << 10, (64 << 10) + 1, false),
+                    (1 << 20, (1 << 20) + 10, false),
+                ] {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let line = format!("SETRANGE k {} ab", end - 2);
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    assert_eq!((reply, skipped), (resp_integer(end as i64), false), "{len}");
+                    value.resize(end - 2, 0);
+                    value.extend_from_slice(b"ab");
+                    let (now, moved_to) = stored(&store, b"k").unwrap();
+                    assert_eq!(now, value, "{len}");
+                    assert_eq!(moved_to == at, stays, "{len}");
+                    if stays {
+                        assert!(peak < SMALL, "{len}: {peak} bytes");
+                    } else {
+                        let most = (end + end / 2) as isize + SMALL;
+                        assert!(peak >= len as isize && peak < most, "{len}: {peak}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// An empty patch writes nothing and copies nothing: the reply is the
+    /// length, a missing key is not made, a string does not grow to the
+    /// offset (however far), and another type is refused. It is not a
+    /// write: nothing is propagated or counted.
+    #[test]
+    fn an_empty_setrange_writes_nothing_and_copies_nothing() {
+        counting(
+            "commands::strings::setrange_tests::an_empty_setrange_writes_nothing_and_copies_nothing",
+            || {
+                let store = store::new_store(1);
+                for line in [
+                    "SETRANGE m 10 ",
+                    "SETRANGE m 0 ",
+                    "SETRANGE m 1099511627776 ",
+                ] {
+                    let (reply, skipped, peak) = counted(&store, line);
+                    assert_eq!((reply, skipped), (resp_integer(0), true), "{line}");
+                    assert!(peak < SMALL, "{line}: {peak} bytes");
+                    assert_eq!(stored(&store, b"m"), None, "{line}");
+                }
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let value = pattern(len);
+                    put(&store, b"k", &value);
+                    let was = stored(&store, b"k");
+                    for offset in [0, len / 2, len + 10, 1 << 40] {
+                        let line = format!("SETRANGE k {offset} ");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!((reply, skipped), (resp_integer(len as i64), true));
+                        assert!(peak < SMALL, "{len} {offset}: {peak} bytes");
+                        assert_eq!(stored(&store, b"k"), was, "{len} {offset}");
+                    }
+                }
+                let set = crate::member_set::MemberSet::new();
+                let set = KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
+                drop(store::get_shard(&store[0], b"s").write().insert(b"s", set));
+                let (reply, _, _) = counted(&store, "SETRANGE s 0 ");
+                assert!(reply.starts_with(WRONGTYPE), "{reply:?}");
+            },
+        );
+    }
+
+    /// A key's time to live stays, in place or copied; a key past it is
+    /// written as a new one, zero-filled to the offset, without one.
+    /// Another type, a length past 512 MB and a bad offset are refused, and
+    /// leave everything as it was.
+    #[test]
+    fn setrange_keeps_a_time_to_live_and_refuses_what_it_cannot_write() {
+        let store = store::new_store(1);
+        let later = crate::commands::helpers::now_ms() + 3_600_000;
+        for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+            let key = name.as_bytes();
+            let shard = store::get_shard(&store[0], key);
+            drop(
+                shard
+                    .write()
+                    .insert_str_expiring(key, pattern(len), Some(later)),
+            );
+            let at = stored(&store, key).unwrap().1;
+            assert_eq!(
+                run(&store, &format!("SETRANGE {name} 0 a")).0,
+                resp_integer(len as i64)
+            );
+            assert_eq!(stored(&store, key).unwrap().1, at, "{name}: in place");
+            let held = shard.read().get_ref(key);
+            let line = format!("SETRANGE {name} {} b", len + 1);
+            assert_eq!(run(&store, &line).0, resp_integer(len as i64 + 2));
+            drop(held);
+            assert_ne!(stored(&store, key).unwrap().1, at, "{name}: copied");
+            assert_eq!(shard.read().expires(key), Some(later), "{name}");
+            let mut want = pattern(len);
+            want[0] = b'a';
+            want.extend_from_slice(b"\0b");
+            assert_eq!(stored(&store, key).unwrap().0, want, "{name}");
+        }
+        let shard = store::get_shard(&store[0], b"past");
+        drop(shard.write().insert_str_expiring(b"past", b"abc", Some(1)));
+        assert_eq!(run(&store, "SETRANGE past 2 x").0, resp_integer(3));
+        assert_eq!(stored(&store, b"past").unwrap().0, b"\0\0x");
+        assert_eq!(shard.read().expires(b"past"), None);
+
+        let set = crate::member_set::MemberSet::new();
+        let set = KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
+        drop(
+            store::get_shard(&store[0], b"set")
+                .write()
+                .insert(b"set", set),
+        );
+        assert!(run(&store, "SETRANGE set 0 x").0.starts_with(WRONGTYPE));
+        let map = store::get_shard(&store[0], b"set").read();
+        assert!(matches!(map.get(b"set"), Some(ValueRef::Set(_))));
+        drop(map);
+
+        put(&store, b"k", b"abc");
+        for (line, error) in [
+            (
+                "SETRANGE k 536870912 x",
+                "-ERR string exceeds maximum allowed size",
+            ),
+            (
+                "SETRANGE k 536870911 xy",
+                "-ERR string exceeds maximum allowed size",
+            ),
+            ("SETRANGE k -1 x", "-ERR offset is out of range"),
+            (
+                "SETRANGE k x x",
+                "-ERR value is not an integer or out of range",
+            ),
+        ] {
+            let reply = run(&store, line).0;
+            assert!(reply.starts_with(error.as_bytes()), "{line}: {reply:?}");
+        }
+        assert_eq!(stored(&store, b"k").unwrap().0, b"abc");
+    }
+
+    /// Through the dispatcher, a `SETRANGE` written in place breaks a
+    /// `WATCH` on its key and announces `setrange`, as one that copies a
+    /// held string does. An empty one breaks no watch and announces
+    /// nothing. Alone: the event flags are the process's.
+    #[test]
+    fn a_setrange_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::strings::setrange_tests::a_setrange_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+                    let key = name.as_bytes();
+                    put(&store, key, &pattern(len));
+                    let mut want = pattern(len);
+                    for (offset, patch, held) in [(0, "ab", false), (2, "cd", true), (4, "", false)]
+                    {
+                        let shard = store::get_shard(&store[0], key);
+                        let held = held.then(|| shard.read().get_ref(key));
+                        let at = stored(&store, key).unwrap().1;
+                        let broken = Arc::new(AtomicBool::new(false));
+                        watches.watch(0, key, Arc::clone(&broken), false);
+                        events::hold();
+                        let line = format!("SETRANGE {name} {offset} {patch}");
+                        let reply = dispatched(&store, &line, &watches);
+                        let announced = events::release();
+                        let case = format!("{line:?}, held: {}", held.is_some());
+                        assert_eq!(reply, resp_integer(len as i64), "{case}");
+                        want[offset..offset + patch.len()].copy_from_slice(patch.as_bytes());
+                        let (now, moved_to) = stored(&store, key).unwrap();
+                        assert_eq!(now, want, "{case}");
+                        assert_eq!(moved_to == at, held.is_none(), "{case}");
+                        let breaks = !patch.is_empty();
+                        assert_eq!(broken.load(Relaxed), breaks, "{case}: the watch");
+                        let want_events: Vec<(Vec<u8>, Arc<[u8]>)> = if patch.is_empty() {
+                            vec![]
+                        } else {
+                            let mut space = b"__keyspace@0__:".to_vec();
+                            space.extend_from_slice(key);
+                            let event = b"__keyevent@0__:setrange".to_vec();
+                            vec![
+                                (space, Arc::from(&b"setrange"[..])),
+                                (event, Arc::from(key)),
+                            ]
+                        };
+                        assert_eq!(announced, want_events, "{case}: the events");
+                        drop(held);
+                    }
+                }
+            },
+        );
+    }
+
+    /// A capture of the dataset (what `BGSAVE`, a full sync, an AOF rewrite
+    /// and `BACKUP` write out) holds each string's entry: `SETRANGE`s after
+    /// it change the live value only, and the image has the bytes from
+    /// before.
+    #[test]
+    fn a_capture_keeps_the_bytes_from_before_a_setrange() {
+        let store = store::new_store(1);
+        let keys = ["inline", "slab", "own"];
+        let lens = [100, 16 << 10, 1 << 20];
+        for (key, len) in keys.into_iter().zip(lens) {
+            put(&store, key.as_bytes(), &pattern(len));
+        }
+        let frozen = crate::snapshot::freeze_dataset(&store, None).unwrap();
+        for (key, len) in keys.into_iter().zip(lens) {
+            let at = stored(&store, key.as_bytes()).unwrap().1;
+            // The first copies the string; the second finds it unheld.
+            for line in [
+                format!("SETRANGE {key} 0 zz"),
+                format!("SETRANGE {key} 4 yy"),
+            ] {
+                assert_eq!(run(&store, &line).0, resp_integer(len as i64), "{line}");
+            }
+            let (now, moved_to) = stored(&store, key.as_bytes()).unwrap();
+            assert_ne!(moved_to, at, "{key}");
+            assert_eq!(&now[..6], &[b'z', b'z', 2, 3, b'y', b'y'], "{key}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        let path = path.to_str().unwrap();
+        frozen.write_file(path).unwrap();
+        let loaded = crate::snapshot::load_snapshot(path).unwrap();
+        for (key, len) in keys.into_iter().zip(lens) {
+            match loaded.dbs[0].get(&store::Key::from(key)) {
+                Some(KiviDBValue::String(b)) => assert!(b[..] == pattern(len)[..], "{key}"),
+                _ => panic!("{key} not in the image"),
+            }
         }
     }
 }

@@ -741,6 +741,10 @@ fn script_mode<'a>(
     applied: bool,
 ) -> (Option<crate::tag_locks::ScriptTags<'a>>, bool) {
     let allowed_beside = crate::tag_locks::take_next_script_allowed();
+    // The setting as it is now, after the script was counted among those
+    // that run beside others (`tag_locks::parallel_scripts`).
+    #[cfg(feature = "lua")]
+    let tag_locks = tag_locks && crate::tag_locks::parallel_scripts();
     let script_tags = if tag_locks {
         crate::tag_locks::script_tags(cmd)
     } else {
@@ -772,7 +776,7 @@ fn count_script_alone(cmd: &[&[u8]], name: &str, tag_locks: bool, in_another: bo
     if crate::expiry::replaying() {
         return;
     }
-    let why = if !tag_locks {
+    let why = if !tag_locks || !crate::tag_locks::parallel_scripts() {
         Alone::ParallelOff
     } else if in_another {
         Alone::InTransaction
@@ -2831,6 +2835,11 @@ fn announce_command_events(ctx: &Ctx, name: &str, result: &[u8]) {
     if result.starts_with(b"-") || crate::commands::blocking::parked(ctx) {
         return;
     }
+    // A BITFIELD that changed no field and grew nothing wrote nothing, and
+    // Redis 8 announces nothing for it.
+    if name == "BITFIELD" && ctx.skip_write_side_effects {
+        return;
+    }
     for event in crate::keyspace_events::command_events(name, &ctx.cmd, result) {
         if let Some(key) = ctx.cmd.get(event.key) {
             crate::keyspace_events::notify(
@@ -3654,12 +3663,28 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
                 _ => Some(Write::Refresh),
             };
             let db = *ctx.selected_db;
+            // A rename that did not happen (`RENAMENX` onto a key that is
+            // there, a key onto itself) changed no document.
+            let renamed = matches!(name, "RENAME" | "RENAMENX") && ctx.cmd.len() >= 3;
+            let unchanged = renamed
+                && (ctx.cmd[1] == ctx.cmd[2]
+                    || ctx.store.get(db).is_some_and(|d| {
+                        crate::store::get_shard(d, ctx.cmd[1])
+                            .read()
+                            .peek(ctx.cmd[1])
+                            .is_some()
+                    }));
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
                 let key = ctx.cmd[pos];
                 crate::field_expiry::track_key(ctx.store, db, key);
-                if let Some(how) = how {
+                if let Some(how) = how.filter(|_| !unchanged) {
                     crate::vector::reindex_key(ctx.index_store, ctx.store, db, key, how);
                 }
+            }
+            // The renamed document keeps its place in the order of its
+            // index's documents, as in Redis.
+            if renamed && !unchanged {
+                crate::vector::renamed(ctx.index_store, db, ctx.cmd[1], ctx.cmd[2]);
             }
         }
         // These can put it in another database.
@@ -3672,14 +3697,23 @@ fn settle_written_keys(ctx: &Ctx, name: &str) {
             reindex_copied(ctx, name);
         }
         "HDEL" | "HINCRBY" | "HINCRBYFLOAT" | "HSETNX" | "HGETDEL" => {
+            // The fields it wrote: one of an index's makes the document the
+            // last written there (`vector::reindex_key_naming`).
+            let args = ctx.cmd.get(2..).unwrap_or_default();
+            let named: &[&[u8]] = match name {
+                "HDEL" => args,
+                "HGETDEL" => args.get(2..).unwrap_or_default(),
+                _ => args.get(..1).unwrap_or_default(),
+            };
             for pos in crate::keyspec::key_positions(name, &ctx.cmd).iter() {
                 let db = *ctx.selected_db;
-                crate::vector::reindex_key(
+                crate::vector::reindex_key_naming(
                     ctx.index_store,
                     ctx.store,
                     db,
                     ctx.cmd[pos],
                     Write::Refresh,
+                    named,
                 );
             }
         }

@@ -108,8 +108,8 @@ pub fn run_for_test(config: config::Config) {
     let cfg = std::sync::Arc::new(config);
     crate::RUNTIME_MAXMEMORY.store(cfg.maxmemory, std::sync::atomic::Ordering::Relaxed);
     // Only ever switched on here: the servers of one test process share it.
-    if cfg!(feature = "lua") && cfg.lua_parallel_scripts {
-        crate::tag_locks::set_enabled(true);
+    if cfg!(feature = "lua") && cfg.lua_parallel_scripts != config::ParallelScripts::No {
+        crate::tag_locks::set_mode(cfg.lua_parallel_scripts);
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);
@@ -218,6 +218,13 @@ async fn server_tokio(
                 std::process::exit(1);
             }
         }
+    }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
     }
     // The AOF writer gets a dedicated single-thread runtime rather than a task on
     // the shared one. `rewrite_aof` quiesces by holding every shard lock and then

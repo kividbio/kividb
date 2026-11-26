@@ -104,9 +104,16 @@ other files:
   `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, with its own for
   `FT.HYBRID`), so a connection that names itself GLIDE (`CLIENT SETINFO LIB-NAME`) is answered in
   that shape; `search-resp3-reply valkey` does it for every connection. A KNN `WITHSCORES` gives the
-  distance where valkey-search gives 0; `FT.PROFILE` and the other search commands keep the Redis
-  shape; the setting is per node, so in a cluster set every node alike:
+  distance where valkey-search gives 0; `FT.INFO` lists a vector field's dimensions in an `index`
+  list, and `FT.PROFILE` is the array GLIDE converts, in that shape; the other search commands keep
+  the Redis shape; an index that does not exist is named in valkey-search's words (`Index with name
+  '<name>' not found in database <n>`) there and in Redis's elsewhere; the setting is per node, so in
+  a cluster set every node alike:
   [docs/CONFIGURATION.md](CONFIGURATION.md#search-reply-shape-over-resp3).
+- From 1.3.0, Open WebUI's Valkey vector store (`VECTOR_DB=valkey`, valkey-glide-sync), with its client
+  unpatched: its own `ValkeyClient` through insert, search, filtered search, query, get, upsert, delete and reset, 17
+  checks, passing on KiviDB and on valkey/valkey-bundle 9.2.0. `INFO` reports `valkey_version:9.0.1`,
+  which its version gate reads: [docs/integrations/open-webui.md](integrations/open-webui.md).
 - Not compatible: Haystack's Valkey document store, which needs valkey-search's reply formats (it fails on
   Redis 8 too): [docs/integrations/haystack.md](integrations/haystack.md).
 - `redis-py` throughout the end-to-end tests (`tests/e2e/`).
@@ -341,8 +348,9 @@ other files:
     Redis adds the terms in); `TFIDF`, `TFIDF.DOCNORM` and `BM25` of three or
     more words, one of which has a stem, can differ in the proximity factor;
     a fuzzy term scores one of the document's words it matches, which one
-    can differ (see `vector/score.rs`); documents with the same score come
-    in key order, Redis's in the order they were indexed.
+    can differ (see `vector/score.rs`). Documents with the same score come
+    in the order they were written, as in Redis.
+  - Limits of that order: `HEXPIRE` of an indexed field leaves the document where it is; with KNN and `k` below the number of vectors at the same distance, which of those are returned is not decided by the order they were written in; with `aof-preamble no`, the order after an AOF rewrite is that of the rewritten file; `FT.HYBRID` does not use it; a replica fed from its master's stream can order level documents written at the same time from different connections otherwise than its master, so a `LIMIT` page that ends among them can differ; an index of vector fields only keeps the order of the keys; the documents written after an `FT.CREATE` while its first walk is still filling the index, saved in that window, load in the order of their keys. A `RENAME` keeps the document's place, as in Redis. `FT.AGGREGATE` gives groups in the order of their first documents written.
   - Dialect 1: a field modifier applies to the bare words that follow it
     (`@title:a b` is `@title:(a b)`) in Redis, to the first only here;
     `=> {$weight: …}` on a clause is accepted but does not weigh it (and is
@@ -446,7 +454,9 @@ other files:
   follows (`server: redis`, `version: 8.10.0`), as Dragonfly does, so that
   clients use what that release has: redis-py's and Jedis's client-side
   caches need Redis 7.4 or later. KiviDB's own release is `kividb_version`,
-  in `HELLO` and in `INFO`.
+  in `HELLO` and in `INFO`. `INFO` also has `valkey_version:9.0.1`, for
+  clients that gate on the Valkey release (Open WebUI's Valkey vector
+  store wants 9.0.1 or later); `HELLO` says `redis` only.
 - `enable-debug-command` is Redis's, `no` by default from 1.3.0 (1.2.2 and
   earlier ignored it): `DEBUG` is refused with Redis's error unless the
   server started with `yes`, or with `local` and the client is on loopback
