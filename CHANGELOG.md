@@ -991,6 +991,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A write counts one change, as any write command does. A signed
   `INCRBY` that wraps past the field's largest value replies with the
   value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
+- **A `SETRANGE` written from a string's end grows it as an `APPEND`
+  does (part of #1016).** When the key holds a string and the value is
+  written at or past its end, the string grows into the room its block
+  keeps; a block with no room left is grown with `realloc`, which the
+  allocator may do by moving it, and a string held elsewhere is copied
+  once, each into a block with room for a quarter more, at most 16 MiB.
+  Before this change such a `SETRANGE` copied a string of more than
+  26,208 bytes whole on every call. A key `SETRANGE` makes is made at its
+  length, and a value that starts inside the string is written as
+  before. The room is allocated memory: `used_memory`, `maxmemory` and
+  `MEMORY USAGE` count it. Replies, time to live, `WATCH`, keyspace
+  events, the dirty count, the AOF and replication are unchanged.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
