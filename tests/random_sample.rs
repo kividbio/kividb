@@ -404,6 +404,24 @@ fn the_errors_stay_the_same() {
     assert!(matches!(c.cmd(&["HRANDFIELD", "s", "2"]), V::Err(e) if e.starts_with("WRONGTYPE")));
 }
 
+#[test]
+fn hrandfield_count_uses_redis_integer_form() {
+    let server = Server::start();
+    let mut c = server.conn();
+    fill_hash(&mut c, "h", 5);
+
+    for count in ["01", "+1", "-0"] {
+        assert_eq!(
+            c.cmd(&["HRANDFIELD", "h", count]),
+            V::Err("ERR value is not an integer or out of range".into())
+        );
+        assert_eq!(
+            c.cmd(&["HRANDFIELD", "h", count, "WITHVALUES"]),
+            V::Err("ERR value is not an integer or out of range".into())
+        );
+    }
+}
+
 /// How often each of `n` members is named by `pick(reply)`, over `calls`
 /// replies to `args`.
 fn tally(
