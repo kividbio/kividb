@@ -5236,19 +5236,14 @@ fn eval_script(
     install_eval_timeout_hook(lua)?;
     let _hook_guard = LuaHookGuard(lua);
 
-    let result = match table_errors(
-        compiled_script(lua, source, lua_body).and_then(|f| f.call::<LuaValue>(())),
+    // The call and the reply made of it under one `table_errors`: nothing
+    // kept while the reply is made outlives the call, and a call that
+    // succeeds reads `ERROR_KEPT` once.
+    let resp = match table_errors(
+        compiled_script(lua, source, lua_body)
+            .and_then(|f| f.call::<LuaValue>(()))
+            .and_then(|v| lua_value_to_resp(lua, v)),
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            *ctx.selected_db = saved_db;
-            return Err(clean_lua_error(&e));
-        }
-    };
-
-    // Through `table_errors` too: nothing kept while the reply is made
-    // outlives the call.
-    let resp = match table_errors(lua_value_to_resp(lua, result)) {
         Ok(r) => r,
         Err(e) => {
             *ctx.selected_db = saved_db;
@@ -5363,19 +5358,11 @@ fn eval_function_call(
 
     let keys_t: LuaTable = lua.globals().get("KEYS").map_err(|e| e.to_string())?;
     let argv_t: LuaTable = lua.globals().get("ARGV").map_err(|e| e.to_string())?;
-    let result = match table_errors(
-        func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t))),
+    // As in `eval_script`: the call and its reply under one `table_errors`.
+    let resp = match table_errors(
+        func.call::<LuaValue>((LuaValue::Table(keys_t), LuaValue::Table(argv_t)))
+            .and_then(|v| lua_value_to_resp(lua, v)),
     ) {
-        Ok(v) => v,
-        Err(e) => {
-            *ctx.selected_db = saved_db;
-            return Err(clean_lua_error(&e));
-        }
-    };
-
-    // Through `table_errors` too: nothing kept while the reply is made
-    // outlives the call.
-    let resp = match table_errors(lua_value_to_resp(lua, result)) {
         Ok(r) => r,
         Err(e) => {
             *ctx.selected_db = saved_db;
