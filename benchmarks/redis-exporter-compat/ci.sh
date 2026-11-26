@@ -15,7 +15,7 @@ cmd=${1:-} dir=${2:-}
 case $cmd in
   setup) mkdir -p "$dir" && docker pull -q "$image" >/dev/null ;;
   run)
-    port=$3 out=$4 name=compat-redis-exporter
+    port=$3 out=$4 name=compat-redis-exporter-sidecar
     docker rm -f "$name" >/dev/null 2>&1 || true
     # shellcheck disable=SC2086 # EXPORTER_DOCKER_ARGS is a list of words
     docker run -d --name "$name" ${EXPORTER_DOCKER_ARGS:---network host} "$image" \
