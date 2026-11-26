@@ -4615,7 +4615,13 @@ const PLACE_ERROR_MARK: &str = "\u{1}kividb-place\u{1}";
 unsafe fn remember_error_place(state: *mut mlua::ffi::lua_State) {
     use mlua::ffi;
     unsafe {
-        if ffi::lua_type(state, -1) != ffi::LUA_TSTRING || in_finalizer(state) {
+        // A finalizer runs in whatever call collects its value, another
+        // script's too: what it raises is not that call's, and the place
+        // that call kept stays (as in `remember_error_table`).
+        if in_finalizer(state) {
+            return;
+        }
+        if ffi::lua_type(state, -1) != ffi::LUA_TSTRING {
             forget_raised_place();
             return;
         }
