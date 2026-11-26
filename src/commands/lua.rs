@@ -4376,18 +4376,38 @@ fn place_prefix(message: &str) -> Option<(&'static str, &str, &str)> {
 /// without what Lua 5.4 adds after it (`(local 't')`, `(field 'x')`), as
 /// [`normalize_redis_eval_nil_index_error`] has it: Redis's suite matches
 /// `*attempt to index a nil value script*`. The same error reads the same,
-/// raised where it happened or caught and raised again (#1055 review).
+/// raised where it happened or caught and raised again (#1055 review). Only
+/// Lua's note is taken off ([`is_lua_variable_note`]): a message a script
+/// wrote itself, `attempt to index a nil value: bad key x`, stays whole, as
+/// Redis replies it (#1058 review).
 fn index_nil_trimmed(message: &str) -> &str {
     const NIL_INDEX: &str = "attempt to index a nil value";
     let mut rest = message;
     while let Some((_, _, after)) = place_prefix(rest) {
         rest = after;
     }
-    if rest.starts_with(NIL_INDEX) {
-        &message[..message.len() - rest.len() + NIL_INDEX.len()]
-    } else {
-        message
+    match rest.strip_prefix(NIL_INDEX) {
+        Some(note) if note.is_empty() || is_lua_variable_note(note) => {
+            &message[..message.len() - note.len()]
+        }
+        _ => message,
     }
+}
+
+/// What Lua 5.4 puts after a type error to name what it was used as, and
+/// all that follows: ` (local 't')`, ` (global 'x')`, ` (field 'k')`,
+/// ` (upvalue 'u')`, ` (method 'm')`, ` (constant 'c')`.
+fn is_lua_variable_note(note: &str) -> bool {
+    let Some(inner) = note.strip_prefix(" (").and_then(|n| n.strip_suffix("')")) else {
+        return false;
+    };
+    ["local", "global", "field", "upvalue", "method", "constant"]
+        .into_iter()
+        .any(|kind| {
+            inner
+                .strip_prefix(kind)
+                .is_some_and(|r| r.starts_with(" '"))
+        })
 }
 
 /// A Lua error that says where in the script it happened (`user_script:3:
@@ -4815,13 +4835,12 @@ unsafe fn remember_error_table(state: *mut mlua::ffi::lua_State) {
         match ffi::lua_rawget(state, 1) {
             ffi::LUA_TSTRING => {}
             ffi::LUA_TNUMBER => {
-                let mut integer = 0;
-                let n = ffi::lua_tointegerx(state, -1, &mut integer);
-                if integer != 0 {
-                    ffi::lua_pushfstring(state, c"%I".as_ptr(), n);
-                } else {
-                    ffi::lua_pushfstring(state, c"%f".as_ptr(), ffi::lua_tonumber(state, -1));
-                }
+                // As Lua 5.1 writes it, and so Redis (`lua51_number`): `-0`,
+                // `1e+15`, `1.2345678901234e+14`, in a buffer that needs no
+                // drop if the push fails (#1058 review).
+                let mut buf = [0u8; LUA51_NUMBER_BUF];
+                let written = lua51_number(ffi::lua_tonumber(state, -1), &mut buf);
+                ffi::lua_pushlstring(state, written.as_ptr().cast(), written.len());
                 ffi::lua_replace(state, -2);
             }
             _ => {
@@ -4862,23 +4881,13 @@ fn forget_raised_table() {
     }
 }
 
-/// Whether a `__gc` metamethod is on the stack.
+/// Whether a finalizer is running, on this thread or on a coroutine it
+/// started (#1058 review). Lua 5.4 stops its collector while it runs one
+/// (`GCSTPGC`, in lgc.c's `GCTM`), and `lua_gc` answers -1 to anything
+/// then. A coroutine a finalizer made and a script calls after it is not
+/// in it.
 unsafe fn in_finalizer(state: *mut mlua::ffi::lua_State) -> bool {
-    use mlua::ffi;
-    unsafe {
-        let mut ar: ffi::lua_Debug = std::mem::zeroed();
-        let mut level = 0;
-        while ffi::lua_getstack(state, level, &mut ar) != 0 {
-            if ffi::lua_getinfo(state, c"n".as_ptr(), &mut ar) != 0
-                && !ar.name.is_null()
-                && std::ffi::CStr::from_ptr(ar.name).to_bytes() == b"__gc"
-            {
-                return true;
-            }
-            level += 1;
-        }
-        false
-    }
+    unsafe { mlua::ffi::lua_gc(state, mlua::ffi::LUA_GCISRUNNING) < 0 }
 }
 
 /// `tostring` of the value at 1, for [`remember_error_table`] to call protected.

@@ -4170,6 +4170,14 @@ fn fcall_error_of_a_value_that_is_not_a_string_names_user_function() {
     );
 }
 
+/// `error('boom', 0)` on line 2, unwinding through a `<close>` that collects
+/// and so runs what a call before it left to finalize, then starts the
+/// collector again. That call stops it (`collectgarbage('stop')`): a step
+/// that collected its object sooner would leave nothing to test.
+const RAISE_WHILE_COLLECTING: &str = "local c <close> = setmetatable({}, {__close = function() \
+                                      collectgarbage('collect') collectgarbage('restart') end})\n\
+                                      error('boom', 0)";
+
 /// A finalizer that raises while another call's error unwinds (a `<close>`
 /// collects then) leaves the place that call kept.
 #[test]
@@ -4179,19 +4187,18 @@ fn a_finalizer_raising_during_another_call_leaves_its_place() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let raise = "local c <close> = setmetatable({}, \
-                 {__close = function() collectgarbage('collect') end})\n\
-                 error('boom', 0)";
     for raised in ["error(nil)", "error(42, 0)", "error(true)"] {
-        let leave =
-            format!("local t = setmetatable({{}}, {{__gc = function() {raised} end}}) return 1");
+        let leave = format!(
+            "collectgarbage('stop') \
+             local t = setmetatable({{}}, {{__gc = function() {raised} end}}) return 1"
+        );
         assert!(
             matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
             "{raised}"
         );
         assert_script_error(
             &mut c,
-            raise,
+            RAISE_WHILE_COLLECTING,
             &["0"],
             "ERR boom script: {sha}, on @user_script:2.",
         );
@@ -4226,6 +4233,161 @@ fn coroutine_wrap_places_what_is_not_a_string_inside_the_coroutine() {
         ),
     ] {
         let script = format!("local f = coroutine.wrap(function()\n  {raise}\nend)\nf()");
+        assert_script_error(&mut c, &script, &["0"], expected);
+    }
+}
+
+// ── #1058 review, points 5 to 7 ──────────────────────────────────────────────
+
+/// A message a script wrote itself that begins `attempt to index a nil
+/// value` is replied whole, as Redis replies it; only the note Lua adds
+/// after its own message is cut.
+#[test]
+fn a_script_s_own_nil_index_message_is_replied_whole() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (script, expected) in [
+        (
+            "error('attempt to index a nil value: bad key x', 0)",
+            "ERR attempt to index a nil value: bad key x script: {sha}, on @user_script:1.",
+        ),
+        (
+            "error('attempt to index a nil value (local t) and more', 0)",
+            "ERR attempt to index a nil value (local t) and more script: {sha}, on @user_script:1.",
+        ),
+        (
+            "error('attempt to index a nil value', 0)",
+            "ERR attempt to index a nil value script: {sha}, on @user_script:1.",
+        ),
+        // Lua's own: ` (local 't')`, ` (field 'a')`, cut.
+        (
+            "local t\nreturn t.x",
+            "ERR user_script:2: attempt to index a nil value script: {sha}, on @user_script:2.",
+        ),
+        (
+            "local t = {}\nreturn t.a.b",
+            "ERR user_script:2: attempt to index a nil value script: {sha}, on @user_script:2.",
+        ),
+    ] {
+        assert_script_error(&mut c, script, &["0"], expected);
+    }
+}
+
+/// A number a table raised has as its `err` is written as Lua 5.1 writes
+/// it, as Redis replies it.
+#[test]
+fn a_number_err_is_written_as_lua_51_writes_it() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (value, said) in [
+        ("10/2", "5"),
+        ("3", "3"),
+        ("0.1", "0.1"),
+        ("-0.0", "-0"),
+        ("1e15", "1e+15"),
+        ("2^53", "9.007199254741e+15"),
+        ("123456789012345", "1.2345678901234e+14"),
+    ] {
+        assert_script_error(
+            &mut c,
+            &format!("error({{err = {value}}})"),
+            &["0"],
+            &format!("{said} script: {{sha}}, on @user_script:1."),
+        );
+    }
+}
+
+/// A coroutine a finalizer starts is in that finalizer too: what it raises
+/// leaves the place another call kept, as the finalizer's own raise does.
+#[test]
+fn a_coroutine_in_a_finalizer_leaves_another_call_s_place() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for raised in ["error('inner', 0)", "error(nil)"] {
+        let leave = format!(
+            "collectgarbage('stop') local t = setmetatable({{}}, {{__gc = function() \
+             coroutine.wrap(function() {raised} end)() end}}) return 1"
+        );
+        assert!(
+            matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
+            "{raised}"
+        );
+        assert_script_error(
+            &mut c,
+            RAISE_WHILE_COLLECTING,
+            &["0"],
+            "ERR boom script: {sha}, on @user_script:2.",
+        );
+    }
+}
+
+/// So too when the `__gc` is set after `setmetatable` (`__gc = true` marks
+/// the table for it), and for a coroutine `coroutine.resume` runs.
+/// `getmetatable(t)` is a read-only view here, so the script keeps `mt`.
+#[test]
+fn a_coroutine_in_a_gc_set_later_leaves_another_call_s_place() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for started in [
+        "coroutine.wrap(function() error('inner', 0) end)()",
+        "coroutine.resume(coroutine.create(function() error('inner', 0) end))",
+    ] {
+        let leave = format!(
+            "collectgarbage('stop') local mt = {{__gc = true}} \
+             local t = setmetatable({{}}, mt) \
+             mt.__gc = function() {started} end return 1"
+        );
+        assert!(
+            matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
+            "{started}"
+        );
+        assert_script_error(
+            &mut c,
+            RAISE_WHILE_COLLECTING,
+            &["0"],
+            "ERR boom script: {sha}, on @user_script:2.",
+        );
+    }
+}
+
+/// A coroutine a finalizer made, called after that finalizer is done, is
+/// not in it: what it raises is the script's.
+#[test]
+fn a_coroutine_a_finalizer_made_is_the_script_s_when_called_after() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (raised, expected) in [
+        ("error(nil)", "ERR nil script: {sha}, on @user_script:3."),
+        (
+            "error({err = 'tbl'})",
+            "tbl script: {sha}, on @user_script:3.",
+        ),
+    ] {
+        let script = format!(
+            "local saved = {{}}\n\
+             local mt = {{__gc = function() saved[1] = coroutine.wrap(function()\n \
+             {raised}\n\
+             end) end}}\n\
+             local t = setmetatable({{}}, mt)\n\
+             t = nil\n\
+             collectgarbage('collect')\n\
+             saved[1]()"
+        );
         assert_script_error(&mut c, &script, &["0"], expected);
     }
 }
