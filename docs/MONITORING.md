@@ -12,8 +12,13 @@ Run one exporter for each node, next to it:
 
 ```bash
 docker run -d --network host -e REDIS_ADDR=redis://127.0.0.1:6380 \
-  -e REDIS_PASSWORD=change-me oliver006/redis_exporter:v1.66.0
+  -e REDIS_PASSWORD_FILE=/run/secrets/kividb-password.json \
+  -v /etc/kividb/kividb-password.json:/run/secrets/kividb-password.json:ro \
+  oliver006/redis_exporter:v1.66.0
 ```
+
+The password file maps each address to its password:
+`{"redis://127.0.0.1:6380": "change-me"}`.
 
 It serves on port 9121. Prometheus scrapes it:
 
@@ -56,24 +61,36 @@ docker compose --profile load down     # when done
 ```
 
 The `load` profile runs `redis-benchmark` against the master, so the graphs
-move.
+move. It runs flat out until it is stopped. The ports are published on
+localhost only, and Grafana lets anyone in as a viewer.
 
 ## What the exporter reports
 
-Every release, the compat workflow checks what redis_exporter v1.66.0
-reports for KiviDB against what it reports for Redis 8.10.3
-([`benchmarks/redis-exporter-compat`](../benchmarks/redis-exporter-compat)).
-Under the same workload it checks that the exporter scrapes without errors,
-that 14 metrics read what the workload did (keys per database, command and
-error counts, hits and misses, blocked clients, the role, latency
-percentiles), and that each metric Redis has is there.
+From 1.3.0, the exporter reports 113 of the 164 metrics it reports for
+Redis 8.10.3. The other 51 have no `INFO` field in KiviDB yet and are listed
+in [`known-gaps.txt`](../benchmarks/redis-exporter-compat/known-gaps.txt):
+among them pub/sub channel and pattern counts, watched keys, ACL denials,
+the allocator's fragmentation figures, and Lua memory. The dashboard uses
+none of them.
 
-51 of the exporter's metrics are missing for KiviDB, because its `INFO` has
-no field for them yet. They're listed in
-[`known-gaps.txt`](../benchmarks/redis-exporter-compat/known-gaps.txt), and
-include pub/sub channel and pattern counts, watched keys, ACL denials, the
-allocator's fragmentation figures, and Lua memory. The dashboard uses none
-of them.
+Every release, the compat workflow runs redis_exporter v1.66.0 against
+KiviDB and Redis 8.10.3 under the same workload
+([`benchmarks/redis-exporter-compat`](../benchmarks/redis-exporter-compat))
+and checks:
+
+- **the scrape:** `redis_up`, no scrape error, and no error or warning in
+  the exporter's log;
+- **values:** 11 metrics match the workload's exact numbers (keys and
+  expiring keys per database, SET, GET and failed INCR calls, `ERR` errors,
+  hits and misses, blocked clients, the role), and four are checked only to
+  be there or above zero (connected clients, time in SET, used memory, SET
+  latency percentiles);
+- **names:** which of Redis's metrics it also reports for KiviDB, and that
+  each name in `known-gaps.txt` is one of them.
+
+It runs a standalone server, so the replication metrics (the replica link,
+connected replicas and their lag), the dashboard's replication panels and
+the `redis_master_link_up` alert below aren't covered.
 
 The exporter knows only Redis's `INFO` fields, so it leaves out the ones
 KiviDB adds (`kividb_version`, `kividb_variant` and the rest). Read those

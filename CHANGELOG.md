@@ -159,10 +159,12 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/MONITORING.md`.** The compat workflow runs redis_exporter v1.66.0
   (the KiviDB operator's metrics sidecar) against KiviDB and Redis 8.10.3
   on each release (`benchmarks/redis-exporter-compat`). It checks the
-  scrape, 14 metrics against a known workload, and each metric Redis has.
-  The 51 KiviDB lacks, for want of an `INFO` field, are listed in
-  `known-gaps.txt`, and the check fails once KiviDB reports one, so the
-  list stays current. `examples/monitoring` has a Grafana dashboard for
+  scrape, 11 metrics against the workload's exact numbers and four more
+  for a value, and which of Redis's metrics it also reports for KiviDB.
+  The exporter reports 113 of the 164 metrics it reports for Redis 8.10.3.
+  The other 51 have no `INFO` field in KiviDB yet and are listed in
+  `known-gaps.txt`. The check fails once KiviDB reports one of them, or
+  when a name there isn't one the exporter reports for Redis. `examples/monitoring` has a Grafana dashboard for
   these metrics and a Compose file that runs it with a master, a replica,
   the exporters and Prometheus. `compat_junit.py` writes a `SKIP` row as
   `<skipped>`.

@@ -124,7 +124,7 @@ suite on Azure VMs, where KiviDB loses, earlier runs and independent reviews.
 [Migrating from Redis](docs/MIGRATING_FROM_REDIS.md) ·
 [Compatibility and differences](docs/COMPATIBILITY.md) · [Commands](COMMANDS.md) ·
 [Client examples](examples/clients/) · [Vector search](docs/SEARCH.md) ·
-[Performance](docs/PERFORMANCE.md) · [Logs](docs/LOGGING.md) and [errors](docs/ERRORS.md) · [Monitoring](docs/MONITORING.md) ·
+[Performance](docs/PERFORMANCE.md) · [Logs](docs/LOGGING.md) and [errors](docs/ERRORS.md) ·
 [FAQ](docs/FAQ.md) · [Changelog](CHANGELOG.md) ·
 [Releases](https://github.com/kividbio/kividb/releases) · Website: [kividb.io](https://kividb.io)
 

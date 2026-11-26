@@ -9,14 +9,18 @@ sidecar) against 127.0.0.1:PORT. This puts a known workload on the server, the s
 on KiviDB, then reads the exporter's /metrics and checks:
 
 - Scrape: the exporter reaches the server (redis_up 1) and reports no scrape error, and its log
-  has no error.
+  has no error or warning.
 - Value: metrics that read what the workload did, so a field the exporter reads but misparses
-  shows: keys per database, expiring keys, command and error counts, hits and misses, blocked
-  clients, the role.
+  shows. 11 match the workload's exact numbers: keys and expiring keys per database, SET, GET and
+  failed INCR calls, ERR errors, hits and misses, blocked clients, the role. Four check only that
+  a value is there or above zero: connected clients, time in SET, used memory, SET latency
+  percentiles.
 - Metric: each metric name in expected-metrics.txt is reported. That file is what the exporter
   reports for Redis 8.10.3 under this workload (--write-expected writes it). A metric listed in
   known-gaps.txt that KiviDB does not report is a skip, not a fail: KiviDB's INFO has no field
   for it yet.
+- Known gaps: listed: each name in known-gaps.txt is in expected-metrics.txt, so a stale entry
+  fails (the check is in kividb-passes.txt).
 - Known gaps: up to date: no metric listed in known-gaps.txt is reported by KiviDB. When KiviDB
   gains one, remove it from the list (the check is in kividb-passes.txt, so the job fails until
   then).
@@ -158,19 +162,19 @@ def main():
     def values(name, **labels):
         return [v for lab, v in metrics.get(name, []) if all(lab.get(k) == w for k, w in labels.items())]
 
-    def value_check(what, name, expected, **labels):
+    def value_check(what, name, expected, group="Value", **labels):
         got = values(name, **labels)
         sel = ",".join(f'{k}="{v}"' for k, v in labels.items())
         shown = f"{name}{{{sel}}}" if sel else name
         if not got:
-            check(f"Value: {what}", False, f"{shown} not reported")
+            check(f"{group}: {what}", False, f"{shown} not reported")
         elif callable(expected):
-            check(f"Value: {what}", expected(got[0]), f"{shown} is {got[0]:g}")
+            check(f"{group}: {what}", expected(got[0]), f"{shown} is {got[0]:g}")
         else:
-            check(f"Value: {what}", got[0] == expected, f"{shown} is {got[0]:g}, expected {expected:g}")
+            check(f"{group}: {what}", got[0] == expected, f"{shown} is {got[0]:g}, expected {expected:g}")
 
     # Scrape
-    value_check("the exporter reaches the server", "redis_up", 1)
+    value_check("the exporter reaches the server", "redis_up", 1, group="Scrape")
     err = metrics.get("redis_exporter_last_scrape_error", [({}, 1)])[0]
     check("Scrape: no scrape error", err[1] == 0, f"redis_exporter_last_scrape_error {err}")
     if args.exporter_log_command:
@@ -198,7 +202,11 @@ def main():
 
     # Metric
     gaps = set(listed("known-gaps.txt"))
-    for name in listed("expected-metrics.txt"):
+    expected = listed("expected-metrics.txt")
+    stale = sorted(gaps - set(expected))
+    check("Known gaps: listed", not stale,
+          "not in expected-metrics.txt, remove from known-gaps.txt: " + ", ".join(stale))
+    for name in expected:
         present = name in metrics
         check(f"Metric: {name}", present, "" if present else "not reported",
               skip=not present and is_kividb and name in gaps)
