@@ -26,6 +26,7 @@ pub mod command_gate;
 pub mod commands;
 pub mod compaction;
 pub mod config;
+mod conn_runtimes;
 mod counted_btree;
 pub mod cpus;
 pub mod deferred;
@@ -415,6 +416,8 @@ async fn server_tokio(
         crate::listen::server_of(&config),
         crate::listen::Kind::Plain,
     );
+    // As the server's tokio loop does (`conn_runtimes`), with two workers.
+    let conns = crate::conn_runtimes::ConnRuntimes::start(2)?;
     loop {
         let (socket, peer_addr) = match listener.accept().await {
             Ok(v) => v,
@@ -448,7 +451,7 @@ async fn server_tokio(
         let cluster_state = Arc::clone(&cluster_state);
         let monitor_registry = Arc::clone(&monitor_registry);
         let tracking_table = Arc::clone(&tracking_table);
-        tokio::spawn(async move {
+        conns.spawn(socket, move |socket| async move {
             let _slot = slot;
             let _ = server::handle_client(
                 socket,

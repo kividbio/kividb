@@ -26,6 +26,7 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod conn_runtimes;
 mod counted_btree;
 mod cpus;
 mod deferred;
@@ -2145,6 +2146,9 @@ async fn async_main_tokio(
     // while another shutdown was under way, which may still be aborted or
     // fail. Taken when the next one begins.
     let mut signal_pending = false;
+    // Plaintext connections: each on a worker runtime of its own (TLS ones
+    // stay on this runtime).
+    let conns = crate::conn_runtimes::ConnRuntimes::start(config.resolve_threads())?;
     loop {
         #[cfg(unix)]
         let shutdown = tokio::select! {
@@ -2182,7 +2186,7 @@ async fn async_main_tokio(
                         let cluster_state = Arc::clone(&cluster_state);
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
-                        tokio::spawn(async move {
+                        conns.spawn(socket, move |socket| async move {
                             let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,
@@ -2285,7 +2289,7 @@ async fn async_main_tokio(
                         let cluster_state = Arc::clone(&cluster_state);
                         let monitor_registry = Arc::clone(&monitor_registry);
                         let tracking_table = Arc::clone(&tracking_table);
-                        tokio::spawn(async move {
+                        conns.spawn(socket, move |socket| async move {
                             let _slot = slot;
                             if let Err(e) = server::handle_client(
                                 socket,

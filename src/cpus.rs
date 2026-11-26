@@ -200,8 +200,9 @@ pub fn not_pinned_here(mode: WorkerCpuAffinity, tokio: bool) -> Option<String> {
             std::env::consts::OS
         )
     } else if tokio {
-        "not pinned: the tokio I/O model's workers take each other's connections, \
-         so none waits on one held up; worker-cpu-affinity is for io_uring"
+        "not pinned: a tokio worker that runs a long command hands its other \
+         connections to another thread, which a CPU of its own would hold back; \
+         worker-cpu-affinity is for io_uring"
             .to_string()
     } else {
         return None;

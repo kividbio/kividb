@@ -531,8 +531,8 @@ The server's other threads (the replication hub, the AOF writer, expiry, the scr
 a full sync's or a backup's work) are not bound: they run on any of the process's CPUs,
 which with `auto` in effect are the workers' CPUs, so they take turns with the workers as
 before; a thread a worker starts is given all of the process's CPUs back first. The tokio
-I/O model is not bound (its workers take each other's connections, so none waits behind one
-that is held up). Linux only: macOS has no call that binds a thread to a CPU, and on
+I/O model is not bound (each worker serves its own connections, and one that runs a long
+command hands the others to another thread, which a CPU of its own would hold back). Linux only: macOS has no call that binds a thread to a CPU, and on
 FreeBSD the setting is not implemented; there it is accepted and the server says it did
 nothing. The binds are made once, at startup: if the cpuset changes later, the kernel
 decides (verified on cgroup v2, Linux 7.0: a worker whose CPU is removed runs on the whole
