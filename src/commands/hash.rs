@@ -544,7 +544,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // `[count [WITHVALUES]]`, read before the key is looked at.
             let count: Option<i64> = match cmd.get(2) {
                 None => None,
-                Some(raw) => match parse_utf8(raw).and_then(|s| s.parse::<i64>().ok()) {
+                Some(raw) => match crate::commands::login::strict_integer(raw) {
                     // The magnitude has to be a count.
                     Some(i64::MIN) => return Some(resp_error("ERR value is out of range")),
                     Some(n) => Some(n),
