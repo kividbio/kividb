@@ -59,6 +59,45 @@ pub enum IoModel {
     Tokio, // always use tokio
 }
 
+/// `lua-parallel-scripts`: which scripts may run beside others (see
+/// docs/SCRIPTS.md). `yes` and `no` also as `true` and `false`, as the
+/// setting was once a flag.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ParallelScripts {
+    /// Every script runs alone.
+    No,
+    /// A script whose keys share hash tags runs beside others, under their
+    /// locks; any other runs alone.
+    Tags,
+    /// Those, and a script that keeps to its keys and has none with a tag,
+    /// under its keys' locks.
+    #[default]
+    Yes,
+}
+
+impl ParallelScripts {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::No => "no",
+            Self::Tags => "tags",
+            Self::Yes => "yes",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "no" | "false" => Some(Self::No),
+            "tags" => Some(Self::Tags),
+            "yes" | "true" => Some(Self::Yes),
+            _ => None,
+        }
+    }
+}
+
+fn parse_parallel_scripts(value: &str) -> Result<ParallelScripts, String> {
+    ParallelScripts::parse(value).ok_or_else(|| format!("expected yes, tags or no, got '{value}'"))
+}
+
 /// `enable-debug-command`: who may run `DEBUG`, as in Redis.
 #[derive(clap::ValueEnum, Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum DebugCommand {
@@ -181,13 +220,15 @@ pub struct Config {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     pub aof_preamble: bool,
 
-    /// Run scripts whose KEYS share a hash tag beside each other, each under
-    /// its tag's lock, instead of one at a time for the whole server. A
-    /// script run that way may not touch a key outside the tag. On unless
-    /// switched off; it means something only in a build with Lua. See
-    /// docs/SCRIPTS.md.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    pub lua_parallel_scripts: bool,
+    /// Which scripts run beside each other instead of one at a time for the
+    /// whole server: `yes` (the default) runs a script whose KEYS share a
+    /// hash tag under its tag's lock, and a script that keeps to KEYS none
+    /// of which has a tag under its keys' locks; `tags` only the first
+    /// kind; `no` none. A script run that way may not touch a key outside
+    /// its KEYS' tags or keys. It means something only in a build with Lua.
+    /// See docs/SCRIPTS.md.
+    #[arg(long, default_value = "yes", value_parser = parse_parallel_scripts, num_args = 1)]
+    pub lua_parallel_scripts: ParallelScripts,
 
     /// Rewrite the AOF once it has grown this much past its post-rewrite size,
     /// as a percentage (0 = never rewrite automatically).
@@ -748,7 +789,7 @@ impl Default for Config {
             search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
-            lua_parallel_scripts: true,
+            lua_parallel_scripts: ParallelScripts::Yes,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
@@ -901,7 +942,7 @@ impl Config {
             search_index_threads: crate::vector::backlog::IndexThreads::Auto,
             aof: false,
             aof_preamble: true,
-            lua_parallel_scripts: true,
+            lua_parallel_scripts: ParallelScripts::Yes,
             aof_rewrite_percentage: 100,
             aof_rewrite_min_size: 64 * 1024 * 1024,
             databases: 16,
@@ -1392,14 +1433,8 @@ impl Config {
             "aof-rewrite-percentage {}\n",
             self.aof_rewrite_percentage
         ));
-        out.push_str(&format!(
-            "lua-parallel-scripts {}\n",
-            if self.lua_parallel_scripts {
-                "yes"
-            } else {
-                "no"
-            }
-        ));
+        // `lua-parallel-scripts` as it is now, which `CONFIG SET` may have
+        // changed: from `values`, `CONFIG GET`'s rows.
         out.push_str(&format!(
             "aof-rewrite-min-size {}\n",
             self.aof_rewrite_min_size
@@ -2039,7 +2074,16 @@ impl Config {
                 };
                 set!(search_resp3_reply, value)
             }
-            "lua-parallel-scripts" => set!(lua_parallel_scripts, yes_no(key, one()?)?),
+            "lua-parallel-scripts" => {
+                let value = one()?;
+                let Some(mode) = ParallelScripts::parse(value) else {
+                    return Err(format!(
+                        "invalid value '{value}' for 'lua-parallel-scripts': expected yes, tags \
+                         or no"
+                    ));
+                };
+                set!(lua_parallel_scripts, mode)
+            }
             "aof-rewrite-percentage" | "auto-aof-rewrite-percentage" => {
                 set!(aof_rewrite_percentage, number(key, one()?)?)
             }

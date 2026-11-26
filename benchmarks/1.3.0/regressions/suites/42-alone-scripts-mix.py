@@ -7,6 +7,12 @@ interleaved with the build with it) ran Nextcloud's mix with a p99 of 8.45 ms
 at 500 connections and 4.38 ms at 200, against 2.53 and 0.96 ms for the same
 mix with no script; with #880, 2.45 and 0.90 ms.
 
+Since #1049 a script whose keys have no hash tag runs beside others when
+its source names no key but `KEYS[n]` (docs/SCRIPTS.md, "Scripts that keep
+to their keys"). Both scripts here are such scripts: their rows now measure
+them running beside others, not alone (the values were recorded before);
+its gates are all in the worse direction.
+
 Scripts, verbatim:
 
   cad       Nextcloud's lock release (`lib/private/Lock/MemcacheLockingProvider`

@@ -2357,3 +2357,57 @@ fn non_loopback_ip() -> Option<std::net::IpAddr> {
     let ip = socket.local_addr().ok()?.ip();
     (!ip.is_loopback() && !ip.is_unspecified()).then_some(ip)
 }
+
+/// `lua-parallel-scripts` takes `yes`, `tags` and `no` from the file and
+/// from `CONFIG SET`, and `CONFIG REWRITE` writes the value it has now, which
+/// a restart from the file reads back. A build without Lua runs no script
+/// beside others, and says `no` whatever it was given.
+#[test]
+fn config_rewrite_keeps_each_lua_parallel_scripts_value() {
+    let shown = |value: &'static str| if cfg!(feature = "lua") { value } else { "no" };
+    for (from_file, set) in [
+        ("tags", "no"),
+        ("no", "yes"),
+        ("yes", "tags"),
+        ("tags", "yes"),
+    ] {
+        let port = free_port();
+        let tmp = tempfile::tempdir().unwrap();
+        let conf = tmp.path().join("kividb.conf");
+        std::fs::write(
+            &conf,
+            format!("port {port}\nlua-parallel-scripts {from_file}\n"),
+        )
+        .unwrap();
+        let mut server = start_from_file(&conf, tmp.path(), port);
+        let mut c = Conn::connect(port);
+        assert_eq!(
+            config_get_all(&mut c)["lua-parallel-scripts"],
+            shown(from_file)
+        );
+        assert!(
+            c.cmds(&["CONFIG", "SET", "lua-parallel-scripts", set])
+                .is_ok()
+        );
+        assert_eq!(config_get_all(&mut c)["lua-parallel-scripts"], set);
+        assert!(
+            c.cmds(&["CONFIG", "SET", "lua-parallel-scripts", "some"])
+                .is_error()
+        );
+        assert!(c.cmds(&["CONFIG", "REWRITE"]).is_ok());
+        drop(c);
+        server.kill().unwrap();
+        let _ = server.wait();
+        let written = std::fs::read_to_string(&conf).unwrap();
+        let mut server = start_from_file(&conf, tmp.path(), port);
+        let mut c = Conn::connect(port);
+        assert_eq!(
+            config_get_all(&mut c)["lua-parallel-scripts"],
+            shown(set),
+            "{written}"
+        );
+        drop(c);
+        server.kill().unwrap();
+        let _ = server.wait();
+    }
+}

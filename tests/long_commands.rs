@@ -172,7 +172,7 @@ fn start_server() -> u16 {
             databases: 16,
             loglevel: "error".to_string(),
             io_model: kividb::config::IoModel::Tokio,
-            lua_parallel_scripts: false,
+            lua_parallel_scripts: kividb::config::ParallelScripts::No,
             configfile: "./kividb.conf".to_string(),
             enable_debug_command: kividb::config::DebugCommand::Yes,
             ..Default::default()

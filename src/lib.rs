@@ -108,8 +108,8 @@ pub fn run_for_test(config: config::Config) {
     let cfg = std::sync::Arc::new(config);
     crate::RUNTIME_MAXMEMORY.store(cfg.maxmemory, std::sync::atomic::Ordering::Relaxed);
     // Only ever switched on here: the servers of one test process share it.
-    if cfg!(feature = "lua") && cfg.lua_parallel_scripts {
-        crate::tag_locks::set_enabled(true);
+    if cfg!(feature = "lua") && cfg.lua_parallel_scripts != config::ParallelScripts::No {
+        crate::tag_locks::set_mode(cfg.lua_parallel_scripts);
     }
     crate::eviction::configure(&cfg);
     crate::compaction::configure(&cfg);

@@ -741,6 +741,10 @@ fn script_mode<'a>(
     applied: bool,
 ) -> (Option<crate::tag_locks::ScriptTags<'a>>, bool) {
     let allowed_beside = crate::tag_locks::take_next_script_allowed();
+    // The setting as it is now, after the script was counted among those
+    // that run beside others (`tag_locks::parallel_scripts`).
+    #[cfg(feature = "lua")]
+    let tag_locks = tag_locks && crate::tag_locks::parallel_scripts();
     let script_tags = if tag_locks {
         crate::tag_locks::script_tags(cmd)
     } else {
@@ -772,7 +776,7 @@ fn count_script_alone(cmd: &[&[u8]], name: &str, tag_locks: bool, in_another: bo
     if crate::expiry::replaying() {
         return;
     }
-    let why = if !tag_locks {
+    let why = if !tag_locks || !crate::tag_locks::parallel_scripts() {
         Alone::ParallelOff
     } else if in_another {
         Alone::InTransaction
