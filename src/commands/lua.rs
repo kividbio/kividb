@@ -2434,13 +2434,6 @@ end
     let compat51 = super::lua_compat51::prepare(&lua).unwrap();
     lua.globals().set("__kividb_compat51", compat51).unwrap();
 
-    // What the sandbox's `setmetatable` wraps a script's `__gc` in, so that a
-    // finalizer is known as one in a coroutine it starts too (`counted_gc`);
-    // the final setup below takes it.
-    // SAFETY: `make_counted_gc` keeps to the rules of a Lua C function.
-    let counted = unsafe { lua.create_c_function(make_counted_gc) }.unwrap();
-    lua.globals().set("__kividb_counted_gc", counted).unwrap();
-
     // `string.format` with Lua 5.1's integer conversions, as Redis's
     // scripts have them (#747): a patched copy of the library's own
     // `str_format` (#771), see [`super::lua_format`].
@@ -2476,12 +2469,6 @@ end
 -- The function that makes the Lua 5.1 library functions (see lua_compat51.rs).
 local _compat51 = __kividb_compat51
 __kividb_compat51 = nil
-
--- What a script's `__gc` is wrapped in (`counted_gc` in lua.rs), and the
--- wrapped ones, so that none is wrapped twice.
-local _counted_gc = __kividb_counted_gc
-__kividb_counted_gc = nil
-local _gc_counted = setmetatable({}, { __mode = "k" })
 
 -- cjson state globals and the array metatable.
 local _guard = {}
@@ -2633,21 +2620,9 @@ _setmetatable(_globals_mt, {
     end,
 })
 
-local _type, _rawget, _rawset = type, rawget, rawset
-
 function setmetatable(t, mt)
     if t == _G_ref then
         error("Attempt to modify a readonly table", 2)
-    end
-    -- A `__gc` runs counted, so that a coroutine it starts is known to be
-    -- in a finalizer too (`counted_gc`, #1058 review).
-    if _type(mt) == "table" then
-        local gc = _rawget(mt, "__gc")
-        if _type(gc) == "function" and not _gc_counted[gc] then
-            gc = _counted_gc(gc)
-            _gc_counted[gc] = true
-            _rawset(mt, "__gc", gc)
-        end
     end
     return _setmetatable(t, mt)
 end
@@ -4906,69 +4881,13 @@ fn forget_raised_table() {
     }
 }
 
-thread_local! {
-    /// How many `__gc` functions a script set are running on this thread
-    /// ([`counted_gc`]). A coroutine one of them starts runs in its
-    /// finalizer too, with no `__gc` on its own stack (#1058 review).
-    static FINALIZER_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
-/// A script's `__gc`, the closure's upvalue, run with [`FINALIZER_DEPTH`]
-/// up. What it raises is raised again once the depth is back down.
-unsafe extern "C-unwind" fn counted_gc(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
-    use mlua::ffi;
-    unsafe {
-        let args = ffi::lua_gettop(state);
-        ffi::luaL_checkstack(state, 1, std::ptr::null());
-        ffi::lua_pushvalue(state, ffi::lua_upvalueindex(1));
-        ffi::lua_insert(state, 1);
-        let _ = FINALIZER_DEPTH.try_with(|depth| depth.set(depth.get() + 1));
-        let status = ffi::lua_pcall(state, args, 0, 0);
-        let _ = FINALIZER_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
-        if status != ffi::LUA_OK {
-            ffi::lua_error(state);
-        }
-        0
-    }
-}
-
-/// `__kividb_counted_gc(f)`, for the sandbox's `setmetatable`: `f` as a
-/// [`counted_gc`].
-unsafe extern "C-unwind" fn make_counted_gc(state: *mut mlua::ffi::lua_State) -> std::ffi::c_int {
-    use mlua::ffi;
-    unsafe {
-        ffi::luaL_checktype(state, 1, ffi::LUA_TFUNCTION);
-        ffi::lua_settop(state, 1);
-        ffi::lua_pushcclosure(state, counted_gc, 1);
-        1
-    }
-}
-
-/// Whether a finalizer is running: a `__gc` a script set, counted
-/// ([`FINALIZER_DEPTH`]), whatever thread it started, or a `__gc` metamethod
-/// on this thread's stack (one set some other way).
+/// Whether a finalizer is running, on this thread or on a coroutine it
+/// started (#1058 review). Lua 5.4 stops its collector while it runs one
+/// (`GCSTPGC`, in lgc.c's `GCTM`), and `lua_gc` answers -1 to anything
+/// then. A coroutine a finalizer made and a script calls after it is not
+/// in it.
 unsafe fn in_finalizer(state: *mut mlua::ffi::lua_State) -> bool {
-    use mlua::ffi;
-    if FINALIZER_DEPTH
-        .try_with(|depth| depth.get() > 0)
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    unsafe {
-        let mut ar: ffi::lua_Debug = std::mem::zeroed();
-        let mut level = 0;
-        while ffi::lua_getstack(state, level, &mut ar) != 0 {
-            if ffi::lua_getinfo(state, c"n".as_ptr(), &mut ar) != 0
-                && !ar.name.is_null()
-                && std::ffi::CStr::from_ptr(ar.name).to_bytes() == b"__gc"
-            {
-                return true;
-            }
-            level += 1;
-        }
-        false
-    }
+    unsafe { mlua::ffi::lua_gc(state, mlua::ffi::LUA_GCISRUNNING) < 0 }
 }
 
 /// `tostring` of the value at 1, for [`remember_error_table`] to call protected.

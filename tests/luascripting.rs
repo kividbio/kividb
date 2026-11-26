@@ -4305,12 +4305,15 @@ fn a_coroutine_in_a_finalizer_leaves_another_call_s_place() {
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let raise = "local c <close> = setmetatable({}, \
-                 {__close = function() collectgarbage('collect') end})\n\
+    // The collector is stopped until the `<close>` collects, while `boom`
+    // unwinds: a step that collected `t` before that would leave nothing
+    // to test.
+    let raise = "local c <close> = setmetatable({}, {__close = function() \
+                 collectgarbage('collect') collectgarbage('restart') end})\n\
                  error('boom', 0)";
     for raised in ["error('inner', 0)", "error(nil)"] {
         let leave = format!(
-            "local t = setmetatable({{}}, {{__gc = function() \
+            "collectgarbage('stop') local t = setmetatable({{}}, {{__gc = function() \
              coroutine.wrap(function() {raised} end)() end}}) return 1"
         );
         assert!(
@@ -4326,26 +4329,67 @@ fn a_coroutine_in_a_finalizer_leaves_another_call_s_place() {
     }
 }
 
-/// A `__gc` a script sets still runs, given its object, when it is
-/// collected.
+/// So too when the `__gc` is set after `setmetatable` (`__gc = true` marks
+/// the table for it), and for a coroutine `coroutine.resume` runs.
+/// `getmetatable(t)` is a read-only view here, so the script keeps `mt`.
 #[test]
-fn a_script_s_gc_runs_with_its_object() {
+fn a_coroutine_in_a_gc_set_later_leaves_another_call_s_place() {
     let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
     let port = free_port();
     start_server(port);
     let mut c = Conn::connect(port);
 
-    let script = "local seen = {}\n\
-                  local t = setmetatable({name = 'mine'}, \
-                  {__gc = function(o) seen[#seen + 1] = o.name end})\n\
-                  t = nil\n\
-                  collectgarbage('collect')\n\
-                  return seen";
-    match c.cmds(&["EVAL", script, "0"]) {
-        RespValue::Array(items) => {
-            assert_eq!(items.len(), 1, "{items:?}");
-            assert_eq!(items[0].as_str(), "mine");
-        }
-        other => panic!("{other:?}"),
+    let raise = "local c <close> = setmetatable({}, {__close = function() \
+                 collectgarbage('collect') collectgarbage('restart') end})\n\
+                 error('boom', 0)";
+    for started in [
+        "coroutine.wrap(function() error('inner', 0) end)()",
+        "coroutine.resume(coroutine.create(function() error('inner', 0) end))",
+    ] {
+        let leave = format!(
+            "collectgarbage('stop') local mt = {{__gc = true}} \
+             local t = setmetatable({{}}, mt) \
+             mt.__gc = function() {started} end return 1"
+        );
+        assert!(
+            matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
+            "{started}"
+        );
+        assert_script_error(
+            &mut c,
+            raise,
+            &["0"],
+            "ERR boom script: {sha}, on @user_script:2.",
+        );
+    }
+}
+
+/// A coroutine a finalizer made, called after that finalizer is done, is
+/// not in it: what it raises is the script's.
+#[test]
+fn a_coroutine_a_finalizer_made_is_the_script_s_when_called_after() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (raised, expected) in [
+        ("error(nil)", "ERR nil script: {sha}, on @user_script:3."),
+        (
+            "error({err = 'tbl'})",
+            "tbl script: {sha}, on @user_script:3.",
+        ),
+    ] {
+        let script = format!(
+            "local saved = {{}}\n\
+             local mt = {{__gc = function() saved[1] = coroutine.wrap(function()\n \
+             {raised}\n\
+             end) end}}\n\
+             local t = setmetatable({{}}, mt)\n\
+             t = nil\n\
+             collectgarbage('collect')\n\
+             saved[1]()"
+        );
+        assert_script_error(&mut c, &script, &["0"], expected);
     }
 }
