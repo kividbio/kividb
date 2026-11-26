@@ -4082,3 +4082,150 @@ fn a_call_after_one_that_caught_an_error_is_its_own() {
         "ERR 42 script: {sha}, on @user_script:2.",
     );
 }
+
+// ── #1058 review ─────────────────────────────────────────────────────────────
+
+/// What `pcall` catches of `error(nil)` and `error(true)` is that value, as
+/// in Redis.
+#[test]
+fn pcall_catches_nil_and_true_as_they_were_raised() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (raise, kind, text) in [
+        ("pcall(error, nil)", "nil", "nil"),
+        ("pcall(error, true)", "boolean", "true"),
+    ] {
+        let script = format!("local ok, e = {raise} return {{type(e), tostring(e)}}");
+        match c.cmds(&["EVAL", &script, "0"]) {
+            RespValue::Array(items) => {
+                assert_eq!(items[0].as_str(), kind, "{raise}");
+                assert_eq!(items[1].as_str(), text, "{raise}");
+            }
+            other => panic!("{raise}: {other:?}"),
+        }
+    }
+}
+
+/// An infinity raised is `inf` or `-inf`, as Lua 5.1's `%.14g` writes it.
+#[test]
+fn error_of_an_infinity_is_inf() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (script, expected) in [
+        (
+            "error(1/0)",
+            "ERR user_script:1: inf script: {sha}, on @user_script:1.",
+        ),
+        (
+            "error(-1/0)",
+            "ERR user_script:1: -inf script: {sha}, on @user_script:1.",
+        ),
+        (
+            "local x = 1\nerror(1/0, 0)",
+            "ERR inf script: {sha}, on @user_script:2.",
+        ),
+    ] {
+        assert_script_error(&mut c, script, &["0"], expected);
+    }
+}
+
+/// In a library, `error(nil)` and `error(42, 0)` name the function and
+/// `@user_function`.
+#[test]
+fn fcall_error_of_a_value_that_is_not_a_string_names_user_function() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let library = [
+        "#!lua name=r1058",
+        "local function n(keys, args)",
+        "  local x = 1",
+        "  error(nil)",
+        "end",
+        "local function z(keys, args)",
+        "  local x = 1",
+        "  error(42, 0)",
+        "end",
+        "redis.register_function('n1058', n)",
+        "redis.register_function('z1058', z)",
+        "",
+    ]
+    .join("\n");
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", &library]).as_str(), "r1058");
+    assert_eq!(
+        c.cmds(&["FCALL", "n1058", "0"]).as_error(),
+        "ERR nil script: n1058, on @user_function:4."
+    );
+    assert_eq!(
+        c.cmds(&["FCALL", "z1058", "0"]).as_error(),
+        "ERR 42 script: z1058, on @user_function:8."
+    );
+}
+
+/// A finalizer that raises while another call's error unwinds (a `<close>`
+/// collects then) leaves the place that call kept.
+#[test]
+fn a_finalizer_raising_during_another_call_leaves_its_place() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let raise = "local c <close> = setmetatable({}, \
+                 {__close = function() collectgarbage('collect') end})\n\
+                 error('boom', 0)";
+    for raised in ["error(nil)", "error(42, 0)", "error(true)"] {
+        let leave =
+            format!("local t = setmetatable({{}}, {{__gc = function() {raised} end}}) return 1");
+        assert!(
+            matches!(c.cmds(&["EVAL", &leave, "0"]), RespValue::Int(1)),
+            "{raised}"
+        );
+        assert_script_error(
+            &mut c,
+            raise,
+            &["0"],
+            "ERR boom script: {sha}, on @user_script:2.",
+        );
+    }
+}
+
+/// Inside `coroutine.wrap`, what is not a string is placed where it was
+/// raised in the coroutine. Lua 5.4's `wrap` puts its place before a string
+/// only and raises anything else as it is; Redis's, Lua 5.1's, places a
+/// number too, and is a C function to its message handler, which names the
+/// line of the call instead: `ERR nil … on @user_script:4.` and
+/// `ERR user_script:4: 42 … on @user_script:4.` for the first and third
+/// rows. A string is placed as in Redis.
+#[test]
+fn coroutine_wrap_places_what_is_not_a_string_inside_the_coroutine() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (raise, expected) in [
+        ("error(nil)", "ERR nil script: {sha}, on @user_script:2."),
+        ("error(true)", "ERR true script: {sha}, on @user_script:2."),
+        ("error(42, 0)", "ERR 42 script: {sha}, on @user_script:2."),
+        (
+            "error(42)",
+            "ERR user_script:4: user_script:2: 42 script: {sha}, on @user_script:4.",
+        ),
+        (
+            "error('s', 0)",
+            "ERR user_script:4: s script: {sha}, on @user_script:4.",
+        ),
+    ] {
+        let script = format!("local f = coroutine.wrap(function()\n  {raise}\nend)\nf()");
+        assert_script_error(&mut c, &script, &["0"], expected);
+    }
+}
