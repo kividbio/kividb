@@ -1947,8 +1947,15 @@ impl SaveGate {
 
     /// Let the save held at `failpoint` go on.
     fn release(&self, failpoint: &std::path::Path) {
+        // The file first, and only then off the list: once it is off the
+        // list the gate's thread may take the file away itself (when `hold`
+        // has changed since), so it may be gone already.
+        match std::fs::remove_file(failpoint) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("removing {}: {e}", failpoint.display()),
+        }
         self.held.lock().retain(|p| p != failpoint);
-        std::fs::remove_file(failpoint).unwrap();
     }
 
     fn finish(mut self) {
