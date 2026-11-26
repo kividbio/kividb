@@ -339,6 +339,32 @@ fn test_lset() {
     assert!(c.cmds(&["LSET", "l", "10", "x"]).is_error());
 }
 
+#[test]
+fn test_list_indexes_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "l", "a", "b", "c"]);
+    for args in [
+        &["LINDEX", "l", "01"][..],
+        &["LINDEX", "l", "+1"][..],
+        &["LINDEX", "l", "-0"][..],
+        &["LSET", "l", "01", "x"][..],
+        &["LSET", "l", "+1", "x"][..],
+        &["LSET", "l", "-0", "x"][..],
+    ] {
+        assert_eq!(
+            c.cmds(args),
+            RespValue::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    let binding = c.cmds(&["LRANGE", "l", "0", "-1"]);
+    let items: Vec<&str> = binding.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(items, vec!["a", "b", "c"]);
+}
+
 // Manual test scenario:
 //   RPUSH l a b c
 //   LINSERT l BEFORE b "X"  → 4
