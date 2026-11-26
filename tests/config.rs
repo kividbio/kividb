@@ -493,6 +493,7 @@ fn config_rewrite_round_trip_keeps_every_setting() {
              rdbcompression yes\n\
              lua-time-limit 7000\n\
              search-default-dialect 2\n\
+             search-flat-int8 yes\n\
              stream-node-max-entries 50\n\
              hash-max-ziplist-entries 99\n\
              tracking-table-max-keys 5000\n\

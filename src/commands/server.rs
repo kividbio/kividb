@@ -659,6 +659,17 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                      Valid values: debug, verbose, notice, warning, nothing",
                 )),
             },
+            "search-flat-int8" => match value.to_ascii_lowercase().as_str() {
+                "yes" => {
+                    crate::vector::flat_int8::set_enabled(true);
+                    Some(resp_simple("OK"))
+                }
+                "no" => {
+                    crate::vector::flat_int8::set_enabled(false);
+                    Some(resp_simple("OK"))
+                }
+                _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
             // Taken with the command gate held alone (`run_command`). A
             // script that read the old setting before the gate may still
             // run: see `tag_locks::set_mode` for why that is safe.
@@ -2415,6 +2426,15 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ),
         ("tcp-backlog", "511".to_string()),
         ("lua-time-limit", lua_time_limit.clone()),
+        (
+            "search-flat-int8",
+            if crate::vector::flat_int8::enabled() {
+                "yes"
+            } else {
+                "no"
+            }
+            .to_string(),
+        ),
         (
             "lua-parallel-scripts",
             crate::tag_locks::mode().name().to_string(),

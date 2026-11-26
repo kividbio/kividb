@@ -529,9 +529,7 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
         match &field.field_type {
             FieldType::Vector { algo, .. } => {
                 let live = match algo {
-                    VectorAlgo::Flat => {
-                        LiveIndex::Flat(Arc::new(crate::vector::VectorIndex::new()))
-                    }
+                    VectorAlgo::Flat => LiveIndex::Flat(crate::vector::VectorIndex::new_shared()),
                     VectorAlgo::Hnsw {
                         m, ef_construction, ..
                     } => LiveIndex::Hnsw(Arc::new(crate::vector::HnswIndex::new(
@@ -2097,6 +2095,14 @@ impl Best {
             top.1.clear();
             top.1.push_str(key);
         }
+    }
+
+    #[inline]
+    pub(crate) fn kth(&self) -> Option<f32> {
+        if self.k == 0 || self.heap.len() < self.k {
+            return None;
+        }
+        self.heap.peek().map(|top| top.0)
     }
 
     pub(crate) fn into_sorted(self) -> Vec<crate::vector::KnnResult> {

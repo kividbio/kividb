@@ -2,6 +2,7 @@ pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
 pub mod flat;
+pub mod flat_int8;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;
@@ -1294,7 +1295,7 @@ impl IndexSchema {
         for f in &self.fields {
             if let FieldType::Vector { algo, .. } = &f.field_type {
                 let live = match algo {
-                    VectorAlgo::Flat => LiveIndex::Flat(Arc::new(VectorIndex::new())),
+                    VectorAlgo::Flat => LiveIndex::Flat(VectorIndex::new_shared()),
                     VectorAlgo::Hnsw {
                         m, ef_construction, ..
                     } => LiveIndex::Hnsw(Arc::new(HnswIndex::new(*m, *ef_construction))),
@@ -3381,6 +3382,10 @@ impl<'a> PreparedQuery<'a> {
             _ => std::borrow::Cow::Borrowed(query),
         };
         Self { metric, vector }
+    }
+
+    pub fn metric(&self) -> &DistanceMetric {
+        self.metric
     }
 
     /// The query as it is measured: of unit length for a cosine.

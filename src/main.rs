@@ -464,6 +464,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         config::ParallelScripts::No
     });
+    vector::flat_int8::set_enabled(config.search_flat_int8);
     eviction::configure(&config);
     compaction::configure(&config);
     give_back::set_enabled(config.allocator_give_back);

@@ -90,6 +90,7 @@ is logged for the directive it overrides. A flag given twice counts once, the la
 | `--worker-cpu-affinity <off\|auto>` | `off` | `auto` binds each io_uring worker to a CPU of its own when they are as many as the process's CPUs (see [Worker CPU affinity](#worker-cpu-affinity)) |
 | `--search-index-threads <auto\|N>` | `auto` | Helper threads that link vectors written to HNSW indexes; startup only (see [Search index threads](#search-index-threads)) |
 | `--search-resp3-reply <auto\|redis\|valkey>` | `auto` | The shape of the search commands' replies over RESP3 (see [Search reply shape over RESP3](#search-reply-shape-over-resp3)) |
+| `--search-flat-int8 <no\|yes>` | `no` | An int8 first pass in FLAT KNN scans of many candidates, the reply still the exact scan's; `CONFIG SET` takes it (see [FLAT int8 first pass](#flat-int8-first-pass)) |
 | `--databases` | `16` | Number of databases |
 | `--dir <path>` | start directory | Where `dump.kdb`, `appendonly.aof` and `nodes.conf` live |
 | `--aof` | off | Append-only file persistence |
@@ -374,6 +375,53 @@ another.
 
 The setting belongs to the node: in a cluster, the node that is asked writes the reply, so set
 every node alike.
+
+### FLAT int8 first pass
+
+`--search-flat-int8` (`search-flat-int8` in the configuration file; `CONFIG GET` and
+`CONFIG SET` take it) gives each FLAT vector field of 256 dimensions or more, once it holds
+1,024 vectors, an int8 copy of its vectors, and lets a KNN scan of 1,024 candidates or more
+(and at least 8 times `k`) measure each candidate against the copy first. A candidate is
+measured exactly unless the k nearest are already held and the copy's lower bound on its
+distance is at least the k-th, so the reply is the exact scan's, ties and order included.
+Once the k nearest are held, the scan looks at each 1,024 candidates in turn: if more than
+half of them had to be measured exactly, the pass is not paying for itself, and the scan
+measures the rest of its candidates exactly, without the pass. x86_64 only; elsewhere the
+switch is taken and the pass is not used.
+
+The copy is made and kept up to date by one thread, `flat-int8`, not by the writes: a write
+marks its slot, and the thread codes what is marked with no lock held, stores each code
+under the write lock only if the slot still holds the same vector, and lets writers and
+searches in every 50 µs. Until a slot is coded again a scan measures it exactly. Switched
+on at run time, the switch makes no copy by itself: an index's copy is started by the first
+search or write that reaches that index afterwards. After each run the thread sleeps as long
+as the run took, three times as long while writes to the index keep arriving; on an Azure
+D8s_v5 it took about 30% of a CPU under steady overwrites, and none with no traffic. While
+the copy is kept up to date, writes to the index are a little slower: loading 1M vectors of
+1,536 dimensions there was 7% slower on average with the switch on than with it off. The copy
+takes 16 bytes plus one a dimension per vector, is counted in `used_memory`, is not saved,
+and is made again after a restart. `FT.INFO` shows it under `flat_int8_indexes`: the field,
+its bytes, and how many candidates the pass skipped and measured exactly since the index
+was made (`CONFIG RESETSTAT` leaves them). Turning the switch off stops the pass at once,
+but a copy already made keeps its memory, and is kept up to date, until the index is
+dropped.
+
+The copy counts against `maxmemory` like any other memory. An index whose copy would take
+`used_memory` past `maxmemory` gets none, and a warning says so; setting `search-flat-int8`
+again (`CONFIG SET search-flat-int8 yes`) lets it try once more. Made near the limit, a copy
+can still leave too little room for the writes that follow, which then evict keys or, under
+`noeviction`, are refused.
+
+While a copy is being made, the median search of its index is already faster than with the
+switch off, but the slowest are slower; once it is made, both are faster. On an Azure
+D8s_v5 (server on 4 CPUs) with 1M vectors of 1,536 dimensions and 4 clients each running a
+KNN 5 over 100,000 candidates, the p50 / p99 was 71 / 74 ms with the switch off, 31 / 133 ms
+while the copy was made, and 31 / 36 ms after. Making it took about 80 s under those 4
+clients, and 37 s after a load with no clients. Switching it on over a large index is best
+done when the index is not busiest.
+
+A scan the query's timeout cuts returns the nearest of the candidates it reached, as it
+does without the pass.
 
 ### Search index threads
 

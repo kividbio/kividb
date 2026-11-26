@@ -226,6 +226,32 @@ impl Slots {
         slots
     }
 
+    pub fn bytes_only(bytes: usize) -> Self {
+        let mut slots = Self::new(bytes.div_ceil(4), 0);
+        slots.links = 0;
+        slots
+    }
+
+    #[inline(always)]
+    pub fn slot_bytes(&self, id: usize) -> &[u8] {
+        // SAFETY: the slot holds `dim` floats' worth of initialised bytes.
+        unsafe { std::slice::from_raw_parts(self.vector_ptr(id).cast::<u8>(), self.dim * 4) }
+    }
+
+    /// # Safety
+    /// As [`Slots::write_vector`]: no one reads the slot meanwhile.
+    pub unsafe fn write_bytes(&self, id: usize, at: usize, bytes: &[u8]) {
+        debug_assert!(at + bytes.len() <= self.dim * 4);
+        // SAFETY: within the slot; no one reads it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.vector_ptr(id).cast::<u8>().add(at),
+                bytes.len(),
+            )
+        };
+    }
+
     /// Slots for vectors laid out as `encoding` has them, in `dim` floats.
     pub fn with_encoding(dim: usize, m0: usize, encoding: super::quant::Encoding) -> Self {
         Self {
@@ -303,6 +329,15 @@ impl Slots {
     /// Bytes the blocks take.
     pub fn bytes(&self) -> usize {
         (0..self.blocks.count())
+            .map(|b| self.layout(block_slots(b)).2.size())
+            .sum()
+    }
+
+    pub fn bytes_for(&self, slots: usize) -> usize {
+        if slots == 0 {
+            return 0;
+        }
+        (0..=locate(slots - 1).0)
             .map(|b| self.layout(block_slots(b)).2.size())
             .sum()
     }
@@ -893,6 +928,16 @@ impl Visited {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytes_for_is_what_the_blocks_take_once_there_is_room() {
+        let slots = Slots::bytes_only(1_552);
+        assert_eq!(slots.bytes_for(0), 0);
+        for n in [1usize, 2, 1_000, 1_024, 1_025, 5_000, 20_000] {
+            slots.reserve(n - 1);
+            assert_eq!(slots.bytes_for(n), slots.bytes(), "{n} slots");
+        }
+    }
 
     #[test]
     fn every_id_has_a_slot_of_its_own() {
