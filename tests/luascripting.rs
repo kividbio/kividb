@@ -3685,3 +3685,124 @@ fn errors_a_script_builds_stay_as_they_are() {
         format!("ERR value is not an integer or out of range script: {sha}, on @user_script:2.")
     );
 }
+
+// ── #1055 review: what a script's error replies, and how it is counted ───────
+
+/// The SHA1 `SCRIPT LOAD` gives a script, as the tail of its error names it.
+fn sha_of(c: &mut Conn, script: &str) -> String {
+    c.cmds(&["SCRIPT", "LOAD", script]).as_str().to_string()
+}
+
+/// The error a script replies, with `{sha}` in `expected` for its SHA1.
+fn assert_script_error(c: &mut Conn, script: &str, args: &[&str], expected: &str) {
+    let sha = sha_of(c, script);
+    let mut cmd = vec!["EVAL", script];
+    cmd.extend_from_slice(args);
+    assert_eq!(
+        c.cmds(&cmd).as_error(),
+        expected.replace("{sha}", &sha),
+        "{script}"
+    );
+}
+
+/// An error's reply begins `ERR`, whatever the message raised begins with,
+/// as Redis's message handler makes it: `error('MYERR bad')` is no longer a
+/// `MYERR` reply.
+#[test]
+fn an_error_s_reply_begins_err_as_in_redis() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SET", "notint", "abc"]);
+
+    assert_script_error(
+        &mut c,
+        "error('MYERR bad')",
+        &["0"],
+        "ERR user_script:1: MYERR bad script: {sha}, on @user_script:1.",
+    );
+    assert_script_error(
+        &mut c,
+        "error('MYERR bad', 0)",
+        &["0"],
+        "ERR MYERR bad script: {sha}, on @user_script:1.",
+    );
+    // A `redis.call` error caught, and raised again as it is.
+    assert_script_error(
+        &mut c,
+        "local ok, e = pcall(redis.call, 'INCR', KEYS[1])\nerror(e, 0)",
+        &["1", "notint"],
+        "ERR ERR value is not an integer or out of range script: {sha}, on @user_script:2.",
+    );
+}
+
+/// A script's error is counted once, under the code its reply has: `ERR`
+/// for what Lua raised, a script's own for `redis.error_reply`. Redis 8.12
+/// counts these five the same.
+#[test]
+fn script_errors_count_once_in_errorstats() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SET", "notint", "abc"]);
+    c.cmds(&["CONFIG", "RESETSTAT"]);
+
+    for (script, args) in [
+        ("local a = 1\nreturn a + nil", &["0"][..]),
+        ("return +", &["0"]),
+        ("error('MYERR x')", &["0"]),
+        ("return redis.call('INCR', KEYS[1])", &["1", "notint"]),
+        ("return redis.error_reply('MYCODE y')", &["0"]),
+    ] {
+        let mut cmd = vec!["EVAL", script];
+        cmd.extend_from_slice(args);
+        c.cmds(&cmd).as_error();
+    }
+    let info = |c: &mut Conn, section: &str| match c.cmds(&["INFO", section]) {
+        RespValue::Bulk(b) => String::from_utf8(b).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let errorstats = info(&mut c, "errorstats");
+    assert!(
+        errorstats.contains("errorstat_ERR:count=4\r\n"),
+        "{errorstats}"
+    );
+    assert!(
+        errorstats.contains("errorstat_MYCODE:count=1\r\n"),
+        "{errorstats}"
+    );
+    let stats = info(&mut c, "stats");
+    assert!(stats.contains("total_error_replies:5\r\n"), "{stats}");
+}
+
+/// What a script catches of `error` given a number is what it catches in
+/// Redis: with a level, a string with the place before it; at level 0, the
+/// number.
+#[test]
+fn a_number_error_caught_is_what_redis_s_lua_gives() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for (raise, kind, text) in [
+        ("pcall(error, 42)", "string", "42"),
+        (
+            "pcall(function() error(42) end)",
+            "string",
+            "user_script:1: 42",
+        ),
+        ("pcall(error, 42, 0)", "number", "42"),
+    ] {
+        let script = format!("local ok, e = {raise} return {{type(e), tostring(e)}}");
+        match c.cmds(&["EVAL", &script, "0"]) {
+            RespValue::Array(items) => {
+                assert_eq!(items[0].as_str(), kind, "{raise}");
+                assert_eq!(items[1].as_str(), text, "{raise}");
+            }
+            other => panic!("{raise}: {other:?}"),
+        }
+    }
+}
