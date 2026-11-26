@@ -3370,8 +3370,9 @@ const SCRIPT_REPLIES: &[(&str, &[u8], &[u8])] = &[
     ),
     (
         r#"return undefined_global"#,
-        b"-ERR Script attempted to access nonexistent global variable 'undefined_global'\r\n",
-        b"-ERR Script attempted to access nonexistent global variable 'undefined_global'\r\n",
+        // With its place, as Redis 8.12 answers it byte for byte (#1054).
+        b"-ERR user_script:1: Script attempted to access nonexistent global variable 'undefined_global' script: 66079c13a0dbe54bee8cb53ac72311504271983b, on @user_script:1.\r\n",
+        b"-ERR user_script:1: Script attempted to access nonexistent global variable 'undefined_global' script: 66079c13a0dbe54bee8cb53ac72311504271983b, on @user_script:1.\r\n",
     ),
     (
         r#"return cjson.encode({1,2})"#,
@@ -3499,3 +3500,188 @@ const SCRIPT_REPLIES: &[(&str, &[u8], &[u8])] = &[
         b"*1\r\n=6\r\ntxt:hi\r\n",
     ),
 ];
+
+// ── Where a script's error happened (#1054) ───────────────────────────────────
+//
+// As Redis 8.12 answers, with Lua 5.4's own wording kept: a script compiled by
+// `EVAL` that does not compile is reported as `SCRIPT LOAD` reports it, and an
+// error raised while it runs names the line it happened on, and the line it
+// left the script from in the `script: …, on @user_script:N.` tail.
+
+const SYNTAX_ON_3: &str = "local a = 1\nlocal b = 2\nreturn a +";
+const STRAY_ON_4: &str = "local a = 1\nlocal b = 2\nreturn a + b\nLUA";
+const NIL_ARITHMETIC_ON_3: &str = "local a = 1\nlocal b = nil\nreturn a + b";
+
+/// `EVAL`, again from the cache, and `EVAL_RO` of a script that does not
+/// compile: `SCRIPT LOAD`'s error, with the line.
+#[test]
+fn eval_compile_errors_name_their_line_as_script_load_does() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let expected =
+        "ERR Error compiling script (new function): user_script:3: unexpected symbol near <eof>";
+    assert_eq!(
+        c.cmds(&["SCRIPT", "LOAD", SYNTAX_ON_3]).as_error(),
+        expected
+    );
+    assert_eq!(c.cmds(&["EVAL", SYNTAX_ON_3, "0"]).as_error(), expected);
+    assert_eq!(c.cmds(&["EVAL", SYNTAX_ON_3, "0"]).as_error(), expected);
+    assert_eq!(c.cmds(&["EVAL_RO", SYNTAX_ON_3, "0"]).as_error(), expected);
+
+    assert_eq!(
+        c.cmds(&["EVAL", STRAY_ON_4, "0"]).as_error(),
+        "ERR Error compiling script (new function): user_script:4: <eof> expected near 'LUA'"
+    );
+}
+
+/// A runtime error names its line, and the tail the same one, however the
+/// script is run.
+#[test]
+fn eval_runtime_errors_keep_their_line() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let sha = c
+        .cmds(&["SCRIPT", "LOAD", NIL_ARITHMETIC_ON_3])
+        .as_str()
+        .to_string();
+    let expected = format!(
+        "ERR user_script:3: attempt to perform arithmetic on a nil value (local 'b') \
+         script: {sha}, on @user_script:3."
+    );
+    for run in [
+        vec!["EVAL", NIL_ARITHMETIC_ON_3, "0"],
+        vec!["EVAL", NIL_ARITHMETIC_ON_3, "0"],
+        vec!["EVALSHA", sha.as_str(), "0"],
+        vec!["EVAL_RO", NIL_ARITHMETIC_ON_3, "0"],
+        vec!["EVALSHA_RO", sha.as_str(), "0"],
+    ] {
+        assert_eq!(c.cmds(&run).as_error(), expected, "{}", run[0]);
+    }
+
+    for (script, message, line) in [
+        ("local x = 1\nerror('boom')", "boom", 2),
+        ("local x = 1\nerror(42)", "42", 2),
+        ("local x\nx()", "attempt to call a nil value (local 'x')", 2),
+    ] {
+        let sha = c.cmds(&["SCRIPT", "LOAD", script]).as_str().to_string();
+        assert_eq!(
+            c.cmds(&["EVAL", script, "0"]).as_error(),
+            format!("ERR user_script:{line}: {message} script: {sha}, on @user_script:{line}."),
+            "{script}"
+        );
+    }
+}
+
+/// An error caught by `pcall` and raised again: `error(e)` puts the line it
+/// is raised on before the one it carries, `error(e, 0)` keeps only that one;
+/// either way the tail names where it left the script, as Redis's does.
+#[test]
+fn an_error_caught_by_pcall_and_raised_again_keeps_its_line() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let caught = "local ok, e = pcall(function()\n  local x\n  return x + 1\nend)\n";
+    for (raise, expected_head) in [
+        (
+            "error(e)",
+            "ERR user_script:5: user_script:3: attempt to perform arithmetic on a nil value (local 'x')",
+        ),
+        (
+            "error(e, 0)",
+            "ERR user_script:3: attempt to perform arithmetic on a nil value (local 'x')",
+        ),
+    ] {
+        let script = format!("{caught}{raise}");
+        let sha = c.cmds(&["SCRIPT", "LOAD", &script]).as_str().to_string();
+        assert_eq!(
+            c.cmds(&["EVAL", &script, "0"]).as_error(),
+            format!("{expected_head} script: {sha}, on @user_script:5."),
+            "{raise}"
+        );
+    }
+}
+
+/// `FCALL`: the line in the library, counted from its `#!lua` line, under
+/// Redis's name for a library's code, and the function's name in the tail.
+#[test]
+fn fcall_errors_name_the_line_of_the_library() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let library = "#!lua name=lib1054\n\
+                   local function f(keys, args)\n\
+                   \x20 local b = nil\n\
+                   \x20 return 1 + b\n\
+                   end\n\
+                   local function g(keys, args)\n\
+                   \x20 error('fboom')\n\
+                   end\n\
+                   redis.register_function('f1054', f)\n\
+                   redis.register_function('g1054', g)\n";
+    assert_eq!(c.cmds(&["FUNCTION", "LOAD", library]).as_str(), "lib1054");
+    assert_eq!(
+        c.cmds(&["FCALL", "f1054", "0"]).as_error(),
+        "ERR user_function:4: attempt to perform arithmetic on a nil value (local 'b') \
+         script: f1054, on @user_function:4."
+    );
+    assert_eq!(
+        c.cmds(&["FCALL", "g1054", "0"]).as_error(),
+        "ERR user_function:7: fboom script: g1054, on @user_function:7."
+    );
+
+    // Loading a library: its lines are counted from the shebang line too.
+    let failing = "#!lua name=fail1054\nlocal x = nil\nreturn x + 1\n";
+    assert_eq!(
+        c.cmds(&["FUNCTION", "LOAD", failing]).as_error(),
+        "ERR Error registering functions: user_function:3: attempt to perform arithmetic on a nil value (local 'x')"
+    );
+
+    let broken = "#!lua name=bad1054\nlocal x = 1\nredis.register_function('b', function() return 1 end)\nreturn +\n";
+    assert_eq!(
+        c.cmds(&["FUNCTION", "LOAD", broken]).as_error(),
+        "ERR Error compiling function: user_function:4: unexpected symbol near '+'"
+    );
+}
+
+/// What a script makes an error of itself carries no line of its own, as in
+/// Redis, and stays as it was.
+#[test]
+fn errors_a_script_builds_stay_as_they_are() {
+    let _serial = LUA_SCRIPTING_SERIAL.lock().unwrap();
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&["SET", "notint", "abc"]);
+
+    let reply = "local x = 1\nreturn redis.error_reply('MY custom error')";
+    assert_eq!(c.cmds(&["EVAL", reply, "0"]).as_error(), "MY custom error");
+
+    let table = "local x = 1\nerror({err = 'MY table error'})";
+    let sha = c.cmds(&["SCRIPT", "LOAD", table]).as_str().to_string();
+    assert_eq!(
+        c.cmds(&["EVAL", table, "0"]).as_error(),
+        format!("MY table error script: {sha}, on @user_script:2.")
+    );
+
+    let returned = "local t = redis.pcall('INCR', KEYS[1])\nreturn t";
+    assert_eq!(
+        c.cmds(&["EVAL", returned, "1", "notint"]).as_error(),
+        "ERR value is not an integer or out of range"
+    );
+    let raised = "local t = redis.pcall('INCR', KEYS[1])\nerror(t)";
+    let sha = c.cmds(&["SCRIPT", "LOAD", raised]).as_str().to_string();
+    assert_eq!(
+        c.cmds(&["EVAL", raised, "1", "notint"]).as_error(),
+        format!("ERR value is not an integer or out of range script: {sha}, on @user_script:2.")
+    );
+}
