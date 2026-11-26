@@ -378,6 +378,49 @@ fn test_bitpos_empty_and_outside_range() {
     assert_eq!(c.cmds(&["BITPOS", "bm", "1", "1"]).as_int(), -1);
 }
 
+#[test]
+fn test_bitmap_numbers_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SETBIT", "bm", "0", "1"]);
+
+    let bit_offset = "ERR bit offset is not an integer or out of range";
+    for args in [
+        &["GETBIT", "bm", "01"][..],
+        &["GETBIT", "bm", "+1"][..],
+        &["SETBIT", "bm", "01", "1"][..],
+        &["BITFIELD", "bm", "GET", "u8", "01"][..],
+        &["BITFIELD", "bm", "GET", "u8", "#01"][..],
+        &["GETBIT", "bm", "4294967296"][..],
+    ] {
+        assert_eq!(c.cmds(args).error_str(), bit_offset, "{args:?}");
+    }
+    assert_eq!(c.cmds(&["GETBIT", "bm", "4294967295"]).as_int(), 0);
+
+    assert_eq!(
+        c.cmds(&["SETBIT", "bm", "0", "00"]).error_str(),
+        "ERR bit is not an integer or out of range"
+    );
+    assert_eq!(
+        c.cmds(&["BITFIELD", "bm", "GET", "u08", "0"]).error_str(),
+        "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."
+    );
+
+    let value = "ERR value is not an integer or out of range";
+    for args in [
+        &["BITCOUNT", "bm", "0", "01"][..],
+        &["BITPOS", "bm", "1", "01"][..],
+        &["BITPOS", "bm", "-0"][..],
+        &["BITFIELD", "bm", "SET", "u8", "0", "01"][..],
+        &["BITFIELD", "bm", "SET", "u8", "0", "x"][..],
+        &["BITFIELD", "bm", "INCRBY", "u8", "0", "+1"][..],
+    ] {
+        assert_eq!(c.cmds(args).error_str(), value, "{args:?}");
+    }
+}
+
 // BITOP AND / OR / XOR / NOT
 #[test]
 fn test_bitop_and_or_xor() {

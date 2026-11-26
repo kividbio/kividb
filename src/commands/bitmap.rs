@@ -32,10 +32,16 @@ fn popcount(data: &[u8]) -> u64 {
 
 #[inline]
 fn parse_i64_arg(arg: &[u8]) -> Result<i64, ()> {
-    std::str::from_utf8(arg)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .ok_or(())
+    crate::commands::login::strict_integer(arg).ok_or(())
+}
+
+#[inline]
+fn parse_bit_offset_arg(arg: &[u8]) -> Result<u64, ()> {
+    let offset = u64::try_from(parse_i64_arg(arg)?).map_err(|_| ())?;
+    if offset >= 1 << 32 {
+        return Err(());
+    }
+    Ok(offset)
 }
 
 // ── GETBIT ────────────────────────────────────────────────────────────────────
@@ -45,12 +51,9 @@ fn cmd_getbit(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'getbit' command");
     }
     let key: &[u8] = cmd[1];
-    let offset: u64 = match std::str::from_utf8(cmd[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) => n,
-        None => return resp_error("ERR bit offset is not an integer or out of range"),
+    let offset: u64 = match parse_bit_offset_arg(cmd[2]) {
+        Ok(n) => n,
+        Err(()) => return resp_error("ERR bit offset is not an integer or out of range"),
     };
 
     if is_expired(ctx.store, *ctx.selected_db, key) {
@@ -88,18 +91,13 @@ fn cmd_setbit(ctx: &mut Ctx) -> Vec<u8> {
         return resp_error("ERR wrong number of arguments for 'setbit' command");
     }
     let key: &[u8] = cmd[1];
-    let offset: u64 = match std::str::from_utf8(cmd[2])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(n) if n < 2u64.pow(32) => n, // Redis limit: 2^32 - 1
-        _ => return resp_error("ERR bit offset is not an integer or out of range"),
+    let offset: u64 = match parse_bit_offset_arg(cmd[2]) {
+        Ok(n) => n,
+        Err(()) => return resp_error("ERR bit offset is not an integer or out of range"),
     };
-    let bit_val: u8 = match std::str::from_utf8(cmd[3])
-        .ok()
-        .and_then(|s| s.parse().ok())
-    {
-        Some(v @ 0) | Some(v @ 1) => v,
+    let bit_val: u8 = match parse_i64_arg(cmd[3]) {
+        Ok(0) => 0,
+        Ok(1) => 1,
         _ => return resp_error("ERR bit is not an integer or out of range"),
     };
 
@@ -183,19 +181,13 @@ fn cmd_bitcount(ctx: &mut Ctx) -> Vec<u8> {
             _ => resp_error("WRONGTYPE Operation against a key holding the wrong kind of value"),
         }
     } else {
-        let start: i64 = match std::str::from_utf8(cmd[2])
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
-            Some(n) => n,
-            None => return resp_error("ERR value is not an integer or out of range"),
+        let start: i64 = match parse_i64_arg(cmd[2]) {
+            Ok(n) => n,
+            Err(()) => return resp_error("ERR value is not an integer or out of range"),
         };
-        let end: i64 = match std::str::from_utf8(cmd[3])
-            .ok()
-            .and_then(|s| s.parse().ok())
-        {
-            Some(n) => n,
-            None => return resp_error("ERR value is not an integer or out of range"),
+        let end: i64 = match parse_i64_arg(cmd[3]) {
+            Ok(n) => n,
+            Err(()) => return resp_error("ERR value is not an integer or out of range"),
         };
 
         let bit_mode = if cmd.len() == 5 {
@@ -871,18 +863,19 @@ fn parse_bitfield<'a>(cmd: &[&'a [u8]], readonly: bool) -> Result<Vec<FieldOp<'a
             ));
         };
         i += 1;
-        let write = incrby.map(|incrby| {
-            let value: i128 = std::str::from_utf8(cmd[i])
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+        let write = if let Some(incrby) = incrby {
+            let Ok(value) = parse_i64_arg(cmd[i]) else {
+                return Err(resp_error("ERR value is not an integer or out of range"));
+            };
             i += 1;
-            FieldWrite {
-                value,
+            Some(FieldWrite {
+                value: i128::from(value),
                 incrby,
                 overflow,
-            }
-        });
+            })
+        } else {
+            None
+        };
         ops.push(FieldOp {
             encoding,
             offset,
@@ -900,16 +893,16 @@ fn parse_bitfield<'a>(cmd: &[&'a [u8]], readonly: bool) -> Result<Vec<FieldOp<'a
 /// A bit offset, as SETBIT's: below 2^32, so that a string is never made
 /// bigger than 512 MB (Redis's `proto-max-bulk-len`).
 fn parse_bitfield_offset(arg: &[u8], encoding_bits: u8) -> Result<usize, ()> {
-    let s = std::str::from_utf8(arg).map_err(|_| ())?;
-    let offset = if let Some(rest) = s.strip_prefix('#') {
-        if rest.is_empty() {
-            return Err(());
-        }
-        let idx: u64 = rest.parse().map_err(|_| ())?;
-        (idx as u128).checked_mul(encoding_bits as u128).ok_or(())?
+    let (raw, scale) = if let Some(rest) = arg.strip_prefix(b"#") {
+        (rest, encoding_bits as u128)
     } else {
-        s.parse::<u64>().map_err(|_| ())? as u128
+        (arg, 1)
     };
+    let idx = parse_i64_arg(raw)?;
+    if idx < 0 {
+        return Err(());
+    }
+    let offset = (idx as u128).checked_mul(scale).ok_or(())?;
     if offset >= 1 << 32 {
         return Err(());
     }
@@ -923,11 +916,11 @@ fn parse_encoding(enc: &str) -> Option<(bool, u8)> {
         let rest = enc.strip_prefix('u')?;
         (false, rest)
     };
-    let bits: u8 = rest.parse().ok()?;
-    if bits == 0 || bits > 64 || !signed && bits > 63 {
+    let bits = crate::commands::login::strict_integer(rest.as_bytes())?;
+    if !(1..=64).contains(&bits) || (!signed && bits > 63) {
         return None;
     }
-    Some((signed, bits))
+    Some((signed, bits as u8))
 }
 
 fn bitfield_get(bytes: &[u8], encoding: &str, bit_offset: usize) -> Option<i64> {
