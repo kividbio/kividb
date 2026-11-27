@@ -4628,6 +4628,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     );
                 }
                 crate::stats::LAST_BGSAVE_OK.store(ok, Ordering::Release);
+                // Before the flag: the next save sets the flag first and its
+                // start after, and INFO reads 0 as "none running".
+                crate::stats::BGSAVE_STARTED_MS.store(0, Ordering::Release);
                 crate::stats::BGSAVE_IN_PROGRESS.store(false, Ordering::Release);
             });
 
