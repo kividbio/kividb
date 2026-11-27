@@ -437,6 +437,8 @@ impl Progress {
             if self.waiting || !authenticated {
                 if !self.whole(&buf[at..], authenticated)? {
                     if buf.len() - at > REQUEST_MAX {
+                        crate::stats::QUERY_BUFFER_LIMIT_DISCONNECTIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         return Err("query buffer limit exceeded".into());
                     }
                     self.waiting = true;

@@ -227,16 +227,23 @@ pub async fn handle_replica_connection_uring(
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         pending_bytes.taken(batch.len(), held);
                         if !pending_bytes.abandoned() {
-                            let _ = stream_fwd.write_all(batch).await;
+                            let len = batch.len() as u64;
+                            if stream_fwd.write_all(batch).await.0.is_ok() {
+                                crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
+                                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                            }
                         }
                         return;
                     }
                 }
             }
             pending_bytes.taken(batch.len(), held);
+            let len = batch.len() as u64;
             if stream_fwd.write_all(batch).await.0.is_err() {
                 break;
             }
+            crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
+                .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
         }
     });
 
@@ -366,8 +373,15 @@ async fn write_unless_let_go(
     repl_state: &crate::replication::ReplState,
     replica_id: u64,
 ) -> Option<std::io::Result<()>> {
+    let len = buf.len() as u64;
     tokio::select! {
-        (res, _) = stream.write_all(buf) => Some(res),
+        (res, _) = stream.write_all(buf) => {
+            if res.is_ok() {
+                crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
+                    .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+            }
+            Some(res)
+        },
         _ = repl_state.replica_timed_out(replica_id) => None,
     }
 }

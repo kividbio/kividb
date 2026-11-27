@@ -104,6 +104,62 @@ pub static DEBUG_SENDS_NONE: AtomicU64 = AtomicU64::new(0);
 /// Clients closed for `client-output-buffer-limit`: `INFO`'s
 /// `client_output_buffer_limit_disconnections`.
 pub static OUTPUT_BUFFER_LIMIT_DISCONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Clients closed for holding more unread request bytes than
+/// `client-query-buffer-limit` allows: `INFO`'s
+/// `client_query_buffer_limit_disconnections`.
+pub static QUERY_BUFFER_LIMIT_DISCONNECTIONS: AtomicU64 = AtomicU64::new(0);
+/// Refusals counted for `INFO`'s `acl_access_denied_auth`, `_cmd`, `_key`
+/// and `_channel`: bumped only where a refusal is logged (`AclLog::record`).
+pub static ACL_DENIED_AUTH: AtomicU64 = AtomicU64::new(0);
+pub static ACL_DENIED_CMD: AtomicU64 = AtomicU64::new(0);
+pub static ACL_DENIED_KEY: AtomicU64 = AtomicU64::new(0);
+pub static ACL_DENIED_CHANNEL: AtomicU64 = AtomicU64::new(0);
+/// Bytes received from the master over the replication link (a full-sync
+/// payload and the stream after it), and bytes sent to replicas over their
+/// links (the same): `INFO`'s `total_net_repl_input_bytes` and
+/// `total_net_repl_output_bytes`.
+pub static TOTAL_NET_REPL_INPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static TOTAL_NET_REPL_OUTPUT_BYTES: AtomicU64 = AtomicU64::new(0);
+/// What the active-expire threads have done, written once a cycle (never by
+/// a command): microseconds spent in cycles, cycles that ran out of time,
+/// and the moving average of the share of sampled keys found past their
+/// time, as the bits of an `f64` percentage. `INFO`'s
+/// `expire_cycle_cpu_milliseconds`, `expired_time_cap_reached_count` and
+/// `expired_stale_perc`.
+pub static EXPIRE_CYCLE_MICROS: AtomicU64 = AtomicU64::new(0);
+pub static EXPIRE_TIME_CAP_REACHED: AtomicU64 = AtomicU64::new(0);
+static EXPIRED_STALE_PERC_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Fold one cycle's sample (`seen` keys looked at, `due` of them past their
+/// time) into the moving average, weighing the new cycle 5% as Redis does.
+pub fn note_expire_cycle(micros: u64, capped: bool, seen: usize, due: usize) {
+    EXPIRE_CYCLE_MICROS.fetch_add(micros, Ordering::Relaxed);
+    if capped {
+        EXPIRE_TIME_CAP_REACHED.fetch_add(1, Ordering::Relaxed);
+    }
+    if seen > 0 {
+        let now = due as f64 * 100.0 / seen as f64;
+        let before = f64::from_bits(EXPIRED_STALE_PERC_BITS.load(Ordering::Relaxed));
+        let after = now * 0.05 + before * 0.95;
+        EXPIRED_STALE_PERC_BITS.store(after.to_bits(), Ordering::Relaxed);
+    }
+}
+
+/// The moving average of the percentage of sampled keys past their time.
+pub fn expired_stale_perc() -> f64 {
+    f64::from_bits(EXPIRED_STALE_PERC_BITS.load(Ordering::Relaxed))
+}
+
+/// Clear what [`note_expire_cycle`] kept (`CONFIG RESETSTAT`).
+pub fn reset_expire_cycle_stats() {
+    EXPIRE_CYCLE_MICROS.store(0, Ordering::Relaxed);
+    EXPIRE_TIME_CAP_REACHED.store(0, Ordering::Relaxed);
+    EXPIRED_STALE_PERC_BITS.store(0, Ordering::Relaxed);
+}
+
+/// When the `BGSAVE` running now began, in milliseconds on the Unix clock;
+/// 0 when none is: `rdb_current_bgsave_time_sec`.
+pub static BGSAVE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 /// Changes to the dataset since it was last saved, a counter to each thread
 /// that has made one. See [`record_rdb_change`].
 static RDB_CHANGES: parking_lot::Mutex<Vec<std::sync::Arc<AtomicU64>>> =

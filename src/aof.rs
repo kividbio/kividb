@@ -140,6 +140,21 @@ pub fn rewrite_in_progress() -> bool {
     REWRITE_ACTIVE.load(Ordering::Relaxed) || REWRITE_ASKED.load(Ordering::Relaxed)
 }
 
+/// When the rewrite walking the store now began, in milliseconds on the
+/// Unix clock; 0 when none is.
+static REWRITE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Seconds the rewrite walking the store now has taken: `INFO`'s
+/// `aof_current_rewrite_time_sec`. -1 when none is.
+pub fn current_rewrite_secs() -> i64 {
+    let started = REWRITE_STARTED_MS.load(Ordering::Acquire);
+    if !REWRITE_ACTIVE.load(Ordering::Acquire) || started == 0 {
+        return -1;
+    }
+    (crate::commands::helpers::unix_ms(std::time::SystemTime::now()).saturating_sub(started) / 1000)
+        as i64
+}
+
 /// `BGREWRITEAOF`'s thread: whether it is running, and whether another
 /// rewrite was asked for while it ran.
 struct BackgroundRewrite {
@@ -2894,6 +2909,10 @@ pub fn checkpoint_noting(
             REWRITE_ACTIVE.store(false, Ordering::Release);
         }
     }
+    REWRITE_STARTED_MS.store(
+        crate::commands::helpers::unix_ms(std::time::SystemTime::now()),
+        Ordering::Release,
+    );
     REWRITE_ACTIVE.store(true, Ordering::Release);
     let _active = Active;
     let aof_on = AOF_ENABLED.load(Ordering::Relaxed);

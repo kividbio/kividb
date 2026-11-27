@@ -460,6 +460,9 @@ only what happened next. Redis rewrites at this point for the same reason.
 | `aof_rewrite_in_progress` | A checkpoint is running. |
 | `aof_last_rewrite_time_sec` | Redis-compatible whole seconds, `-1` if none has run. |
 | `aof_last_rewrite_time_ms` | The same in milliseconds, because the seconds field shows a short checkpoint as `0`. |
+| `aof_current_rewrite_time_sec` | Whole seconds the checkpoint running now has taken, `-1` when none is. |
+| `rdb_current_bgsave_time_sec` | Whole seconds the `BGSAVE` running now has taken, `-1` when none is. |
+| `latest_fork_usec` | Always `0` (in `INFO stats`): a save and a checkpoint run in this process, and no fork is made. |
 | `aof_last_bgrewrite_status` | `err` if the last checkpoint failed. Durability is intact, but the log keeps growing. |
 | `aof_lost_records` | Non-zero means the log has a hole and can no longer reconstruct the dataset. |
 | `aof_acks_before_write` | Replies to writes sent after waiting 5 s for their records to reach the file, without them: the disk fell more than 5 s behind. A process killed then can lose those writes. 0 on a disk that keeps up (see [When a write is acknowledged](#when-a-write-is-acknowledged)). |

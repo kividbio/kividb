@@ -1131,6 +1131,7 @@ async fn run_replication_session(
                 )));
             }
             filled += n;
+            crate::stats::TOTAL_NET_REPL_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
             repl_state.note_master_io();
         }
 
@@ -1350,6 +1351,8 @@ async fn run_replication_session(
                         }
                         repl_buf.extend_from_slice(&temp[..n]);
                         offset += n as u64;
+                        crate::stats::TOTAL_NET_REPL_INPUT_BYTES
+                            .fetch_add(n as u64, Ordering::Relaxed);
                         repl_state.note_master_io();
                     }
                 }
@@ -1498,6 +1501,7 @@ async fn run_replication_session(
                 Some(n) => {
                     repl_buf.extend_from_slice(&temp[..n]);
                     offset += n as u64;
+                    crate::stats::TOTAL_NET_REPL_INPUT_BYTES.fetch_add(n as u64, Ordering::Relaxed);
                     last_io = Instant::now();
                     repl_state.note_master_io();
                     master_link.touch();
@@ -2640,6 +2644,8 @@ where
         async move {
             use tokio::io::AsyncWriteExt;
             crate::stats::TOTAL_NET_OUTPUT_BYTES.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
+                .fetch_add(batch.len() as u64, Ordering::Relaxed);
             crate::stats::record_write();
             writer.lock().await.write_all(&batch).await.is_ok()
         }
@@ -2800,6 +2806,8 @@ where
         let write_frames = async {
             for frame in frames {
                 crate::stats::TOTAL_NET_OUTPUT_BYTES
+                    .fetch_add(frame.len() as u64, Ordering::Relaxed);
+                crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
                     .fetch_add(frame.len() as u64, Ordering::Relaxed);
                 if out.write_all(&frame).await.is_err() {
                     return false;
