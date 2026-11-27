@@ -2381,9 +2381,7 @@ impl Config {
             }
             "daemonize" => {
                 if yes_no(key, one()?)? {
-                    return Err(
-                        "'daemonize yes' is not supported: KiviDB runs in the foreground".into(),
-                    );
+                    return no_effect("KiviDB runs in the foreground");
                 }
             }
             // When the AOF is synced (#513). It used to be read and warned
@@ -3137,7 +3135,7 @@ mod config_file_tests {
             "requirepass \"unterminated",
             "maxmemory-policy allkeys-mru",
             "maxmemory-samples 0",
-            "daemonize yes",
+            "daemonize maybe",
             "dbfilename other.rdb",
         ] {
             let err = load(bad).unwrap_err();
@@ -3366,9 +3364,15 @@ mod config_file_tests {
 
     #[test]
     fn redis_directives_with_no_effect_are_reported_and_not_fatal() {
-        let (_, warnings) = load("save 900 1\ntcp-keepalive 300\nappendfsync no\n").unwrap();
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        let (_, warnings) =
+            load("save 900 1\ntcp-keepalive 300\nappendfsync no\ndaemonize yes\n").unwrap();
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
         assert!(warnings[0].contains("line 1") && warnings[0].contains("'save'"));
+        assert!(
+            warnings[3].contains("line 4")
+                && warnings[3].contains("'daemonize'")
+                && warnings[3].contains("foreground")
+        );
         // The values KiviDB already behaves as are not worth a warning.
         let (_, warnings) =
             load("save \"\"\nappendfsync everysec\ndaemonize no\ndbfilename dump.kdb\n").unwrap();
