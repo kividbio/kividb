@@ -337,7 +337,7 @@ fn requests_arriving_in_small_pieces_keep_their_buffer() {
         let mut c = server.conn();
         assert!(c.cmd(&["CLIENT", "SETNAME", "slow"]).ok());
         let request = encode(&["SET", "slow", &"s".repeat(8 * 1024)]);
-        let mut send_slowly = |c: &mut Conn| {
+        let send_slowly = |c: &mut Conn| {
             for piece in request.chunks(PIECE) {
                 c.writer.write_all(piece).unwrap();
                 std::thread::sleep(Duration::from_millis(20));
@@ -384,7 +384,7 @@ fn bursts_between_single_commands_keep_their_buffer() {
         for i in 0..BURST {
             burst.extend_from_slice(&encode(&["SET", &format!("k{i}"), &value]));
         }
-        let mut cycle = |c: &mut Conn| {
+        let cycle = |c: &mut Conn| {
             c.writer.write_all(&burst).unwrap();
             for _ in 0..BURST {
                 assert!(c.read().ok(), "{io_model}");
