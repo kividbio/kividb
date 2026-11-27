@@ -169,6 +169,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`INFO` fields that redis_exporter reads: client buffers, ACL denials,
+  saves and rewrites, replication traffic, and the background expiry.**
+  `INFO clients` has `client_recent_max_input_buffer` and
+  `client_recent_max_output_buffer` (the largest query buffer, and the most
+  output waiting to be written, of one client among those connected).
+  `INFO stats` has `client_query_buffer_limit_disconnections`,
+  `evicted_clients` (0: `maxmemory-clients` is kept, not enforced),
+  `acl_access_denied_auth`, `_cmd`, `_key` and `_channel`,
+  `total_net_repl_input_bytes` and `total_net_repl_output_bytes`,
+  `expire_cycle_cpu_milliseconds`, `expired_time_cap_reached_count`,
+  `expired_stale_perc`, and `latest_fork_usec` (0: nothing is forked).
+  `INFO persistence` has `rdb_current_bgsave_time_sec` and
+  `aof_current_rewrite_time_sec` (-1 when none runs); `INFO memory` has
+  `mem_total_replication_buffers`. Each is counted off the command path,
+  and `CONFIG RESETSTAT` clears the counters.
+
 - **`GEO` fields in `FT.CREATE`, `@field:[lon lat radius unit]` and
   `GEOFILTER` (part of #1004).** As in Redis 8.10: a HASH field holds
   `"lon,lat"`, a JSON one a string of that form or an array of them; the

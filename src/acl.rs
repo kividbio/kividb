@@ -439,6 +439,14 @@ impl AclLog {
     /// or a failed AUTH. The context is the one the connection is in (see
     /// [`log_context`]): `toplevel`, `multi` or `lua`.
     pub fn record(&self, reason: &str, object: &[u8], username: &str, client_info: &str) {
+        // Counted for `INFO` whether or not the log keeps entries.
+        let counter = match reason {
+            "auth" => &crate::stats::ACL_DENIED_AUTH,
+            "command" => &crate::stats::ACL_DENIED_CMD,
+            "key" => &crate::stats::ACL_DENIED_KEY,
+            _ => &crate::stats::ACL_DENIED_CHANNEL,
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

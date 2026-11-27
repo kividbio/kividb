@@ -66,12 +66,28 @@ localhost only, and Grafana lets anyone in as a viewer.
 
 ## What the exporter reports
 
-From 1.3.0, the exporter reports 113 of the 164 metrics it reports for
-Redis 8.10.3. The other 51 have no `INFO` field in KiviDB yet and are listed
+From 1.3.0, the exporter reports 130 of the 164 metrics it reports for
+Redis 8.10.3. The other 34 have no `INFO` field in KiviDB yet and are listed
 in [`known-gaps.txt`](../benchmarks/redis-exporter-compat/known-gaps.txt):
-among them pub/sub channel and pattern counts, watched keys, ACL denials,
-the allocator's fragmentation figures, and Lua memory. The dashboard uses
-none of them.
+among them pub/sub channel and pattern counts, watched keys, the allocator's
+fragmentation figures, Lua memory and the I/O thread figures. The dashboard
+uses none of them.
+
+The fields added for the exporter, and what each reports:
+
+| `INFO` field | What it reports |
+|---|---|
+| `client_recent_max_input_buffer`, `client_recent_max_output_buffer` (clients) | The largest query buffer, and the most output waiting to be written, of one client among those connected when `INFO` runs. Redis reports the largest over the last few seconds; KiviDB reports the clients as they are. |
+| `client_query_buffer_limit_disconnections` | Clients closed for sending more than `client-query-buffer-limit` allows. |
+| `evicted_clients` | Always `0`: `maxmemory-clients` is accepted and kept, and no client is evicted for it. |
+| `acl_access_denied_auth`, `_cmd`, `_key`, `_channel` | A failed `AUTH`, and a command, key or channel the user's rules refuse (the refusals `ACL LOG` lists, counted whether or not `acllog-max-len` keeps entries). |
+| `rdb_current_bgsave_time_sec`, `aof_current_rewrite_time_sec` | Whole seconds the `BGSAVE` or the checkpoint running now has taken, `-1` when none runs. |
+| `latest_fork_usec` | Always `0`: a save and a checkpoint run in the server process, and nothing is forked. |
+| `total_net_repl_input_bytes`, `total_net_repl_output_bytes` | Bytes a replica received from its master, and bytes a master sent to its replicas, full syncs included. |
+| `mem_total_replication_buffers` (memory) | The bytes the replication backlog holds, the same as `mem_replication_backlog`. Each replica's own queue is in `mem_clients_slaves`. |
+| `expire_cycle_cpu_milliseconds`, `expired_time_cap_reached_count`, `expired_stale_perc` | The time the background expiry's cycles have taken (wall-clock, all threads), the cycles that stopped because their time was up, and a moving average of the share of the keys a cycle looked at that were past their time, as Redis computes it. |
+
+`CONFIG RESETSTAT` clears the counters.
 
 Every release, the compat workflow runs redis_exporter v1.66.0 against
 KiviDB and Redis 8.10.3 under the same workload

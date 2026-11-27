@@ -112,6 +112,7 @@ pub(crate) fn carried_too_much(base: usize, carried: &[u8], from: usize) -> bool
     log_warn!(
         "Closing a client that held {held} unread bytes, past client-query-buffer-limit ({limit})"
     );
+    crate::stats::QUERY_BUFFER_LIMIT_DISCONNECTIONS.fetch_add(1, Ordering::Relaxed);
     true
 }
 

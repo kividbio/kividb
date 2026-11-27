@@ -391,6 +391,39 @@ pub fn active_expire_cycle(
     cursor: &mut ExpireCursor,
     target: Option<&crate::expiry::Target>,
 ) -> bool {
+    let started = std::time::Instant::now();
+    let mut tally = CycleTally::default();
+    let behind = expire_cycle(store, index_store, cursor, target, &mut tally);
+    // For `INFO`: once a cycle, never by a command.
+    if tally.ran {
+        crate::stats::note_expire_cycle(
+            started.elapsed().as_micros() as u64,
+            tally.capped,
+            tally.seen,
+            tally.due,
+        );
+    }
+    behind
+}
+
+/// What one [`active_expire_cycle`] did, for `INFO`: whether it looked at
+/// any shard, whether its time ran out, the keys it looked at and those
+/// past their time.
+#[derive(Default)]
+struct CycleTally {
+    ran: bool,
+    capped: bool,
+    seen: usize,
+    due: usize,
+}
+
+fn expire_cycle(
+    store: &Store,
+    index_store: &IndexStore,
+    cursor: &mut ExpireCursor,
+    target: Option<&crate::expiry::Target>,
+    tally: &mut CycleTally,
+) -> bool {
     // A replica expires nothing itself: its master's `DEL`s say what has
     // gone (see `expiry`). Its clients are told a key past its time is not
     // there all the same. Unless its master sends no `DEL`s (before 1.1.3).
@@ -407,10 +440,9 @@ pub fn active_expire_cycle(
     if shards == 0 {
         return false;
     }
+    tally.ran = true;
     let started = std::time::Instant::now();
     let mut visited = 0usize;
-    // Keys looked at, and of them those past their time.
-    let (mut seen, mut due_total) = (0usize, 0usize);
     let behind = stale;
     while visited < shards {
         if cursor.db >= store.len() {
@@ -443,12 +475,13 @@ pub fn active_expire_cycle(
             // the thread spent its time copying and deleted 5,000 a second.
             loop {
                 let (looked, due) = expire_pass(store, index_store, db, shard, now, told);
-                seen += looked;
-                due_total += due;
+                tally.seen += looked;
+                tally.due += due;
                 if started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
                     // This shard is gone through again next time: what is
                     // left of it, and what has come due since.
-                    return behind(seen, due_total);
+                    tally.capped = true;
+                    return behind(tally.seen, tally.due);
                 }
                 if due < ACTIVE_EXPIRE_BATCH {
                     break;
@@ -458,7 +491,8 @@ pub fn active_expire_cycle(
         cursor.shard += 1;
         visited += 1;
         if visited.is_multiple_of(64) && started.elapsed() >= ACTIVE_EXPIRE_BUDGET {
-            return visited < shards && behind(seen, due_total);
+            tally.capped = visited < shards;
+            return visited < shards && behind(tally.seen, tally.due);
         }
     }
     false

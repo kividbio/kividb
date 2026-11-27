@@ -3905,3 +3905,62 @@ fn a_torn_old_log_beside_a_dump_saved_with_the_aof_off_is_judged_the_same_twice(
     assert_eq!((c.cmd(&["DBSIZE"]).i(), c.cmd(&["GET", "off"])), first);
     assert_eq!(kept_aside(&server.dir).len(), kept);
 }
+
+/// `INFO` shows a `BGSAVE` and a `BGREWRITEAOF` while they run, how long
+/// each has taken, and neither once it is done. No fork is made, so
+/// `latest_fork_usec` stays 0.
+#[test]
+fn info_shows_a_save_and_a_rewrite_while_they_run() {
+    let field = |c: &mut Conn, section: &str, name: &str| -> i64 {
+        let info = c.cmd(&["INFO", section]);
+        info.s()
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}:")))
+            .unwrap_or_else(|| panic!("no {name} in INFO {section}"))
+            .trim()
+            .parse()
+            .unwrap()
+    };
+    for &io in io_models() {
+        let server = Server::start(io, "checkpoint-cutting");
+        let mut c = server.conn();
+        fill(&mut c, "k", 100);
+        assert_eq!(
+            field(&mut c, "persistence", "rdb_current_bgsave_time_sec"),
+            -1
+        );
+        assert_eq!(
+            field(&mut c, "persistence", "aof_current_rewrite_time_sec"),
+            -1
+        );
+
+        assert_eq!(c.cmd(&["BGREWRITEAOF"]).s(), STARTED);
+        assert!(server.reached("checkpoint-cutting.1", LONG), "{io}");
+        assert_eq!(field(&mut c, "persistence", "aof_rewrite_in_progress"), 1);
+        assert!(field(&mut c, "persistence", "aof_current_rewrite_time_sec") >= 0);
+        assert_eq!(field(&mut c, "persistence", "rdb_bgsave_in_progress"), 0);
+        assert_eq!(
+            field(&mut c, "persistence", "rdb_current_bgsave_time_sec"),
+            -1
+        );
+        server.release("checkpoint-cutting.1");
+        wait_idle(&mut c);
+        assert_eq!(
+            field(&mut c, "persistence", "aof_current_rewrite_time_sec"),
+            -1
+        );
+
+        assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+        assert!(server.reached("checkpoint-cutting.2", LONG), "{io}");
+        assert_eq!(field(&mut c, "persistence", "rdb_bgsave_in_progress"), 1);
+        assert!(field(&mut c, "persistence", "rdb_current_bgsave_time_sec") >= 0);
+        server.release("checkpoint-cutting.2");
+        wait_idle(&mut c);
+        assert_eq!(
+            field(&mut c, "persistence", "rdb_current_bgsave_time_sec"),
+            -1
+        );
+        assert!(field(&mut c, "persistence", "rdb_last_bgsave_time_sec") >= 0);
+        assert_eq!(field(&mut c, "stats", "latest_fork_usec"), 0);
+    }
+}

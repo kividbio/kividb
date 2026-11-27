@@ -4592,6 +4592,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if crate::stats::BGSAVE_IN_PROGRESS.swap(true, Ordering::AcqRel) {
                 return Some(resp_error("ERR Background save already in progress"));
             }
+            crate::stats::BGSAVE_STARTED_MS.store(
+                crate::commands::helpers::unix_ms(std::time::SystemTime::now()),
+                Ordering::Release,
+            );
             let store = Arc::clone(ctx.store);
             let index_store_snap = Arc::clone(ctx.index_store);
             let repl_state = Arc::clone(ctx.repl_state);
@@ -4963,6 +4967,45 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "client_output_buffer_limit_disconnections:{}\r\n",
                     crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.load(Ordering::Relaxed)
                 ));
+                // Clients closed for an unread request past
+                // `client-query-buffer-limit`. `maxmemory-clients` is
+                // accepted and kept but no client is evicted for it, so
+                // none has been: 0.
+                out.push_str(&format!(
+                    "client_query_buffer_limit_disconnections:{}\r\n",
+                    crate::stats::QUERY_BUFFER_LIMIT_DISCONNECTIONS.load(Ordering::Relaxed)
+                ));
+                out.push_str("evicted_clients:0\r\n");
+                // Refusals by the ACL: a failed AUTH, and a command, key or
+                // channel a user's rules do not allow.
+                out.push_str(&format!(
+                    "acl_access_denied_auth:{}\r\nacl_access_denied_cmd:{}\r\n\
+                     acl_access_denied_key:{}\r\nacl_access_denied_channel:{}\r\n",
+                    crate::stats::ACL_DENIED_AUTH.load(Ordering::Relaxed),
+                    crate::stats::ACL_DENIED_CMD.load(Ordering::Relaxed),
+                    crate::stats::ACL_DENIED_KEY.load(Ordering::Relaxed),
+                    crate::stats::ACL_DENIED_CHANNEL.load(Ordering::Relaxed),
+                ));
+                // Bytes over the replication links: received from the
+                // master, and sent to replicas.
+                out.push_str(&format!(
+                    "total_net_repl_input_bytes:{}\r\ntotal_net_repl_output_bytes:{}\r\n",
+                    crate::stats::TOTAL_NET_REPL_INPUT_BYTES.load(Ordering::Relaxed),
+                    crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES.load(Ordering::Relaxed),
+                ));
+                // The background expiry: time its cycles took, cycles that
+                // ran out of time, and the share of the keys sampled that
+                // were past their time (a moving average).
+                out.push_str(&format!(
+                    "expired_stale_perc:{:.2}\r\nexpired_time_cap_reached_count:{}\r\n\
+                     expire_cycle_cpu_milliseconds:{}\r\n",
+                    crate::stats::expired_stale_perc(),
+                    crate::stats::EXPIRE_TIME_CAP_REACHED.load(Ordering::Relaxed),
+                    crate::stats::EXPIRE_CYCLE_MICROS.load(Ordering::Relaxed) / 1000,
+                ));
+                // KiviDB does not fork: a save and a rewrite run in this
+                // process, so no fork has taken any time.
+                out.push_str("latest_fork_usec:0\r\n");
                 out.push_str(&format!(
                     "total_error_replies:{}\r\n",
                     crate::stats::TOTAL_ERROR_REPLIES.load(Ordering::Relaxed)
@@ -5355,6 +5398,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     ctx.repl_state.backlog_histlen.load(Ordering::Relaxed)
                 ));
                 let (clients_normal, clients_replicas) = ctx.client_registry.buffer_totals();
+                // What the backlog holds is all KiviDB keeps for replicas
+                // besides each one's own queue (`mem_clients_slaves`).
+                out.push_str(&format!(
+                    "mem_total_replication_buffers:{}\r\n",
+                    ctx.repl_state.backlog_histlen.load(Ordering::Relaxed)
+                ));
                 out.push_str(&format!("mem_clients_slaves:{clients_replicas}\r\n"));
                 out.push_str(&format!("mem_clients_normal:{clients_normal}\r\n"));
                 out.push_str("mem_aof_buffer:0\r\n");
@@ -5378,6 +5427,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let tracking = crate::tracking::tracking_client_count();
                 out.push_str("# Clients\r\n");
                 out.push_str(&format!("connected_clients:{count}\r\n"));
+                // The largest query buffer and the most output waiting to be
+                // written among the clients connected now.
+                let (max_input, max_output) = ctx.client_registry.max_buffers();
+                out.push_str(&format!("client_recent_max_input_buffer:{max_input}\r\n"));
+                out.push_str(&format!("client_recent_max_output_buffer:{max_output}\r\n"));
                 out.push_str(&format!("blocked_clients:{blocked}\r\n"));
                 out.push_str(&format!("tracking_clients:{tracking}\r\n"));
                 let (keys, items, prefixes) = ctx.tracking_table.totals();
@@ -5431,6 +5485,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     "rdb_last_bgsave_time_sec:{}\r\n",
                     crate::stats::LAST_BGSAVE_SECS.load(Ordering::Relaxed)
                 ));
+                // Seconds the `BGSAVE` running now has taken; -1 when none is.
+                let started = crate::stats::BGSAVE_STARTED_MS.load(Ordering::Acquire);
+                let current =
+                    if crate::stats::BGSAVE_IN_PROGRESS.load(Ordering::Acquire) && started != 0 {
+                        (crate::commands::helpers::unix_ms(std::time::SystemTime::now())
+                            .saturating_sub(started)
+                            / 1000) as i64
+                    } else {
+                        -1
+                    };
+                out.push_str(&format!("rdb_current_bgsave_time_sec:{current}\r\n"));
                 out.push_str(&format!(
                     "rdb_last_bgsave_status:{}\r\n",
                     if crate::stats::LAST_BGSAVE_OK.load(Ordering::Acquire) {
@@ -5463,6 +5528,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     if rewriting { 1 } else { 0 }
                 ));
                 out.push_str("aof_rewrite_scheduled:0\r\n");
+                // Seconds the rewrite running now has taken; -1 when none is.
+                out.push_str(&format!(
+                    "aof_current_rewrite_time_sec:{}\r\n",
+                    crate::aof::current_rewrite_secs()
+                ));
                 match crate::aof::last_rewrite_duration() {
                     // Redis reports whole seconds, so keep that field
                     // wire-compatible for tools that already parse it.
@@ -5751,6 +5821,18 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     crate::compaction::reset_stats();
                     crate::stats::REJECTED_CONNECTIONS.store(0, Ordering::Relaxed);
                     crate::stats::OUTPUT_BUFFER_LIMIT_DISCONNECTIONS.store(0, Ordering::Relaxed);
+                    crate::stats::QUERY_BUFFER_LIMIT_DISCONNECTIONS.store(0, Ordering::Relaxed);
+                    for counter in [
+                        &crate::stats::ACL_DENIED_AUTH,
+                        &crate::stats::ACL_DENIED_CMD,
+                        &crate::stats::ACL_DENIED_KEY,
+                        &crate::stats::ACL_DENIED_CHANNEL,
+                        &crate::stats::TOTAL_NET_REPL_INPUT_BYTES,
+                        &crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES,
+                    ] {
+                        counter.store(0, Ordering::Relaxed);
+                    }
+                    crate::stats::reset_expire_cycle_stats();
                     // Not `rdb_changes_since_last_save`: that is not a
                     // statistic, and Redis keeps it (#566).
                     crate::stats::INSTANTANEOUS_OPS.store(0, Ordering::Relaxed);

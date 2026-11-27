@@ -1179,6 +1179,20 @@ impl ClientRegistryInner {
         (normal, replicas)
     }
 
+    /// The largest query buffer (what it holds and its spare room) and the
+    /// most output waiting to be written, each of one client, among those
+    /// connected now: `INFO`'s `client_recent_max_input_buffer` and
+    /// `client_recent_max_output_buffer`.
+    pub fn max_buffers(&self) -> (u64, u64) {
+        let (mut input, mut output) = (0u64, 0u64);
+        for info in self.clients.read().values() {
+            let (len, free) = info.query_buffer.values();
+            input = input.max(len + free);
+            output = output.max(info.activity.output());
+        }
+        (input, output)
+    }
+
     pub fn register_push_tx(&self, id: u64, tx: mpsc::Sender<Vec<u8>>) {
         if let Some(info) = self.clients.write().get_mut(&id) {
             info.push_tx = Some(tx);

@@ -4452,7 +4452,11 @@ pub fn start_hub(state: Arc<ReplState>) -> HubTx {
                     for mut r in socket_replicas.drain(..) {
                         use tokio::io::AsyncWriteExt;
                         match r.writer.write_all(&payload).await {
-                            Ok(_) => alive_sockets.push(r),
+                            Ok(_) => {
+                                crate::stats::TOTAL_NET_REPL_OUTPUT_BYTES
+                                    .fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                alive_sockets.push(r)
+                            }
                             Err(e) => {
                                 log_warn!("Replication: Socket replica {} dropped: {e}", r.addr);
                                 state.connected_replicas.fetch_sub(1, Ordering::Relaxed);

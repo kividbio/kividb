@@ -1,3 +1,20 @@
 # Checks KiviDB passes that comparing with Redis would not catch (benchmarks/README.md).
 redis-exporter.Known gaps::up to date
 redis-exporter.Known gaps::listed
+redis-exporter.Metric::redis_acl_access_denied_auth_total
+redis-exporter.Metric::redis_acl_access_denied_channel_total
+redis-exporter.Metric::redis_acl_access_denied_cmd_total
+redis-exporter.Metric::redis_acl_access_denied_key_total
+redis-exporter.Metric::redis_aof_current_rewrite_duration_sec
+redis-exporter.Metric::redis_client_query_buffer_limit_disconnections_total
+redis-exporter.Metric::redis_client_recent_max_input_buffer_bytes
+redis-exporter.Metric::redis_client_recent_max_output_buffer_bytes
+redis-exporter.Metric::redis_evicted_clients_total
+redis-exporter.Metric::redis_expire_cycle_cpu_time_ms_total
+redis-exporter.Metric::redis_expired_stale_percentage
+redis-exporter.Metric::redis_expired_time_cap_reached_total
+redis-exporter.Metric::redis_latest_fork_seconds
+redis-exporter.Metric::redis_mem_total_replication_buffers_bytes
+redis-exporter.Metric::redis_net_repl_input_bytes_total
+redis-exporter.Metric::redis_net_repl_output_bytes_total
+redis-exporter.Metric::redis_rdb_current_bgsave_duration_sec
