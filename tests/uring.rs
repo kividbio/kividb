@@ -432,7 +432,11 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     }
     let list = observer.cmd(&["CLIENT", "LIST"]);
     let small_line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
-    assert_eq!(client_metric(small_line, "qbuf="), Some("0"), "{small_line}");
+    assert_eq!(
+        client_metric(small_line, "qbuf="),
+        Some("0"),
+        "{small_line}"
+    );
     assert_eq!(
         client_metric(small_line, "qbuf-free="),
         Some("0"),

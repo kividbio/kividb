@@ -1224,8 +1224,7 @@ where
         if unpresented == 0 && carried.is_empty() && !skip_read {
             // Not needed past `READ_SIZE` lately: an empty, grown buffer goes
             // back to `READ_SIZE`.
-            if unused_turns >= UNUSED_TURNS && buffer.is_empty() && buffer.capacity() > READ_SIZE
-            {
+            if unused_turns >= UNUSED_TURNS && buffer.is_empty() && buffer.capacity() > READ_SIZE {
                 buffer = Vec::with_capacity(READ_SIZE);
                 private_query_buffer = false;
                 query_buffer.update(0, buffer.capacity(), private_query_buffer);

@@ -361,7 +361,10 @@ fn requests_arriving_in_small_pieces_keep_their_buffer() {
             assert_eq!(c.cmd(&["PING"]), V::Str("PONG".into()));
         }
         let back = used_memory(&mut ctl) - small;
-        assert!(back < READ_SIZE, "{io_model}: {back} bytes over the small buffers");
+        assert!(
+            back < READ_SIZE,
+            "{io_model}: {back} bytes over the small buffers"
+        );
         assert_eq!(c.cmd(&["STRLEN", "slow"]), V::Int(8 * 1024));
     }
 }
@@ -411,7 +414,10 @@ fn bursts_between_single_commands_keep_their_buffer() {
             assert_eq!(c.cmd(&["PING"]), V::Str("PONG".into()));
         }
         let back = used_memory(&mut ctl) - small;
-        assert!(back < READ_SIZE, "{io_model}: {back} bytes over the small buffers");
+        assert!(
+            back < READ_SIZE,
+            "{io_model}: {back} bytes over the small buffers"
+        );
     }
 }
 

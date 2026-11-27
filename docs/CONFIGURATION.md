@@ -140,8 +140,10 @@ warning. Cluster bus links, a replica's link to its master and files written whi
 are not counted in that; leave room for them in a large cluster.
 
 A connection's read buffer starts at 4 KiB and its reply buffers start empty, so a connection that
-has sent nothing holds little more than that. A read buffer grown for a burst goes back to 4 KiB
-once the connection's requests are small again, with the reply buffers; on the Tokio loop a
+has sent nothing holds little more than that. A read buffer grown for a burst goes back to 4 KiB,
+with the reply buffers, once sixteen reads in a row have not needed more than 4 KiB of it: a
+client whose requests arrive in several small reads, or that sends pipelined bursts between a few
+single commands, keeps the size it uses rather than growing it again for each. On the Tokio loop a
 quiet connection also gives them back after `query-buffer-idle-resize-after`. On io_uring a read
 buffer that has grown stays at its size while a read is pending on it. Suite
 `55-idle-connection-memory` under `benchmarks/1.3.0/regressions/` measures what 10,000 idle
