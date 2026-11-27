@@ -379,7 +379,11 @@ fn a_tracking_client_survives_the_buffers_going_back() {
         std::thread::sleep(QUIET);
         assert!(server.conn().cmd(&["SET", "watched", "2"]).ok());
         let push = c.read();
-        assert_eq!(push.items()[0], V::Bulk(b"invalidate".to_vec()), "{io_model}");
+        assert_eq!(
+            push.items()[0],
+            V::Bulk(b"invalidate".to_vec()),
+            "{io_model}"
+        );
         assert_eq!(
             push.items()[1],
             V::Arr(vec![V::Bulk(b"watched".to_vec())]),
