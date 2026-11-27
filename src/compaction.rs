@@ -2326,6 +2326,7 @@ mod tests {
     /// keyspace's and chooses none of the set's, and a real pass after it
     /// moves none of the set's entries: the set reads as it did, and its
     /// slabs are given back once it is dropped.
+    #[cfg(any())] // the large form is not a collection table here
     #[test]
     fn a_large_sorted_sets_full_pool_slabs_are_never_chosen() {
         use crate::sorted_set::SortedSetInner;

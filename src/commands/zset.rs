@@ -1607,14 +1607,22 @@ fn zscan(ctx: &mut Ctx) -> Vec<u8> {
             // A table (#875) gives the cursor itself: a page reads its own
             // groups, and `COUNT` is the hint it is in Redis (#770). A
             // cursor of the earlier form goes on from that position.
-            if let Some(table) = inner.table() {
-                return crate::commands::table_scan::zscan_reply(
-                    table,
-                    cursor,
-                    options.count,
-                    pattern.as_ref(),
-                    options.no_scores,
-                );
+            {
+                let mut items: Vec<Vec<u8>> = Vec::new();
+                let next = inner.scan_page(cursor, options.count, |member, score| {
+                    if pattern.as_ref().is_none_or(|glob| glob.matches(member)) {
+                        items.push(resp_bulk(member));
+                        if !options.no_scores {
+                            items.push(resp_bulk_str(&format_score(score)));
+                        }
+                    }
+                });
+                if let Some(next) = next {
+                    return resp_array(vec![
+                        resp_bulk_str(&next.to_string()),
+                        resp_array(items),
+                    ]);
+                }
             }
             // A block comes back whole, in order, as Redis returns a
             // listpack.

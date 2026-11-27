@@ -765,7 +765,7 @@ impl std::error::Error for TooLong {}
 /// limit can be tried without 4 GiB of bytes.
 #[cfg(not(test))]
 #[inline(always)]
-fn max_len() -> usize {
+pub(crate) fn max_len() -> usize {
     MAX_LEN
 }
 
@@ -775,7 +775,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn max_len() -> usize {
+pub(crate) fn max_len() -> usize {
     TEST_MAX_LEN.with(std::cell::Cell::get)
 }
 

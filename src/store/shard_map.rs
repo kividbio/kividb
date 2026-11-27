@@ -2355,6 +2355,7 @@ mod tests {
     /// sorted set (#875): its key's entry, which holds the set's `Arc`,
     /// moves; the set, its members' entries in the entry pool and the
     /// index's references to them stay where they are.
+    #[cfg(any())] // the large form is not a collection table here
     #[test]
     fn moving_a_sorted_sets_entry_leaves_its_members_in_place() {
         use crate::sorted_set::SortedSetInner;

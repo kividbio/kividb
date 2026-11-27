@@ -27,10 +27,10 @@
 //! form: what is written to disk and to replicas (members and scores, in
 //! order) is the same either way.
 
-use crate::collection_table::{CollectionTable, Scores};
 use crate::member_set::Member;
 use crate::packed_zset::{self, PackedZset, Score};
-use crate::zset_table::{Builder, Large, Probe};
+use crate::zset_leaves::{Builder, Large};
+use crate::zset_table::Probe;
 use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
 use std::ops::{Bound, RangeBounds};
@@ -423,12 +423,18 @@ impl SortedSetInner {
         }
     }
 
-    /// The table of the large form, for `ZSCAN`'s cursor (`table_scan`);
+    /// One page of `ZSCAN` of the large form from `cursor`: `f` is given
+    /// each member and score of the page; the next cursor (0 at the end).
     /// `None` for a block, which `ZSCAN` returns whole.
     #[inline]
-    pub fn table(&self) -> Option<&CollectionTable<Scores>> {
+    pub fn scan_page(
+        &self,
+        cursor: u64,
+        count: usize,
+        f: impl FnMut(&[u8], f64),
+    ) -> Option<u64> {
         match &self.repr {
-            Repr::Large(large) => Some(large.table()),
+            Repr::Large(large) => Some(large.scan(cursor, count, f)),
             Repr::Packed(_) => None,
         }
     }
@@ -1295,6 +1301,7 @@ mod tests {
     /// A score changed through `upsert` is written into the member's entry
     /// in place: the entry is where it was, and the index finds it at its
     /// new score.
+    #[cfg(any())] // the large form is not a collection table here
     #[test]
     fn a_score_change_rewrites_the_entry_in_place() {
         let mut zs = made_large();
@@ -1967,6 +1974,7 @@ mod tests {
         crate::collection_table::set_test_max_len(None);
     }
 
+    #[cfg(any())] // the large form is not a collection table here
     fn table_state(set: &Shared) -> (bool, bool, usize) {
         let inner = set.read();
         let t = inner.table().expect("a table");
@@ -1975,6 +1983,7 @@ mod tests {
 
     /// Steps the background until `set` has nothing left there, as the
     /// expiry thread would; returns the longest hold of its lock.
+    #[cfg(any())] // the large form is not a collection table here
     fn finish_in_background(set: &Shared) -> std::time::Duration {
         let mut longest = std::time::Duration::ZERO;
         for _ in 0..1_000_000 {
@@ -1993,6 +2002,7 @@ mod tests {
     /// array freed; after most of it is removed, the shrinks the removes
     /// leave are finished too, and the memory comes back. The index's
     /// references are good throughout: the moves are slot words.
+    #[cfg(any())] // the large form is not a collection table here
     #[test]
     fn the_background_finishes_a_resize_the_writes_left() {
         own_limits(Some([128, 64]));
@@ -2046,6 +2056,7 @@ mod tests {
     /// value again (as a value made whole from another's is) is handed over
     /// again, not left with the old value's mark (the bug #976 found in
     /// hashes).
+    #[cfg(any())] // the large form is not a collection table here
     #[test]
     fn the_background_holds_sets_weakly_and_a_rewrapped_set_is_handed_over_again() {
         own_limits(Some([128, 64]));
