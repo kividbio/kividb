@@ -335,6 +335,19 @@ fn replication_traffic_and_buffers_are_reported() {
         wait_until("the link", 30, || {
             r.info("replication", "master_link_status") == "up"
         });
+        // Read once the link is quiet: what the master sent of the sync has
+        // arrived, so both counts start from the same point of the stream.
+        let mut last = (u64::MAX, u64::MAX);
+        wait_until("the link to be quiet", 30, || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let now = (
+                m.info_u64("stats", "total_net_repl_output_bytes"),
+                r.info_u64("stats", "total_net_repl_input_bytes"),
+            );
+            let quiet = now == last;
+            last = now;
+            quiet
+        });
         let sent_before = m.info_u64("stats", "total_net_repl_output_bytes");
         let received_before = r.info_u64("stats", "total_net_repl_input_bytes");
         // The full sync's payload is in both.
