@@ -705,6 +705,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **An idle connection holds a few kilobytes.** A connection's read buffer
+  starts at a small read's room (4 KiB) and its reply buffers start empty,
+  on both I/O models. A read buffer grown for a burst goes back to that size
+  once the connection's requests are small again, with its reply buffers,
+  and on the Tokio loop also once the connection has been quiet for
+  `query-buffer-idle-resize-after`. A pool of many idle connections counts
+  that much less against `maxmemory`.
+
 - **A script's error reply begins `ERR`, as in Redis (#1054).** Redis
   makes `ERR` and the message of whatever a script raises with `error`.
   `error('MYERR bad')` replied `-MYERR bad`, and now replies

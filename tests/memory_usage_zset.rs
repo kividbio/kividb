@@ -185,6 +185,15 @@ fn deleting_and_making_again_sorted_sets_gives_back_what_they_report() {
     c.pipeline(&make[..10]);
     c.ok(&[b"SELECT", b"0"]);
 
+    // Made and deleted once before anything is measured: what the keys leave
+    // behind when they go (the shards' tables keep the room they grew to) is
+    // there at every reading, and so is out of the differences between them.
+    // The readings are taken from a connection whose buffers are small
+    // (`settled_used_memory`), so those are not in them either.
+    c.pipeline(&make);
+    let dels: Vec<Cmd> = keys.iter().map(|k| vec![b("DEL"), k.clone()]).collect();
+    c.pipeline(&dels);
+
     let empty = c.settled_used_memory();
     c.pipeline(&make);
     let full = c.settled_used_memory();
@@ -196,7 +205,6 @@ fn deleting_and_making_again_sorted_sets_gives_back_what_they_report() {
         keys.len()
     );
 
-    let dels: Vec<Cmd> = keys.iter().map(|k| vec![b("DEL"), k.clone()]).collect();
     c.pipeline(&dels);
     let freed = (full - c.settled_used_memory()) as i64;
     assert!(

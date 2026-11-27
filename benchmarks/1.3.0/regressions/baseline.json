@@ -36775,6 +36775,426 @@
           "max_x": 2.0
         }
       ]
+    },
+    "55-idle-connection-memory/tokio-idle/clients": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-idle",
+      "metric": "clients",
+      "unit": "connections",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 10000.0,
+        "candidate": 10000.0,
+        "redis": 10000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-idle/open_s": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-idle",
+      "metric": "open_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 3.5224,
+        "candidate": 4.4694,
+        "redis": 1.2967,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-idle/rss_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-idle",
+      "metric": "rss_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 23499.1616,
+        "candidate": 11913.216,
+        "redis": 2005.8112,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10,
+          "abs": 1024
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-idle/used_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-idle",
+      "metric": "used_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 27080.2584,
+        "candidate": 11407.6923,
+        "redis": 2799.4848,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 256
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-ping/clients": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-ping",
+      "metric": "clients",
+      "unit": "connections",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 10000.0,
+        "candidate": 10000.0,
+        "redis": 10000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-ping/open_s": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-ping",
+      "metric": "open_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 5.6618,
+        "candidate": 5.6317,
+        "redis": 1.3649,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-ping/rss_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-ping",
+      "metric": "rss_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 23493.4272,
+        "candidate": 11945.1648,
+        "redis": 4954.5216,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10,
+          "abs": 1024
+        }
+      ]
+    },
+    "55-idle-connection-memory/tokio-ping/used_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "tokio-ping",
+      "metric": "used_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 27080.2584,
+        "candidate": 11415.6923,
+        "redis": 2799.4848,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 256
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-idle/clients": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-idle",
+      "metric": "clients",
+      "unit": "connections",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 10000.0,
+        "candidate": 10000.0,
+        "redis": 10000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-idle/open_s": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-idle",
+      "metric": "open_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.3321,
+        "candidate": 0.2666,
+        "redis": 1.3002,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-idle/rss_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-idle",
+      "metric": "rss_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 19408.896,
+        "candidate": 12548.9152,
+        "redis": 2029.568,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10,
+          "abs": 1024
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-idle/used_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-idle",
+      "metric": "used_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 170615.5964,
+        "candidate": 12223.0303,
+        "redis": 2799.4848,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 256
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-ping/clients": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-ping",
+      "metric": "clients",
+      "unit": "connections",
+      "better": "higher",
+      "recorded": {
+        "v1_2_2": 10000.0,
+        "candidate": 10000.0,
+        "redis": 10000.0,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "bound",
+          "eq": "recorded"
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-ping/open_s": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-ping",
+      "metric": "open_s",
+      "unit": "s",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 0.4853,
+        "candidate": 0.3416,
+        "redis": 1.4265,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-ping/rss_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-ping",
+      "metric": "rss_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 19444.1216,
+        "candidate": 12581.2736,
+        "redis": 5074.5344,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 10,
+          "abs": 1024
+        }
+      ]
+    },
+    "55-idle-connection-memory/uring-ping/used_per_conn": {
+      "suite": "55-idle-connection-memory",
+      "config": "uring-ping",
+      "metric": "used_per_conn",
+      "unit": "B",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 170615.672,
+        "candidate": 12231.1275,
+        "redis": 2799.4848,
+        "vm": "Standard_D4s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "d8de3efc",
+        "label": "idle-connections-55-d4s_v5",
+        "rustc": "1.100.0",
+        "nproc": 4
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 5,
+          "abs": 256
+        },
+        {
+          "kind": "ratio",
+          "keep": 0.6
+        }
+      ]
     }
   }
 }

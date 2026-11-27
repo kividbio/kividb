@@ -360,11 +360,16 @@ impl Conn {
         last
     }
 
-    /// Five `PING`s, one at a time. The Tokio loop gives a read buffer that
-    /// a long pipeline grew (32 KiB) back after four reads in a row that
-    /// were small, as it waits for the next one: a count of `used_memory`
-    /// taken after a pipeline and compared with one taken after the next
-    /// commands sees the buffer go, 28 KiB, unless it has gone already.
+    /// Five `PING`s, one at a time: brings this connection's buffers to the
+    /// small size every connection starts with. The server keeps a buffer
+    /// that a long pipeline grew (32 KiB for reads, and as much as the
+    /// replies for writes) until four reads in a row have been small, and
+    /// then gives it back, on either I/O model; the buffers are in
+    /// `used_memory`, so a count taken after a pipeline and one taken
+    /// before it differ by what the pipeline grew, unless both are taken
+    /// from a connection in this state. [`Conn::settled_used_memory`] does
+    /// that. Not a matter of waiting: the idle timer that also gives a grown
+    /// buffer back may or may not have fired.
     pub fn small_reads(&mut self) {
         for _ in 0..5 {
             assert!(matches!(self.cmd(&[b"PING"]), Reply::Simple));
@@ -374,7 +379,13 @@ impl Conn {
     /// `used_memory` once four readings 50 ms apart agree (background frees
     /// done, and a large set's resize the background finishes: #764), for
     /// at most four seconds.
+    ///
+    /// Taken from a connection whose buffers are small ([`Conn::small_reads`]),
+    /// so that the connection's own buffers, which a pipeline grows, are
+    /// the same size at every reading and are not part of a difference
+    /// between two.
     pub fn settled_used_memory(&mut self) -> u64 {
+        self.small_reads();
         let mut last = self.used_memory();
         let mut same = 0;
         for _ in 0..80 {

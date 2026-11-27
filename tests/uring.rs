@@ -324,11 +324,11 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         Some("10"),
         "{first_partial_line}"
     );
-    // The read buffer starts at `READ_BUFFER` (32 KiB); a freshly opened
-    // connection still holds that much spare capacity after a small batch.
+    // The read buffer starts at 4 KiB; a request cut inside a bulk string
+    // makes it private, and a private buffer holds at least 16 KiB.
     assert_eq!(
         client_metric(&first_partial_line, "qbuf-free="),
-        Some("32758"),
+        Some("16374"),
         "{first_partial_line}"
     );
 
@@ -350,7 +350,7 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     );
     assert_eq!(
         client_metric(&partial_line, "qbuf-free="),
-        Some("32756"),
+        Some("16372"),
         "{partial_line}"
     );
 
@@ -371,16 +371,17 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         Some("0"),
         "{completed_line}"
     );
+    // Four reads in a row under 4 KiB, with nothing left to parse: the batch
+    // that finished the request gave the buffer back to 4 KiB, which is not
+    // a private one, and `qbuf-free` is reported for private buffers only.
     assert_eq!(
         client_metric(&completed_line, "qbuf-free="),
-        Some("32768"),
+        Some("0"),
         "{completed_line}"
     );
 
-    // io_uring reclaims an oversized private query buffer *between* reads, not
-    // while a read is in flight; but this buffer only reached the 32 KiB floor,
-    // which is never reclaimed. Wait past the idle threshold and confirm the
-    // floor is held, then send a command and confirm it is still held.
+    // The buffer is not private any more: nothing is held for the idle
+    // threshold to reclaim, and the next read keeps it at 4 KiB.
     std::thread::sleep(Duration::from_secs(3));
     let idle_line = {
         let list = observer.cmd(&["CLIENT", "LIST"]);
@@ -390,15 +391,10 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     };
     assert_eq!(
         client_metric(&idle_line, "qbuf-free="),
-        Some("32768"),
-        "an idle io_uring client must retain its private query buffer until the next read: {idle_line}"
+        Some("0"),
+        "an idle io_uring client holds its 4 KiB read buffer, not a private one: {idle_line}"
     );
 
-    // A private buffer that only ever reached the 32 KiB floor is never
-    // reclaimed: like Redis, io_uring keeps buffers at or below
-    // `PROTO_RESIZE_THRESHOLD` (32 KiB) untouched, so the floor survives an
-    // idle period and the read that follows it. (Reclaiming an *oversized*
-    // buffer is the next test's subject.)
     assert_eq!(partial.cmd(&["PING"]), s("PONG"));
 
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -417,8 +413,8 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     );
     assert_eq!(
         client_metric(&floor_line, "qbuf-free="),
-        Some("32768"),
-        "the 32 KiB floor must be retained across reads: {floor_line}"
+        Some("0"),
+        "the 4 KiB buffer stays small across reads: {floor_line}"
     );
 
     let info = partial.cmd(&["CLIENT", "INFO"]);

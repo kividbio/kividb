@@ -139,6 +139,14 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
+A connection's read buffer starts at 4 KiB and its reply buffers start empty, so a connection that
+has sent nothing holds little more than that. A read buffer grown for a burst goes back to 4 KiB
+once the connection's requests are small again, with the reply buffers; on the Tokio loop a
+quiet connection also gives them back after `query-buffer-idle-resize-after`. On io_uring a read
+buffer that has grown stays at its size while a read is pending on it. Suite
+`55-idle-connection-memory` under `benchmarks/1.3.0/regressions/` measures what 10,000 idle
+connections hold, beside Redis's figure.
+
 Small collections are kept in one block of memory up to Redis's limits, which are set as in
 Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJECT ENCODING`:
 `set-max-intset-entries` (512), `set-max-listpack-entries` (128) and `set-max-listpack-value`
