@@ -593,7 +593,7 @@ struct Store {
     keep_word: bool,
     /// Rebuilds of the index so far: a position found before a placement is
     /// good after it only if none came between.
-    gen: u64,
+    builds: u64,
 }
 
 /// A leaf split: the new leaf (right of the old one) and the separator.
@@ -675,7 +675,7 @@ impl Store {
                 }
             }
         }
-        self.gen += 1;
+        self.builds += 1;
         self.index = if wide {
             Index::Wide(widened)
         } else {
@@ -1056,7 +1056,7 @@ impl Large {
                 hasher: ahash::RandomState::new(),
                 inners: 1,
                 keep_word: false,
-                gen: 0,
+                builds: 0,
             },
             len: 0,
             queued: false,
@@ -1183,9 +1183,9 @@ impl Large {
                         self.grow_index();
                         vacant = self.st.lookup(member, h).expect_err("a new member");
                     }
-                    let gen = self.st.gen;
+                    let builds = self.st.builds;
                     let (leaf, slot) = self.place(score, member);
-                    if gen == self.st.gen {
+                    if builds == self.st.builds {
                         with_index!(&mut self.st.index, t => t.set(vacant, Word::make(leaf, slot, h)));
                     } else {
                         self.index_new(member, h, leaf, slot);
@@ -1228,9 +1228,9 @@ impl Large {
         self.st.keep_word = true;
         self.take_out(Find::Key(old, member), &mut |_, _| {});
         self.st.keep_word = false;
-        let gen = self.st.gen;
+        let builds = self.st.builds;
         let (leaf, slot) = self.place(score, member);
-        if gen == self.st.gen {
+        if builds == self.st.builds {
             with_index!(&mut self.st.index, t => t.set(i, Word::make(leaf, slot, h)));
         } else {
             self.index_new(member, h, leaf, slot);
