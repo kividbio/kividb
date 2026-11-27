@@ -1431,3 +1431,118 @@ fn a_hash_that_gets_its_first_field_ttl_mid_growth_is_still_finished() {
         assert_eq!(c.cmd(&["HLEN", key]).int(), (n + 1) as i64);
     }
 }
+
+/// Snapshot capture and full sync keep values while writes replace their
+/// arrays. Exercise chunk-slab arrays and the larger padded fallback.
+#[test]
+fn saving_and_full_sync_keep_hashes_that_grow_and_shrink() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const KEYS: usize = 32;
+    const FIELDS: usize = 1_200;
+    let master_dir = temp_dir("grow-master");
+    let master = Server::start(
+        master_dir.path(),
+        &["--io-model", "tokio", "--threads", "2"],
+    );
+    let mut m = master.conn();
+    let port = master.port;
+    let payload = "x".repeat(1_800);
+    for i in 0..KEYS {
+        assert_eq!(
+            m.cmd(&["HSET", &format!("hash:{i}"), "data", &payload])
+                .int(),
+            1
+        );
+    }
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let rounds = Arc::new(AtomicUsize::new(0));
+    let writer_stop = stop.clone();
+    let writer_rounds = rounds.clone();
+    let writer = thread::spawn(move || {
+        let fields: Vec<_> = (0..FIELDS).map(|i| format!("f{i:04}")).collect();
+        let mut c = Conn::connect(port);
+        while !writer_stop.load(Ordering::Acquire) {
+            for i in 0..KEYS {
+                let key = format!("hash:{i}");
+                let mut add = vec!["HSET", key.as_str()];
+                for field in &fields {
+                    add.extend([field.as_str(), "value"]);
+                }
+                assert_eq!(c.cmd(&add).int(), FIELDS as i64);
+                let mut remove = vec!["HDEL", key.as_str()];
+                remove.extend(fields.iter().map(String::as_str));
+                assert_eq!(c.cmd(&remove).int(), FIELDS as i64);
+            }
+            writer_rounds.fetch_add(1, Ordering::Release);
+        }
+    });
+    wait_for("a complete hash growth/shrink round", || {
+        rounds.load(Ordering::Acquire) > 0
+    });
+
+    let replica_dir = temp_dir("grow-replica");
+    let port = master.port.to_string();
+    let replica = Server::start(
+        replica_dir.path(),
+        &[
+            "--io-model",
+            "tokio",
+            "--threads",
+            "2",
+            "--replicaof",
+            "127.0.0.1",
+            &port,
+        ],
+    );
+    let mut r = replica.conn();
+    wait_for("the full sync", || {
+        r.info("replication", "master_link_status") == "up"
+    });
+    assert!(m.info("stats", "sync_full").parse::<u64>().unwrap() > 0);
+    // Both the master capture and the replica's capture run while the
+    // writer repeatedly replaces arrays on each side of the slab limit.
+    for _ in 0..3 {
+        assert!(m.cmd(&["SAVE"]).ok());
+        assert!(r.cmd(&["SAVE"]).ok());
+    }
+    // Reload a capture made beside writes. A command adds or removes all
+    // the short fields together, so each captured hash has either shape.
+    let saved_dir = temp_dir("grow-saved");
+    std::fs::copy(
+        master_dir.path().join("dump.kdb"),
+        saved_dir.path().join("dump.kdb"),
+    )
+    .unwrap();
+    let saved = Server::start(saved_dir.path(), &["--io-model", "tokio", "--threads", "2"]);
+    let mut s = saved.conn();
+    for i in 0..KEYS {
+        let key = format!("hash:{i}");
+        let length = s.cmd(&["HLEN", &key]).int();
+        assert!(length == 1 || length == FIELDS as i64 + 1, "{length}");
+        assert_eq!(s.cmd(&["HGET", &key, "data"]).text(), payload);
+        if length > 1 {
+            for field in 0..FIELDS {
+                assert_eq!(
+                    s.cmd(&["HGET", &key, &format!("f{field:04}")]).text(),
+                    "value"
+                );
+            }
+        }
+    }
+    wait_for("another hash growth/shrink round", || {
+        rounds.load(Ordering::Acquire) > 1
+    });
+    stop.store(true, Ordering::Release);
+    writer.join().unwrap();
+    synced(&mut m, &mut r);
+    for i in 0..KEYS {
+        let key = format!("hash:{i}");
+        assert_eq!(m.cmd(&["HLEN", &key]).int(), 1);
+        assert_eq!(r.cmd(&["HLEN", &key]).int(), 1);
+        assert_eq!(m.cmd(&["HGET", &key, "data"]).text(), payload);
+        assert_eq!(r.cmd(&["HGET", &key, "data"]).text(), payload);
+    }
+}

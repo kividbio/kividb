@@ -32,20 +32,37 @@ bounds of what a large hash costs. A hash this big is one key of that many
 fields. Before `used_memory` is read the server is left until it stops
 falling (a resize that the background, or Redis's rehashing, is still
 finishing; at most 60 s).
+
+#782 adds `small-table`: 200,000 hashes of six fields, one JSON-encoded
+1,800-byte payload (a 1,822-byte value) and five small metadata values.
+The long value forces a table even
+at six fields; OBJECT ENCODING must say hashtable. A fresh server keeps
+this row apart from the large hashes above. used_memory and settled RSS
+growth are divided by the keys, not the fields. Gates: used_memory a key
+within 1 % (or 1 B) of recorded, RSS a key within 10 % (or 1 B); the form
+must not change. The used_memory bound is tighter than the other rows'
+5 % because restoring the 56-byte alignment reserve costs about 2.5 %
+at this shape and must fail. MEMORY USAGE of the first key and load time
+are shown, not gated.
 """
+import json
 import os
 import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
 from suite import Suite, Config, KEEP_IMPROVEMENT, EXACT, rel, info, scaled  # noqa: E402
+from rss import vmrss_mib, MIB  # noqa: E402
 
-S = Suite("19-hash-memory", [Config("plain", threads=2), Config("ttl", threads=2)])
+S = Suite("19-hash-memory", [Config("plain", threads=2), Config("ttl", threads=2),
+                           Config("small-table", threads=2)])
 SIZES = [10, 100, 1000, 100_000, 3_000_000, 3_211_264, 3_211_265]
 TOTAL = 1_000_000
 BATCH = 250
 ENCODINGS = {"listpack": 2, "hashtable": 3, "listpackex": 4}
 FAR = 4_000_000_000_000  # a deadline in 2096
+SMALL_KEYS = 200_000
+SMALL_PAYLOAD_BYTES = 1_800
 
 
 def fields(start, n):
@@ -93,9 +110,56 @@ def settled(c, limit=60.0):
     return low
 
 
+def small_table(ctx, c):
+    keys = scaled(SMALL_KEYS)
+    data = json.dumps({"run": 0, "payload": "x" * SMALL_PAYLOAD_BYTES}, separators=(",", ":"))
+    values = ["name", "step", "data", data,
+              "opts", '{"removeOnComplete":false,"attempts":0}',
+              "timestamp", "1795259701048", "delay", "0", "priority", "0"]
+    c.flushall()
+    time.sleep(1)
+    u0 = settled(c)
+    r0 = vmrss_mib(ctx.pid) * MIB
+    t = time.perf_counter()
+    p = c.pipeline(transaction=False)
+    for k in range(keys):
+        p.execute_command("HSET", "k:has:%010d" % k, *values)
+        if (k + 1) % 500 == 0:
+            assert all(reply == 6 for reply in p.execute()), "HSET did not add six fields"
+    assert all(reply == 6 for reply in p.execute()), "HSET did not add six fields"
+    secs = time.perf_counter() - t
+    # Keep RSS's settling interval the same as the other resident-memory
+    # suites, then let any background resize finish before taking both.
+    time.sleep(5)
+    u1 = settled(c)
+    r1 = vmrss_mib(ctx.pid) * MIB
+    first = "k:has:%010d" % 0
+    assert c.dbsize() == keys, "DBSIZE does not match the loaded hashes"
+    assert c.hlen(first) == 6, "small-table hash does not have six fields"
+    assert c.hstrlen(first, "data") == len(data), "small-table value has the wrong size"
+    enc = c.object("encoding", first)
+    enc = enc.decode() if isinstance(enc, bytes) else enc
+    assert enc == "hashtable", "small-table hash stayed packed: %r" % enc
+    usage = int(c.execute_command("MEMORY", "USAGE", first, "SAMPLES", "0"))
+    ctx.raw["small_table"] = {"keys": keys, "fields_per_key": 6,
+                              "payload_bytes": SMALL_PAYLOAD_BYTES, "long_value_bytes": len(data),
+                              "used_before": u0, "used_after": u1,
+                              "rss_before": r0, "rss_after": r1,
+                              "dbsize": c.dbsize(), "encoding": enc}
+    ctx.emit("used_per_key_small_table", (u1 - u0) / float(keys), "B", "lower", gate=rel(1, abs=1))
+    ctx.emit("rss_per_key_small_table", (r1 - r0) / float(keys), "B", "lower", gate=rel(10, abs=1))
+    ctx.emit("encoding_small_table", ENCODINGS[enc], "code", "lower", gate=EXACT)
+    ctx.emit("memory_usage_small_table", usage, "B", "lower", gate=info())
+    ctx.emit("load_small_table_s", secs, "s", "lower", gate=info())
+
+
 @S.run
 def run(ctx):
     c = ctx.client()
+    if ctx.config.name == "small-table":
+        small_table(ctx, c)
+        c.flushall()
+        return
     ttl = ctx.config.name == "ttl"
     for n in SIZES:
         # Past TOTAL, one hash of n fields.

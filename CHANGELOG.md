@@ -1886,6 +1886,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     its text), and `JSON.DEBUG MEMORY` reports the new sizes. The
     analysis of where the bytes went, and suite 45, are IIITManjeet's.
 
+- **Small hashes and sets whose elements are too long to stay packed take
+  less memory (#782).** A table that fits one group takes that group's
+  64 bytes from a slab class, without the 56 bytes previously reserved to
+  align it. A six-field hash with a JSON-encoded 1,800-byte payload and
+  five small values takes 2,176 bytes, down from 2,232, including its shared
+  allocation but not its key or keyspace table. Arrays above 8 KiB keep the padded
+  allocation that lets the system allocator use `calloc`. The
+  `small-table` case of regression suite `19-hash-memory` gates
+  `used_memory` and RSS a key for this shape.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
