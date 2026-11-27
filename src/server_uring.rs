@@ -1701,6 +1701,12 @@ pub async fn handle_client(
                     if n == room {
                         read_small = false;
                         short_reads = 0;
+                        // As the Tokio loop does: the room a read brings the
+                        // rest of a burst in, whatever a request cut inside
+                        // a bulk string reserved.
+                        if parse_buf.capacity() < READ_BUFFER {
+                            parse_buf.reserve(READ_BUFFER - parse_buf.len());
+                        }
                     } else if n < READ_SIZE {
                         short_reads = short_reads.saturating_add(1);
                     } else {
