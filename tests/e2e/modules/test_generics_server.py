@@ -5,7 +5,6 @@ Pub/Sub — SUBSCRIBE/PUBLISH/PSUBSCRIBE
 """
 from __future__ import annotations
 import time
-import threading
 import pytest
 import redis
 from utils.helpers import make_client
@@ -302,76 +301,67 @@ class TestServer:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestPubSub:
+    @staticmethod
+    def _subscribed(method, name):
+        """A subscription the server has confirmed, on a connection of its own.
+
+        Reads until the confirmation arrives, so a publish that follows is
+        ordered after the subscription by the server's own answer. Every read
+        has a deadline: a message that never comes fails the test.
+        """
+        c = make_client(socket_timeout=10)
+        ps = c.pubsub()
+        getattr(ps, method)(name)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            msg = ps.get_message(timeout=1)
+            if msg and msg["type"] == method:
+                return c, ps
+        ps.close()
+        c.close()
+        pytest.fail(f"no {method} confirmation for {name!r} within 5s")
+
+    @staticmethod
+    def _next(ps, kind):
+        """The next message of `kind`, or None after 5 seconds."""
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            msg = ps.get_message(timeout=1)
+            if msg and msg["type"] == kind:
+                return msg
+        return None
+
     def test_subscribe_publish(self, r):
         """A subscriber on a channel should receive a published message."""
-        received = []
-        ready = threading.Event()
-
-        def subscriber():
-            c = make_client()
-            ps = c.pubsub()
-            ps.subscribe("mychan")
-            ready.set()
-            for msg in ps.listen():
-                if msg["type"] == "message":
-                    received.append(msg["data"])
-                    break
-            ps.unsubscribe()
-
-        t = threading.Thread(target=subscriber)
-        t.start()
-        ready.wait(timeout=3)
-        time.sleep(0.1)  # give listen() time to block
-        r.publish("mychan", "hello")
-        t.join(timeout=5)
-        assert received == ["hello"]
+        c, ps = self._subscribed("subscribe", "mychan")
+        try:
+            r.publish("mychan", "hello")
+            msg = self._next(ps, "message")
+            assert msg is not None and msg["data"] == "hello"
+        finally:
+            ps.close()
+            c.close()
 
     def test_psubscribe(self, r):
         """Pattern subscribe should match wildcard channels."""
-        received = []
-        ready = threading.Event()
-
-        def subscriber():
-            c = make_client()
-            ps = c.pubsub()
-            ps.psubscribe("news.*")
-            ready.set()
-            for msg in ps.listen():
-                if msg["type"] == "pmessage":
-                    received.append(msg["data"])
-                    break
-            ps.punsubscribe()
-
-        t = threading.Thread(target=subscriber)
-        t.start()
-        ready.wait(timeout=3)
-        time.sleep(0.1)
-        r.publish("news.sports", "goal!")
-        t.join(timeout=5)
-        assert received == ["goal!"]
+        c, ps = self._subscribed("psubscribe", "news.*")
+        try:
+            r.publish("news.sports", "goal!")
+            msg = self._next(ps, "pmessage")
+            assert msg is not None and msg["data"] == "goal!"
+        finally:
+            ps.close()
+            c.close()
 
     def test_publish_returns_subscriber_count(self, r):
         """PUBLISH returns the number of clients that received the message."""
-        received_count = [0]
-        ready = threading.Event()
-
-        def subscriber():
-            c = make_client()
-            ps = c.pubsub()
-            ps.subscribe("chan")
-            ready.set()
-            for msg in ps.listen():
-                if msg["type"] == "message":
-                    break
-
-        t = threading.Thread(target=subscriber)
-        t.start()
-        ready.wait(timeout=3)
-        time.sleep(0.1)
-        n = r.publish("chan", "msg")
-        received_count[0] = n
-        t.join(timeout=3)
-        assert received_count[0] == 1
+        c, ps = self._subscribed("subscribe", "chan")
+        try:
+            assert r.publish("chan", "msg") == 1
+            assert self._next(ps, "message") is not None
+        finally:
+            ps.close()
+            c.close()
 
     def test_no_subscribers(self, r):
         """Publishing to a channel with no subscribers returns 0."""
