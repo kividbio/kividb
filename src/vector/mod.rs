@@ -1,9 +1,9 @@
 pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
-pub mod geo;
 pub mod flat;
 pub mod flat_int8;
+pub mod geo;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;
@@ -745,7 +745,15 @@ pub struct IndexDef {
     /// not be indexed (a GEO field that holds no point, #1004), and the
     /// indexing failures counted, for FT.INFO.
     pub refusals: Arc<Refusals>,
+    /// Whether the schema has a GEO field: the only kind that refuses a
+    /// document. Without one, a write pays one branch for refusals.
+    pub has_geo: bool,
 }
+
+/// Documents left out, over every index: while there are none, a write of
+/// some fields of a hash looks at no index's refusals
+/// (`refused_given_geo`).
+static REFUSED_ANYWHERE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// What [`IndexDef::refusals`] keeps. As Redis 8.10 counts them: each write
 /// of a document that is refused is a failure, the document's first and
@@ -754,6 +762,9 @@ pub struct IndexDef {
 pub struct Refusals {
     /// By key, why the document is left out.
     keys: parking_lot::Mutex<AHashMap<String, String>>,
+    /// How many keys `keys` holds, read without its lock: while it is 0,
+    /// [`Refusals::refused`] takes no lock.
+    count: std::sync::atomic::AtomicUsize,
     failures: std::sync::atomic::AtomicU64,
     /// The last failure's error and key.
     last: parking_lot::Mutex<Option<(String, String)>>,
@@ -761,9 +772,37 @@ pub struct Refusals {
 
 impl Refusals {
     /// Whether the document at `key` is left out.
+    #[inline]
     pub fn refused(&self, key: &str) -> bool {
+        // A key's writes are ordered by its write order, so a refusal of
+        // this key happened before, or happens after, this read of it.
+        if self.count.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            return false;
+        }
+        self.keys.lock().contains_key(key)
+    }
+
+    /// Whether no document is left out.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many documents are left out.
+    pub fn len(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The bytes the keys left out take, for FT.INFO's sizes.
+    pub fn bytes(&self) -> usize {
+        if self.is_empty() {
+            return 0;
+        }
         let keys = self.keys.lock();
-        !keys.is_empty() && keys.contains_key(key)
+        keys.capacity() * (std::mem::size_of::<(String, String)>() + 1)
+            + keys
+                .iter()
+                .map(|(k, why)| k.capacity() + why.capacity())
+                .sum::<usize>()
     }
 
     /// A write of only some fields of the document at `key`, which is left
@@ -777,7 +816,16 @@ impl Refusals {
 
     /// A write of the document at `key` was refused, for `why`.
     pub fn refuse(&self, key: &str, why: String) {
-        self.keys.lock().insert(key.to_string(), why.clone());
+        if self
+            .keys
+            .lock()
+            .insert(key.to_string(), why.clone())
+            .is_none()
+        {
+            self.count
+                .fetch_add(1, std::sync::atomic::Ordering::Release);
+            REFUSED_ANYWHERE.fetch_add(1, std::sync::atomic::Ordering::Release);
+        }
         self.failures
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.last.lock() = Some((why, key.to_string()));
@@ -785,9 +833,13 @@ impl Refusals {
 
     /// The document at `key` is indexed, or gone: no longer left out.
     pub fn admit(&self, key: &str) {
-        let mut keys = self.keys.lock();
-        if !keys.is_empty() {
-            keys.remove(key);
+        if self.is_empty() {
+            return;
+        }
+        if self.keys.lock().remove(key).is_some() {
+            self.count
+                .fetch_sub(1, std::sync::atomic::Ordering::Release);
+            REFUSED_ANYWHERE.fetch_sub(1, std::sync::atomic::Ordering::Release);
         }
     }
 
@@ -797,6 +849,16 @@ impl Refusals {
             self.failures.load(std::sync::atomic::Ordering::Relaxed),
             self.last.lock().clone(),
         )
+    }
+}
+
+impl Drop for Refusals {
+    /// The index is gone: its documents are no longer left out anywhere.
+    fn drop(&mut self) {
+        let n = *self.count.get_mut();
+        if n > 0 {
+            REFUSED_ANYWHERE.fetch_sub(n, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 
@@ -1368,7 +1430,12 @@ impl IndexSchema {
             &self.fields,
             matches!(self.on, IndexOn::Json),
         ));
+        let has_geo = self
+            .fields
+            .iter()
+            .any(|f| matches!(f.field_type, FieldType::Geo));
         IndexDef {
+            has_geo,
             name: self.name,
             db_index: self.db_index,
             on: self.on,
@@ -1396,6 +1463,10 @@ impl IndexSchema {
 /// written after the field was added.
 pub fn backfill_text_fields(db: &crate::store::Db, def: &IndexDef, fields: &[String]) {
     walk_documents(db, def, |key, inner| {
+        // A document the index left out stays out.
+        if def.refusals.refused(key) {
+            return;
+        }
         let language = def.language_of(key, &inner);
         let mut changes = Vec::new();
         for field in fields {
@@ -1442,6 +1513,11 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
                 def.refusals.refuse(key, why);
                 return;
             }
+        }
+        // A document the index left out stays out: no postings, and no id
+        // for `*` to find it by, with SKIPINITIALSCAN too.
+        if def.refusals.refused(key) {
+            return;
         }
         let mut postings = def.postings.write();
         if scan {
@@ -1739,7 +1815,10 @@ pub fn backfill_from_db_progress(
             // A document's key is kept as text (`key_bytes::text_of`).
             let raw = crate::key_bytes::bytes_of(&key);
             let map = crate::store::get_shard(db, &*raw).read();
+            // A document left out (a GEO field that holds no point, written
+            // after the checkpoint) holds nothing the index keeps.
             let holds = def.covers(&raw)
+                && !def.refusals.refused(&key)
                 && map
                     .peek(&*raw)
                     .and_then(|value| doc_fields(&def.on, &def.fields, value))
@@ -2909,10 +2988,15 @@ fn refused_given_geo(
     key: &[u8],
     pairs: &[[&[u8]; 2]],
 ) -> bool {
+    if REFUSED_ANYWHERE.load(std::sync::atomic::Ordering::Acquire) == 0 {
+        return false;
+    }
     let indexes = index_store.read();
     let text = crate::key_bytes::text_of(key);
     indexes.iter().any(|(name, def)| {
-        !is_alias(name, def)
+        def.has_geo
+            && !def.refusals.is_empty()
+            && !is_alias(name, def)
             && def.db_index == db
             && def.covers(key)
             && def.refusals.refused(&text)
@@ -2980,17 +3064,19 @@ fn index_fields(
     // (`maybe_index_pairs` indexes the whole document when a write gives it
     // a GEO field's value). The check is general: a NUMERIC field could be
     // made to refuse its document the same way.
-    if let Some(why) = refusal(def, fields) {
-        unindex_from(def, key);
-        def.refusals.refuse(key, why);
-        return;
-    }
-    if def.refusals.refused(key) {
-        if !whole {
-            def.refusals.refuse_again(key);
+    if def.has_geo {
+        if let Some(why) = refusal(def, fields) {
+            unindex_from(def, key);
+            def.refusals.refuse(key, why);
             return;
         }
-        def.refusals.admit(key);
+        if def.refusals.refused(key) {
+            if !whole {
+                def.refusals.refuse_again(key);
+                return;
+            }
+            def.refusals.admit(key);
+        }
     }
 
     // ── The words of the TEXT fields written ────────────────────────────────
@@ -3157,6 +3243,9 @@ fn unindex_vector(live: &LiveIndex, key: &str) {
 /// Why `fields` keep their document out of `def`, if they do: a GEO field
 /// whose value is no point (`geo::points`).
 fn refusal(def: &IndexDef, fields: &[(String, Arc<[u8]>)]) -> Option<String> {
+    if !def.has_geo {
+        return None;
+    }
     let json = matches!(def.on, IndexOn::Json);
     def.fields
         .iter()

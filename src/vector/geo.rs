@@ -15,25 +15,28 @@ use crate::geohash::{GEO_LAT_MAX, GEO_LAT_MIN, GEO_LON_MAX, GEO_LON_MIN};
 /// or, for a value that refuses the document, a NUL and then why.
 const JSON_SEPARATOR: u8 = 0;
 
-/// The point a HASH field holds: `lon,lat`, one comma, the longitude as it
-/// is and the latitude with ASCII spaces around it allowed; decimal numbers
-/// only (no `inf`, `nan` or hex); within the coordinates a geohash holds.
-/// The error is the one Redis records as the document's indexing error.
+/// The point a HASH field holds, as Redis 8.10.3 reads one: the longitude
+/// up to the first comma or space, as it is, and the latitude after it,
+/// ASCII whitespace around it allowed (`"2.35,48.85 "` and `"2.35 48.85"`
+/// are points; `" 2.35,48.85"` and `"2.35 ,48.85"` are not). Each is read
+/// as Rust reads an `f64`, then must be finite and within the coordinates a
+/// geohash holds. The error is the one Redis records as the document's
+/// indexing error, word for word.
 pub(crate) fn parse_point(raw: &[u8]) -> Result<(f64, f64), String> {
     let text =
         std::str::from_utf8(raw).map_err(|_| invalid_literal(&String::from_utf8_lossy(raw)))?;
-    let Some((lon, lat)) = text.split_once(',') else {
+    let Some(at) = text.find([',', ' ']) else {
         return Err("SEARCH_PARSE_ARGS Invalid geo string: missing separator".to_string());
     };
     let number = |s: &str| -> Result<f64, String> {
-        // Rust also reads `inf`, `infinity` and `nan`, which Redis does not.
-        match s.parse::<f64>() {
-            Ok(v) if v.is_finite() => Ok(v),
-            _ => Err(invalid_literal(s)),
-        }
+        s.parse::<f64>()
+            .map_err(|e| format!("SEARCH_PARSE_ARGS Invalid geo string \"{s}\": {e}"))
     };
-    let lon = number(lon)?;
-    let lat = number(lat.trim_matches(|c: char| c.is_ascii_whitespace()))?;
+    let lon = number(&text[..at])?;
+    let lat = number(text[at + 1..].trim_matches(|c: char| c.is_ascii_whitespace()))?;
+    if !lon.is_finite() || !lat.is_finite() {
+        return Err("SEARCH_PARSE_ARGS Geo coordinates must be finite".to_string());
+    }
     if !(GEO_LON_MIN..=GEO_LON_MAX).contains(&lon) || !(GEO_LAT_MIN..=GEO_LAT_MAX).contains(&lat) {
         return Err(format!(
             "SEARCH_GEO_COORDINATES_INVALID Invalid geo coordinates: {lon:.6}, {lat:.6}"
@@ -118,6 +121,10 @@ mod tests {
         for ok in [
             "2.35,48.85",
             "2.35,48.85 ",
+            "2.35,48.85  ",
+            "2.35 48.85",
+            "2.35  48.85",
+            "2.35, 48.85 ",
             "2.35,\t48.85",
             "2.35,  48.85",
             "+2.35,48.85",
@@ -136,6 +143,10 @@ mod tests {
         for refused in [
             " 2.35,48.85",
             "2.35 ,48.85",
+            "2.35 , 48.85",
+            "2.35\t48.85",
+            "2.35 48.85 1",
+            "2.35,48.85 x",
             "0x1p1,10",
             "inf,10",
             "nan,10",
@@ -163,6 +174,25 @@ mod tests {
             parse_point(b"2,3abc").unwrap_err(),
             "SEARCH_PARSE_ARGS Invalid geo string \"3abc\": invalid float literal"
         );
+        assert_eq!(
+            parse_point(b" 2.35,48.85").unwrap_err(),
+            "SEARCH_PARSE_ARGS Invalid geo string \"\": cannot parse float from empty string"
+        );
+        assert_eq!(
+            parse_point(b"2.35 , 48.85").unwrap_err(),
+            "SEARCH_PARSE_ARGS Invalid geo string \", 48.85\": invalid float literal"
+        );
+        assert_eq!(
+            parse_point(b"2.35\t48.85").unwrap_err(),
+            "SEARCH_PARSE_ARGS Invalid geo string: missing separator"
+        );
+        for not_finite in ["inf,1", "nan,1", "1,inf", "1,-nan"] {
+            assert_eq!(
+                parse_point(not_finite.as_bytes()).unwrap_err(),
+                "SEARCH_PARSE_ARGS Geo coordinates must be finite",
+                "{not_finite:?}"
+            );
+        }
         assert_eq!(
             parse_point(b"2.35,86").unwrap_err(),
             "SEARCH_GEO_COORDINATES_INVALID Invalid geo coordinates: 2.350000, 86.000000"

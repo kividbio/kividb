@@ -666,6 +666,16 @@ pub(crate) fn ft_info(ctx: &mut Ctx) -> Option<Vec<u8>> {
         put("postings_tag_bytes", resp_integer(bytes.tags as i64));
         put("postings_numeric_bytes", resp_integer(bytes.numbers as i64));
     }
+    // The documents left out (a GEO field holding no point), and what
+    // keeping their keys costs. A GEO field's postings are counted in
+    // `postings_numeric_bytes`.
+    if def.has_geo {
+        put("refused_docs", resp_integer(def.refusals.len() as i64));
+        put(
+            "refused_docs_bytes",
+            resp_integer(def.refusals.bytes() as i64),
+        );
+    }
     put("indexing", resp_integer(0));
     put("percent_indexed", resp_bulk_str("1"));
     // As Redis 8.10 counts them: a document's write that was refused (a GEO

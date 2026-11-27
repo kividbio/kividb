@@ -30,10 +30,15 @@ impl Conn {
     }
 
     fn cmds(&mut self, args: &[&str]) -> RespValue {
+        let args: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
+        self.cmd(&args)
+    }
+
+    fn cmd(&mut self, args: &[&[u8]]) -> RespValue {
         let mut buf = format!("*{}\r\n", args.len()).into_bytes();
         for arg in args {
             buf.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
-            buf.extend_from_slice(arg.as_bytes());
+            buf.extend_from_slice(arg);
             buf.extend_from_slice(b"\r\n");
         }
         self.stream.write_all(&buf).unwrap();
@@ -269,7 +274,6 @@ fn cities(c: &mut Conn) {
         "t",
         "x",
     ]);
-    thread::sleep(Duration::from_millis(50));
 }
 
 #[test]
@@ -461,7 +465,6 @@ fn geo_radius_edge_is_measured_as_geosearch_measures() {
         "GEO",
     ]);
     c.cmds(&["HSET", "h:1", "loc", "13.3613891,38.1155561"]);
-    thread::sleep(Duration::from_millis(50));
     let at = |c: &mut Conn, r: &str| search(c, "g", &format!("@loc:[13.3614 38.1156 {r} m]"), &[]);
     assert!(at(&mut c, "4.928882").is_empty());
     assert_eq!(at(&mut c, "4.957005"), ["h:1"]);
@@ -493,7 +496,6 @@ fn a_document_whose_geo_field_is_no_point_is_left_out() {
     ]);
     c.cmds(&["HSET", "h:1", "loc", "2.35,48.85", "name", "alpha"]);
     c.cmds(&["HSET", "h:2", "loc", "bad", "name", "beta"]);
-    thread::sleep(Duration::from_millis(50));
     assert_eq!(failures(&mut c, "g"), (1, 1, "h:2".into()));
     assert!(search(&mut c, "g", "beta", &[]).is_empty());
     assert_eq!(search(&mut c, "g", "*", &[]), ["h:1"]);
@@ -547,10 +549,8 @@ fn a_document_whose_geo_field_is_no_point_is_left_out() {
         "q",
         "TEXT",
     ]);
-    thread::sleep(Duration::from_millis(100));
     assert_eq!(search(&mut c, "a", "x", &[]), ["a:1", "a:2"]);
     c.cmds(&["FT.ALTER", "a", "SCHEMA", "ADD", "p", "GEO"]);
-    thread::sleep(Duration::from_millis(100));
     for index in ["a", "b"] {
         assert_eq!(
             failures(&mut c, index),
@@ -602,7 +602,6 @@ fn json_geo_fields_take_strings_and_arrays_of_them() {
     ] {
         c.cmds(&["JSON.SET", key, "$", doc]);
     }
-    thread::sleep(Duration::from_millis(50));
     assert_eq!(failures(&mut c, "j").0, 4);
     assert_eq!(failures(&mut c, "j").1, 6);
     assert_eq!(
@@ -655,7 +654,6 @@ fn geo_postings_and_the_document_filter_agree() {
         let (lon, lat) = (next() * 20.0 - 10.0, next() * 20.0 + 40.0);
         c.cmds(&["HSET", &format!("p:{i}"), "loc", &format!("{lon},{lat}")]);
     }
-    thread::sleep(Duration::from_millis(200));
     let mut queries = Vec::new();
     for _ in 0..60 {
         let (lon, lat) = (next() * 24.0 - 12.0, next() * 24.0 + 38.0);
@@ -673,5 +671,421 @@ fn geo_postings_and_the_document_filter_agree() {
     c.cmds(&["FT.DEBUG", "POSTINGS", "g", "OFF"]);
     for (q, found) in queries.iter().zip(&with) {
         assert_eq!(&search(&mut c, "g", q, &[]), found, "{q}");
+    }
+}
+
+fn pack_f32(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// A 2-dimensional L2 FLAT vector field, as `FT.CREATE` arguments.
+const VECTOR_2D: [&str; 9] = [
+    "VECTOR",
+    "FLAT",
+    "6",
+    "TYPE",
+    "FLOAT32",
+    "DIM",
+    "2",
+    "DISTANCE_METRIC",
+    "L2",
+];
+
+/// `FT.ALTER` adding a field does not put back a document the index left
+/// out, whatever the field (NUMERIC, TEXT, VECTOR), with `SKIPINITIALSCAN`
+/// or without: `*` and the new field find only the documents it holds, and
+/// FT.INFO still counts the one refused.
+#[test]
+fn ft_alter_leaves_a_refused_document_out() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let v = pack_f32(&[1.0, 1.0]);
+    for (i, skip) in [false, true].into_iter().enumerate() {
+        let index = format!("g{i}");
+        let prefix = format!("h{i}:");
+        let mut create = vec!["FT.CREATE", &index, "ON", "HASH", "PREFIX", "1", &prefix];
+        create.extend(["SCHEMA", "loc", "GEO", "name", "TEXT"]);
+        assert_eq!(c.cmds(&create).as_str(), "OK");
+        for (id, loc) in [("1", "1,1"), ("2", "bad")] {
+            let key = format!("{prefix}{id}");
+            c.cmd(&[
+                b"HSET",
+                key.as_bytes(),
+                b"loc",
+                loc.as_bytes(),
+                b"name",
+                b"beta",
+                b"n",
+                b"5",
+                b"t",
+                b"word",
+                b"v",
+                &v,
+            ]);
+        }
+        let mut added: Vec<&str> = Vec::new();
+        for field in [
+            &["n", "NUMERIC"][..],
+            &["t", "TEXT"],
+            &[&["v"][..], &VECTOR_2D].concat(),
+        ] {
+            let mut alter = vec!["FT.ALTER", index.as_str()];
+            if skip {
+                alter.push("SKIPINITIALSCAN");
+            }
+            alter.extend(["SCHEMA", "ADD"]);
+            alter.extend_from_slice(field);
+            assert_eq!(c.cmds(&alter).as_str(), "OK", "{alter:?}");
+            added.push(field[0]);
+            let kept = vec![format!("{prefix}1")];
+            let ctx = format!("skip={skip} after adding {added:?}");
+            assert_eq!(
+                failures(&mut c, &index),
+                (1, 1, format!("{prefix}2")),
+                "{ctx}"
+            );
+            assert_eq!(search(&mut c, &index, "*", &[]), kept, "{ctx}");
+            assert_eq!(search(&mut c, &index, "beta", &[]), kept, "{ctx}");
+            // A new field finds nothing with SKIPINITIALSCAN (the documents
+            // there were not read for it), and only the one kept without.
+            let found = if skip { vec![] } else { kept.clone() };
+            if added.contains(&"n") {
+                assert_eq!(search(&mut c, &index, "@n:[5 5]", &[]), found, "{ctx}");
+            }
+            if added.contains(&"t") {
+                assert_eq!(search(&mut c, &index, "@t:word", &[]), found, "{ctx}");
+            }
+            if added.contains(&"v") {
+                let r = c.cmd(&[
+                    b"FT.SEARCH",
+                    index.as_bytes(),
+                    b"*=>[KNN 5 @v $b]",
+                    b"PARAMS",
+                    b"2",
+                    b"b",
+                    &v,
+                    b"NOCONTENT",
+                    b"DIALECT",
+                    b"2",
+                ]);
+                assert_eq!(keys(&r), found, "{ctx}");
+            }
+        }
+    }
+}
+
+/// A GEO clause filters a KNN query (before the nearest are picked), an
+/// `FT.AGGREGATE`, and both sides of an `FT.HYBRID`.
+#[test]
+fn geo_clauses_filter_knn_aggregate_and_hybrid() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut create = vec![
+        "FT.CREATE",
+        "g",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d:",
+        "SCHEMA",
+    ];
+    create.extend(["loc", "GEO", "name", "TEXT", "v"]);
+    create.extend_from_slice(&VECTOR_2D);
+    assert_eq!(c.cmds(&create).as_str(), "OK");
+    // Near: Paris; far: Rome. The far ones' vectors are the nearest.
+    for (key, loc, x) in [
+        ("d:1", "2.35,48.85", 5.0),
+        ("d:2", "2.36,48.86", 6.0),
+        ("d:3", "12.49,41.89", 0.0),
+        ("d:4", "12.50,41.90", 1.0),
+    ] {
+        let v = pack_f32(&[x, 0.0]);
+        c.cmd(&[
+            b"HSET",
+            key.as_bytes(),
+            b"loc",
+            loc.as_bytes(),
+            b"name",
+            b"cafe",
+            b"v",
+            &v,
+        ]);
+    }
+    let q = pack_f32(&[0.0, 0.0]);
+    let near = "@loc:[2.35 48.85 10 km]";
+
+    let knn = format!("({near})=>[KNN 2 @v $q]");
+    let r = c.cmd(&[
+        b"FT.SEARCH",
+        b"g",
+        knn.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"NOCONTENT",
+        b"DIALECT",
+        b"2",
+    ]);
+    assert_eq!(keys(&r), ["d:1", "d:2"]);
+    let r = c.cmd(&[
+        b"FT.SEARCH",
+        b"g",
+        b"*=>[KNN 2 @v $q]",
+        b"GEOFILTER",
+        b"loc",
+        b"2.35",
+        b"48.85",
+        b"10",
+        b"km",
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+        b"NOCONTENT",
+        b"DIALECT",
+        b"2",
+    ]);
+    assert_eq!(keys(&r), ["d:1", "d:2"]);
+
+    let r = c.cmds(&[
+        "FT.AGGREGATE",
+        "g",
+        near,
+        "LOAD",
+        "1",
+        "@__key",
+        "SORTBY",
+        "2",
+        "@__key",
+        "ASC",
+    ]);
+    let rows: Vec<&str> = r.as_array()[1..]
+        .iter()
+        .map(|row| row.as_array()[1].as_str())
+        .collect();
+    assert_eq!(rows, ["d:1", "d:2"], "{r:?}");
+    let r = c.cmds(&[
+        "FT.AGGREGATE",
+        "g",
+        "@loc:[2.35 48.85 10 km] @name:cafe",
+        "GROUPBY",
+        "0",
+        "REDUCE",
+        "COUNT",
+        "0",
+        "AS",
+        "n",
+    ]);
+    assert_eq!(r.as_array()[1].as_array()[1].as_int(), 2, "{r:?}");
+
+    // FT.HYBRID: the GEO clause in the text query, and in the vector side's
+    // FILTER. Either way only the near documents come back.
+    let hybrid_keys = |r: &RespValue| -> Vec<String> {
+        let top = r.as_array();
+        assert_eq!(top.get(2).map(|v| v.as_str()), Some("results"), "{r:?}");
+        let mut keys: Vec<String> = top[3]
+            .as_array()
+            .iter()
+            .map(|row| {
+                let row = row.as_array();
+                let at = row.iter().position(|v| v.as_str() == "__key").unwrap();
+                row[at + 1].as_str().to_string()
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+    let r = c.cmd(&[
+        b"FT.HYBRID",
+        b"g",
+        b"SEARCH",
+        near.as_bytes(),
+        b"VSIM",
+        b"@v",
+        b"$q",
+        b"FILTER",
+        near.as_bytes(),
+        b"PARAMS",
+        b"2",
+        b"q",
+        &q,
+    ]);
+    assert_eq!(hybrid_keys(&r), ["d:1", "d:2"]);
+}
+
+/// Points around the corner of cells at every level, (0, 0), and on a line
+/// between cells (11.25, the edge of a cell at 5 bits of longitude): each
+/// circle finds what `GEOSEARCH … BYRADIUS` finds among the same points.
+#[test]
+fn geo_queries_across_cell_edges_find_what_geosearch_finds() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "g",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "p:",
+        "SCHEMA",
+        "loc",
+        "GEO",
+    ]);
+    let mut n = 0;
+    for (clon, clat) in [(0.0f64, 0.0f64), (11.25, 30.0)] {
+        for i in -8..=8 {
+            for j in -8..=8 {
+                let (lon, lat) = (clon + f64::from(i) * 0.0013, clat + f64::from(j) * 0.0011);
+                let point = format!("{lon},{lat}");
+                c.cmds(&["HSET", &format!("p:{n}"), "loc", &point]);
+                c.cmds(&[
+                    "GEOADD",
+                    "z",
+                    &lon.to_string(),
+                    &lat.to_string(),
+                    &format!("p:{n}"),
+                ]);
+                n += 1;
+            }
+        }
+    }
+    for (clon, clat) in [
+        (0.0f64, 0.0f64),
+        (11.25, 30.0),
+        (0.0004, -0.0003),
+        (11.2499, 30.0001),
+    ] {
+        for radius in ["1", "120", "250", "900", "1500", "5000"] {
+            let found = search(
+                &mut c,
+                "g",
+                &format!("@loc:[{clon} {clat} {radius} m]"),
+                &[],
+            );
+            let r = c.cmds(&[
+                "GEOSEARCH",
+                "z",
+                "FROMLONLAT",
+                &clon.to_string(),
+                &clat.to_string(),
+                "BYRADIUS",
+                radius,
+                "m",
+            ]);
+            let mut expected: Vec<String> = r
+                .as_array()
+                .iter()
+                .map(|m| m.as_str().to_string())
+                .collect();
+            expected.sort();
+            assert_eq!(found, expected, "({clon}, {clat}) {radius} m");
+        }
+    }
+}
+
+/// A JSON document rewritten from several points to fewer, to one, and back
+/// to several is found by the points it holds now, and only by them.
+#[test]
+fn a_json_document_rewritten_to_fewer_points_is_found_by_those_only() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "j",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "j:",
+        "SCHEMA",
+        "$.loc",
+        "AS",
+        "loc",
+        "GEO",
+    ]);
+    let at = |c: &mut Conn, lon: u32| search(c, "j", &format!("@loc:[{lon} {lon} 10 km]"), &[]);
+    let found = |c: &mut Conn| -> Vec<u32> { (1..=4).filter(|&p| !at(c, p).is_empty()).collect() };
+    c.cmds(&["JSON.SET", "j:1", "$", r#"{"loc":["1,1","2,2","3,3"]}"#]);
+    assert_eq!(found(&mut c), [1, 2, 3]);
+    c.cmds(&["JSON.SET", "j:1", "$.loc", r#"["1,1","3,3"]"#]);
+    assert_eq!(found(&mut c), [1, 3]);
+    c.cmds(&["JSON.SET", "j:1", "$.loc", r#""2,2""#]);
+    assert_eq!(found(&mut c), [2]);
+    c.cmds(&["JSON.SET", "j:1", "$.loc", r#"["4,4"]"#]);
+    assert_eq!(found(&mut c), [4]);
+    c.cmds(&["JSON.SET", "j:1", "$.loc", r#"["1,1","2,2","4,4"]"#]);
+    assert_eq!(found(&mut c), [1, 2, 4]);
+    c.cmds(&["JSON.SET", "j:1", "$.loc", "[]"]);
+    assert!(found(&mut c).is_empty());
+    assert_eq!(search(&mut c, "j", "*", &[]), ["j:1"]);
+}
+
+/// [`geo_postings_and_the_document_filter_agree`] over JSON documents that
+/// hold arrays of one to four points, some rewritten with fewer: the
+/// postings (one point a document, and several) and the filter that reads
+/// the documents find the same ones.
+#[test]
+fn geo_postings_and_the_document_filter_agree_on_json_arrays() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    c.cmds(&[
+        "FT.CREATE",
+        "j",
+        "ON",
+        "JSON",
+        "PREFIX",
+        "1",
+        "p:",
+        "SCHEMA",
+        "$.loc",
+        "AS",
+        "loc",
+        "GEO",
+    ]);
+    let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let doc = |next: &mut dyn FnMut() -> f64| {
+        let n = 1 + (next() * 4.0) as usize;
+        let points: Vec<String> = (0..n)
+            .map(|_| format!("\"{},{}\"", next() * 20.0 - 10.0, next() * 20.0 + 40.0))
+            .collect();
+        format!("{{\"loc\":[{}]}}", points.join(","))
+    };
+    for i in 0..1500 {
+        c.cmds(&["JSON.SET", &format!("p:{i}"), "$", &doc(&mut next)]);
+    }
+    for i in (0..1500).step_by(7) {
+        c.cmds(&["JSON.SET", &format!("p:{i}"), "$", &doc(&mut next)]);
+    }
+    let mut queries = Vec::new();
+    for _ in 0..60 {
+        let (lon, lat) = (next() * 24.0 - 12.0, next() * 24.0 + 38.0);
+        let radius = 10f64.powf(next() * 4.0);
+        queries.push(format!("@loc:[{lon} {lat} {radius} km]"));
+    }
+    let with: Vec<Vec<String>> = queries
+        .iter()
+        .map(|q| search(&mut c, "j", q, &[]))
+        .collect();
+    assert!(
+        with.iter()
+            .any(|found| !found.is_empty() && found.len() < 1500)
+    );
+    c.cmds(&["FT.DEBUG", "POSTINGS", "j", "OFF"]);
+    for (q, found) in queries.iter().zip(&with) {
+        assert_eq!(&search(&mut c, "j", q, &[]), found, "{q}");
     }
 }

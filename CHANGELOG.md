@@ -180,7 +180,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   point is left out of the index, every field of it, and each such write is
   counted in FT.INFO's `hash_indexing_failures`, with the last error and key
   under `Index Errors`. `SORTBY` on a `GEO` field and `GEOSHAPE` fields are
-  still refused.
+  still refused. `FT.INFO` shows `Index Errors` for every index, `N/A` where
+  nothing was refused, as Redis does, and for an index with a `GEO` field,
+  `refused_docs` and `refused_docs_bytes`.
 
 - **`CONFIG REWRITE` writes the ACL users when no `aclfile` is set, as
   Redis does; the config file takes `user` lines.** A `user <name>

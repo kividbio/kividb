@@ -553,6 +553,10 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let kept_keys = !def.gives_ids();
     def.fields.extend(new_fields);
+    def.has_geo = def
+        .fields
+        .iter()
+        .any(|f| matches!(f.field_type, FieldType::Geo));
     // An index of vectors alone that is given its first TEXT, TAG or
     // NUMERIC field counts its documents by their ids from here on: each
     // is given one below, whatever was added and with SKIPINITIALSCAN too.
@@ -2488,6 +2492,10 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     // a search of the new field finds them from here on.
     let keeps_keys = !def.gives_ids();
     crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        // A document the index left out stays out.
+        if def.refusals.refused(key) {
+            return;
+        }
         if keeps_keys {
             def.docs.add(key);
         }

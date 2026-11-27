@@ -438,6 +438,31 @@ fn order_key(v: f64) -> u64 {
     }
 }
 
+/// The order keys a range of values runs between, its ends included or
+/// not: `None` for a range that holds no value (a NaN end, or ends that
+/// cross).
+fn order_bounds(
+    lo: f64,
+    lo_exclusive: bool,
+    hi: f64,
+    hi_exclusive: bool,
+) -> Option<((u64, u32), (u64, u32))> {
+    if lo.is_nan() || hi.is_nan() {
+        return None;
+    }
+    let start = match (order_key(lo), lo_exclusive) {
+        (k, false) => (k, 0),
+        (u64::MAX, true) => return None,
+        (k, true) => (k + 1, 0),
+    };
+    let end = match (order_key(hi), hi_exclusive) {
+        (k, false) => (k, u32::MAX),
+        (0, true) => return None,
+        (k, true) => (k - 1, u32::MAX),
+    };
+    (start <= end).then_some((start, end))
+}
+
 /// The (value, document) of every document whose value is a number other
 /// than NaN, in the value's order, are in up to three places: most in a
 /// sorted list (`settled`), which a range is a slice of, read in order;
@@ -667,22 +692,9 @@ impl NumericPostings {
         by_value: Option<bool>,
         out: &mut Bits,
     ) {
-        if lo.is_nan() || hi.is_nan() {
+        let Some((start, end)) = order_bounds(lo, lo_exclusive, hi, hi_exclusive) else {
             return;
-        }
-        let start = match (order_key(lo), lo_exclusive) {
-            (k, false) => (k, 0),
-            (u64::MAX, true) => return,
-            (k, true) => (k + 1, 0),
         };
-        let end = match (order_key(hi), hi_exclusive) {
-            (k, false) => (k, u32::MAX),
-            (0, true) => return,
-            (k, true) => (k - 1, u32::MAX),
-        };
-        if start > end {
-            return;
-        }
         let from = self.settled.partition_point(|entry| *entry < start);
         let to = self.settled.partition_point(|entry| *entry <= end);
         // At most this many documents, if every entry still is its own.
@@ -692,6 +704,13 @@ impl NumericPostings {
         } else {
             self.range_in_order(start, end, from..to, out);
         }
+    }
+
+    /// The entries of the sorted list between the order keys `start` and
+    /// `end`, by their places in it.
+    fn settled_between(&self, start: (u64, u32), end: (u64, u32)) -> std::ops::Range<usize> {
+        self.settled.partition_point(|entry| *entry < start)
+            ..self.settled.partition_point(|entry| *entry <= end)
     }
 
     /// [`Self::range`] read off the sorted list (entries `settled`) and the
@@ -1654,6 +1673,8 @@ struct GeoPostings {
     many: BTreeSet<(u64, u32)>,
     /// By document, the geohashes it has in `many`.
     many_points: ahash::AHashMap<u32, Vec<u64>>,
+    /// The bytes the vectors of `many_points` hold on the heap.
+    many_heap: usize,
 }
 
 impl GeoPostings {
@@ -1683,6 +1704,7 @@ impl GeoPostings {
                 for &hash in &hashes {
                     self.many.insert((hash, doc));
                 }
+                self.many_heap += hashes.len() * 8;
                 self.many_points.insert(doc, hashes);
             }
         }
@@ -1691,6 +1713,7 @@ impl GeoPostings {
     fn clear(&mut self, doc: u32) {
         self.one.clear(doc);
         if let Some(hashes) = self.many_points.remove(&doc) {
+            self.many_heap -= hashes.len() * 8;
             for hash in hashes {
                 self.many.remove(&(hash, doc));
             }
@@ -1714,9 +1737,35 @@ impl GeoPostings {
             }
             Cover::Nothing => return,
             Cover::Ranges(ranges) => {
-                for (from, to) in ranges {
-                    self.one
-                        .range(from as f64, false, to as f64, true, &mut found);
+                // The points of one point a document, read one way for all
+                // the cells, as `NumericPostings::range` decides for one
+                // range: off the sorted list, cell by cell, when they are
+                // few; else in one pass over the values. Decided for each
+                // cell, a query could pass over all the values up to nine
+                // times.
+                let one = &self.one;
+                let mut cells = Vec::with_capacity(ranges.len());
+                let mut most = one.frozen.len() + one.recent.len();
+                for &(from, to) in &ranges {
+                    if let Some((start, end)) = order_bounds(from as f64, false, to as f64, true) {
+                        let settled = one.settled_between(start, end);
+                        most += settled.len();
+                        cells.push((start, end, settled));
+                    }
+                }
+                if most.saturating_mul(4) > one.values.len() {
+                    for doc in one.has.iter() {
+                        let hash = one.values[doc as usize] as u64;
+                        if ranges.iter().any(|&(from, to)| from <= hash && hash < to) {
+                            found.set(doc);
+                        }
+                    }
+                } else {
+                    for (start, end, settled) in cells {
+                        one.range_in_order(start, end, settled, &mut found);
+                    }
+                }
+                for &(from, to) in &ranges {
                     for &(hash, doc) in self.many.range((from, 0)..(to, 0)) {
                         if inside(hash) {
                             out.set(doc);
@@ -1733,7 +1782,9 @@ impl GeoPostings {
     }
 
     fn bytes(&self) -> usize {
-        self.one.bytes() + self.many.len() * 16 + self.many_points.len() * 40
+        // A B-tree entry some 26 bytes, as `NumericPostings::bytes` reckons;
+        // a map entry its 32 bytes and a control byte.
+        self.one.bytes() + self.many.len() * 26 + self.many_points.capacity() * 33 + self.many_heap
     }
 }
 
