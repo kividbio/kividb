@@ -32,9 +32,11 @@ other files:
 - Redis's own test suite: [REDIS_TEST_SUITE.md](REDIS_TEST_SUITE.md).
 - Nine client libraries, over RESP2 and RESP3: redis-py, valkey-glide, ioredis, node-redis, Jedis,
   Lettuce, go-redis, StackExchange.Redis and redis-rs send the same 99 commands to Redis 8.10 and to
-  KiviDB, and must get the same replies back (`scripts/client_smoke/`, the Client smoke suite
-  workflow, run by hand). valkey-glide 2.6 cannot read Redis 8's RESP3 search replies; it reads
-  KiviDB's (`search-resp3-reply auto`).
+  KiviDB, and must get the same replies back, of the same kinds (a map, a set, a double), except for
+  the cases listed in `scripts/client_smoke/reported.json`: valkey-glide 2.6 cannot read Redis 8's
+  RESP3 search replies, and reads KiviDB's (`search-resp3-reply auto`). The Client smoke suite
+  workflow runs it by hand, against the latest release's image unless it is given another; the
+  clients are pinned to exact versions.
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
 - LiteLLM's caches (exact and semantic), router counters and proxy rate limiter (the `lua` build for the

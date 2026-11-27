@@ -11,14 +11,15 @@ r.ping()
 
 
 def norm(v):
+    """A reply as JSON: bytes as text, a map as {"map": pairs}, a set as {"set": sorted items}."""
     if isinstance(v, bytes):
         return v.decode("utf-8", "backslashreplace")
     if isinstance(v, dict):
-        return [[norm(k), norm(x)] for k, x in v.items()]
+        return {"map": [[norm(k), norm(x)] for k, x in v.items()]}
     if isinstance(v, (list, tuple)):
         return [norm(x) for x in v]
-    if isinstance(v, set):
-        return sorted((norm(x) for x in v), key=json.dumps)
+    if isinstance(v, (set, frozenset)):
+        return {"set": sorted((norm(x) for x in v), key=json.dumps)}
     return v
 
 

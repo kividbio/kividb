@@ -7,26 +7,32 @@ fn text(b: &[u8]) -> J {
     J::String(String::from_utf8_lossy(b).into_owned())
 }
 
-/// A reply as JSON: maps as [key, value] pairs, sets sorted.
+/// A reply as JSON: a map as {"map": [key, value] pairs}, a set as {"set": sorted items}, and a
+/// simple string, a verbatim string and a big number each tagged with its kind; a bulk string is a
+/// string.
 fn norm(v: &Value) -> J {
     match v {
         Value::Nil => J::Null,
         Value::Int(i) => json!(i),
         Value::BulkString(b) => text(b),
-        Value::SimpleString(s) => J::String(s.clone()),
-        Value::Okay => J::String("OK".into()),
+        Value::SimpleString(s) => json!({"simple": s}),
+        Value::Okay => json!({"simple": "OK"}),
         Value::Array(a) => J::Array(a.iter().map(norm).collect()),
         Value::Set(s) => {
             let mut items: Vec<J> = s.iter().map(norm).collect();
             items.sort_by_key(|x| x.to_string());
-            J::Array(items)
+            json!({"set": items})
         }
-        Value::Map(m) => J::Array(m.iter().map(|(k, x)| json!([norm(k), norm(x)])).collect()),
+        Value::Map(m) => {
+            json!({"map": m.iter().map(|(k, x)| json!([norm(k), norm(x)])).collect::<Vec<_>>()})
+        }
         Value::Double(d) if d.is_finite() => json!(d),
         Value::Double(d) => J::String(d.to_string()),
         Value::Boolean(b) => json!(b),
-        Value::VerbatimString { text, .. } => J::String(text.clone()),
-        Value::BigNumber(n) => J::String(n.to_string()),
+        Value::VerbatimString { format, text } => {
+            json!({"verbatim": text, "format": format!("{format:?}")})
+        }
+        Value::BigNumber(n) => json!({"bignum": n.to_string()}),
         Value::Attribute { data, .. } => norm(data),
         other => J::String(format!("{other:?}")),
     }

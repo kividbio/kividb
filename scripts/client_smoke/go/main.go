@@ -20,7 +20,8 @@ type testCase struct {
 	Cmd  []string `json:"cmd"`
 }
 
-// norm turns a reply into JSON-able values: maps as [key, value] pairs, sets sorted.
+// norm turns a reply into JSON-able values: a map as {"map": [key, value] pairs}, so that
+// run.py tells it from an array.
 func norm(v any) any {
 	switch x := v.(type) {
 	case []any:
@@ -43,7 +44,7 @@ func norm(v any) any {
 		for i, k := range keys {
 			out[i] = []any{k, norm(byKey[k])}
 		}
-		return out
+		return map[string]any{"map": out}
 	case map[string]any:
 		m := map[any]any{}
 		for k, e := range x {

@@ -225,9 +225,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   node-redis, Jedis, Lettuce, go-redis, StackExchange.Redis and redis-rs
   each send the 99 commands of `cases.json` through their own command API,
   over RESP2 and RESP3, to Redis 8.10.3 and to KiviDB. A client's replies
-  from KiviDB are compared with its replies from Redis, so a case needs no
-  expected value. The job summary is a matrix of clients and protocols.
-  The workflow runs by hand only.
+  from KiviDB are compared with its replies from Redis, kinds included (a
+  map against an array, `true` against `1`), so a case needs no expected
+  value. The cases a client reads from KiviDB only are listed in
+  `reported.json`; any other difference fails. The job summary is a matrix
+  of clients and protocols. The workflow runs by hand only.
 
 - **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
   `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,

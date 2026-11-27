@@ -2,17 +2,19 @@ name: Client smoke suite
 # scripts/client_smoke: the same 99 commands through nine Redis clients (redis-py, valkey-glide,
 # ioredis, node-redis, Jedis, Lettuce, go-redis, StackExchange.Redis, redis-rs), over RESP2 and RESP3,
 # against Redis 8.10.3 and against KiviDB. It fails when a client gets another answer from KiviDB
-# than from Redis. The matrix is in the job summary.
+# than from Redis, outside the cases listed in scripts/client_smoke/reported.json. The matrix is in
+# the job summary. The suite begins with FLUSHALL; here both servers are fresh containers.
 #
 # By hand only: Actions minutes cost money, and the clients change on their own schedule, not with
-# each pull request. Each client is pinned (requirements.txt, package-lock.json, pom.xml, go.sum,
-# SmokeSE.csproj, Cargo.lock).
+# each pull request. Each client and what it pulls in is pinned: requirements.txt (hashed),
+# package-lock.json, go.sum, packages.lock.json and Cargo.lock with their checksums, pom.xml to exact
+# versions.
 
 on:
   workflow_dispatch:
     inputs:
       image:
-        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release)"
+        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release). It is started empty: the suite begins with FLUSHALL"
         required: false
         default: ""
       clients:

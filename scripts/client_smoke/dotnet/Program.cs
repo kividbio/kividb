@@ -19,7 +19,8 @@ var version = typeof(ConnectionMultiplexer).Assembly
     .OfType<System.Reflection.AssemblyInformationalVersionAttribute>().FirstOrDefault()?.InformationalVersion.Split('+')[0] ?? "?";
 Console.WriteLine(new JsonObject { ["client"] = "StackExchange.Redis", ["version"] = version }.ToJsonString());
 
-// A reply as JSON: maps as [key, value] pairs, sets sorted.
+// A reply as JSON: a map as {"map": [key, value] pairs}, a set as {"set": sorted items}, and a simple
+// string, a verbatim string and a big number each tagged with its kind; a bulk string is a string.
 static JsonNode? Norm(RedisResult r)
 {
     if (r.IsNull) return null;
@@ -29,12 +30,12 @@ static JsonNode? Norm(RedisResult r)
         case ResultType.Push:
             return new JsonArray(((RedisResult[])r!).Select(Norm).ToArray());
         case ResultType.Set:
-            return new JsonArray(((RedisResult[])r!).Select(Norm).OrderBy(n => n?.ToJsonString(), StringComparer.Ordinal).ToArray());
+            return new JsonObject { ["set"] = new JsonArray(((RedisResult[])r!).Select(Norm).OrderBy(n => n?.ToJsonString(), StringComparer.Ordinal).ToArray()) };
         case ResultType.Map:
             var items = (RedisResult[])r!;
             var pairs = new JsonArray();
             for (var i = 0; i + 1 < items.Length; i += 2) pairs.Add(new JsonArray(Norm(items[i]), Norm(items[i + 1])));
-            return pairs;
+            return new JsonObject { ["map"] = pairs };
         case ResultType.Integer:
             return JsonValue.Create((long)r);
         case ResultType.Double:
@@ -42,6 +43,12 @@ static JsonNode? Norm(RedisResult r)
             return double.IsFinite(d) ? JsonValue.Create(d) : JsonValue.Create(d.ToString());
         case ResultType.Boolean:
             return JsonValue.Create((bool)r);
+        case ResultType.SimpleString:
+            return new JsonObject { ["simple"] = r.ToString() };
+        case ResultType.VerbatimString:
+            return new JsonObject { ["verbatim"] = r.ToString() };
+        case ResultType.BigInteger:
+            return new JsonObject { ["bignum"] = r.ToString() };
         default:
             return JsonValue.Create(r.ToString());
     }

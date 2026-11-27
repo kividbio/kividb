@@ -7,13 +7,16 @@ export const port = Number(portArg);
 export const protocol = Number(protocolArg);
 export const cases = JSON.parse(readFileSync(casesPath, "utf8"));
 
-// A reply as JSON: buffers as strings, maps as [key, value] pairs, sets sorted.
+// A reply as JSON: buffers as strings, a map as {map: [key, value] pairs}, a set as
+// {set: sorted items}, so that run.py tells them from arrays.
 export function norm(v) {
   if (Buffer.isBuffer(v)) return v.toString("utf8");
-  if (v instanceof Map) return [...v].map(([k, x]) => [norm(k), norm(x)]);
-  if (v instanceof Set) return [...v].map(norm).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1));
+  if (v instanceof Map) return { map: [...v].map(([k, x]) => [norm(k), norm(x)]) };
+  if (v instanceof Set) {
+    return { set: [...v].map(norm).sort((a, b) => (JSON.stringify(a) < JSON.stringify(b) ? -1 : 1)) };
+  }
   if (Array.isArray(v)) return v.map(norm);
-  if (v !== null && typeof v === "object") return Object.entries(v).map(([k, x]) => [k, norm(x)]);
+  if (v !== null && typeof v === "object") return { map: Object.entries(v).map(([k, x]) => [k, norm(x)]) };
   if (typeof v === "bigint") return Number(v);
   if (typeof v === "number" && !Number.isFinite(v)) return String(v);
   return v === undefined ? null : v;

@@ -35,7 +35,7 @@ final class Smoke {
         return new String(b, StandardCharsets.UTF_8);
     }
 
-    /** A reply as JSON: bytes as text, maps as [key, value] pairs, sets sorted. */
+    /** A reply as JSON: bytes as text, a map as {"map": [key, value] pairs}, a set as {"set": sorted items}. */
     static Object norm(Object v) throws Exception {
         if (v instanceof byte[] b) return text(b);
         if (v instanceof ByteBuffer b) {
@@ -46,7 +46,7 @@ final class Smoke {
         if (v instanceof Map<?, ?> m) {
             List<Object> out = new ArrayList<>();
             for (Map.Entry<?, ?> e : m.entrySet()) out.add(List.of(norm(e.getKey()), norm(e.getValue())));
-            return out;
+            return Map.of("map", out);
         }
         if (v instanceof Set<?> s) {
             List<Object> out = new ArrayList<>();
@@ -58,7 +58,7 @@ final class Smoke {
                     throw new RuntimeException(e);
                 }
             }));
-            return out;
+            return Map.of("set", out);
         }
         if (v instanceof Collection<?> c) {
             List<Object> out = new ArrayList<>();
