@@ -4172,3 +4172,287 @@ fn acknowledged_vectors_waiting_to_be_linked_survive_a_crash_and_a_shutdown() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// GEO fields (#1004): a snapshot and an AOF round trip through a server
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// A checkpoint: dump.kdb plus an empty AOF delta, the files swapped.
+fn checkpoint(c: &mut Conn) {
+    let bgrw = c.cmds(&["BGREWRITEAOF"]);
+    assert!(!bgrw.is_error(), "BGREWRITEAOF failed: {bgrw:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while c
+        .cmds(&["INFO", "persistence"])
+        .as_str()
+        .contains("aof_rewrite_in_progress:1")
+    {
+        assert!(Instant::now() < deadline, "the rewrite did not finish");
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(500));
+}
+
+/// The keys an `FT.SEARCH … NOCONTENT` reply names, sorted.
+fn found_keys(r: &RespValue) -> Vec<String> {
+    let arr = r.as_array();
+    let mut keys: Vec<String> = arr[1..].iter().map(|k| k.as_str().to_string()).collect();
+    keys.sort();
+    assert_eq!(arr[0].as_int(), keys.len() as i64, "{r:?}");
+    keys
+}
+
+fn geo_search(c: &mut Conn, index: &str, query: &str) -> Vec<String> {
+    found_keys(&c.cmds(&["FT.SEARCH", index, query, "NOCONTENT", "DIALECT", "2"]))
+}
+
+/// The GEO indexes of these tests: `g` on hashes (with a TEXT field) and
+/// `j` on JSON documents, whose field holds an array of points.
+fn create_geo_indexes(c: &mut Conn) {
+    for create in [
+        &[
+            "FT.CREATE",
+            "g",
+            "ON",
+            "HASH",
+            "PREFIX",
+            "1",
+            "h:",
+            "SCHEMA",
+            "loc",
+            "GEO",
+            "name",
+            "TEXT",
+        ][..],
+        &[
+            "FT.CREATE",
+            "j",
+            "ON",
+            "JSON",
+            "PREFIX",
+            "1",
+            "j:",
+            "SCHEMA",
+            "$.loc",
+            "AS",
+            "loc",
+            "GEO",
+        ],
+    ] {
+        assert!(c.cmds(create).is_ok(), "{create:?}");
+    }
+}
+
+/// What the GEO indexes answer, after the writes of `write_geo_documents`.
+fn assert_geo_answers(c: &mut Conn, when: &str) {
+    assert_eq!(
+        geo_search(c, "g", "@loc:[2.35 48.85 10 km]"),
+        ["h:1"],
+        "{when}"
+    );
+    assert_eq!(
+        geo_search(c, "g", "@loc:[12.49 41.89 10 km]"),
+        ["h:3"],
+        "{when}"
+    );
+    // h:2 holds no point: it is left out, every field of it.
+    assert_eq!(geo_search(c, "g", "*"), ["h:1", "h:3"], "{when}");
+    assert!(geo_search(c, "g", "beta").is_empty(), "{when}");
+    assert_eq!(geo_search(c, "j", "@loc:[10 10 10 km]"), ["j:1"], "{when}");
+    assert_eq!(
+        geo_search(c, "j", "@loc:[20 20 10 km]"),
+        ["j:1", "j:2"],
+        "{when}"
+    );
+}
+
+fn write_geo_documents(c: &mut Conn) {
+    c.cmds(&["HSET", "h:1", "loc", "2.35,48.85", "name", "alpha"]);
+    c.cmds(&["HSET", "h:2", "loc", "bad", "name", "beta"]);
+    c.cmds(&["HSET", "h:3", "loc", "12.49 41.89", "name", "gamma"]);
+    c.cmds(&["JSON.SET", "j:1", "$", r#"{"loc":["10,10","20,20"]}"#]);
+    c.cmds(&["JSON.SET", "j:2", "$", r#"{"loc":"20,20"}"#]);
+}
+
+#[test]
+fn geo_index_survives_snapshot_restart() {
+    let _serial = persist_serial();
+    let dir = temp_dir("geo_snapshot");
+    let port1 = free_port();
+    let mut srv1 = start_server_in_dir(port1, &dir);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    {
+        let mut c = Conn::connect(port1);
+        create_geo_indexes(&mut c);
+        write_geo_documents(&mut c);
+        assert_geo_answers(&mut c, "before the restart");
+        assert!(c.cmds(&["SAVE"]).is_ok());
+    }
+    send_shutdown_nosave(port1);
+    assert!(
+        wait_for_exit(&mut srv1, Duration::from_secs(8)),
+        "srv1 exit"
+    );
+
+    let port2 = free_port();
+    let mut srv2 = start_server_in_dir(port2, &dir);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_geo_answers(&mut c, "after the restart");
+        // The document is refused again as the index is filled in.
+        c.cmds(&["HSET", "h:2", "loc", "2.36,48.86"]);
+        assert_eq!(geo_search(&mut c, "g", "beta"), ["h:2"]);
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The index and its documents from the checkpoint, then the AOF's tail:
+/// a document refused after the checkpoint stays out, one let in after it
+/// is in, and one written after it is found.
+#[test]
+fn geo_index_and_refusals_recover_from_aof() {
+    let _serial = persist_serial();
+    let dir = temp_dir("geo_aof");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    {
+        let mut c = Conn::connect(port1);
+        create_geo_indexes(&mut c);
+        write_geo_documents(&mut c);
+        checkpoint(&mut c);
+        // The AOF's tail.
+        c.cmds(&["HSET", "h:1", "loc", "nowhere"]);
+        c.cmds(&["HSET", "h:2", "loc", "2.36,48.86"]);
+        c.cmds(&["HSET", "h:4", "loc", "2.34,48.84", "name", "delta"]);
+        c.cmds(&["JSON.SET", "j:1", "$.loc", r#"["10,10"]"#]);
+    }
+    kill_server(&mut srv1);
+    assert!(dir.join("dump.kdb").exists());
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        assert_eq!(
+            geo_search(&mut c, "g", "@loc:[2.35 48.85 10 km]"),
+            ["h:2", "h:4"]
+        );
+        assert_eq!(geo_search(&mut c, "g", "*"), ["h:2", "h:3", "h:4"]);
+        assert!(geo_search(&mut c, "g", "alpha").is_empty());
+        assert_eq!(geo_search(&mut c, "g", "beta"), ["h:2"]);
+        assert_eq!(geo_search(&mut c, "j", "@loc:[20 20 10 km]"), ["j:2"]);
+        assert_eq!(geo_search(&mut c, "j", "@loc:[10 10 10 km]"), ["j:1"]);
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An HNSW graph loaded from the checkpoint holds the vector of a document
+/// that a write in the AOF's tail left out (its GEO field no point): the
+/// walk after the replay takes it out of the graph, and KNN does not find
+/// it.
+#[test]
+fn a_loaded_hnsw_graph_drops_a_document_refused_after_the_checkpoint() {
+    let _serial = persist_serial();
+    let dir = temp_dir("geo_hnsw");
+    let port1 = free_port();
+    let mut srv1 = start_aof_server(port1, &dir, &[]);
+    assert!(
+        wait_for_server(port1, Duration::from_secs(10)),
+        "srv1 start"
+    );
+    let near = pack_f32(&[0.0, 0.0]);
+    let far = pack_f32(&[5.0, 5.0]);
+    {
+        let mut c = Conn::connect(port1);
+        assert!(
+            c.cmds(&[
+                "FT.CREATE",
+                "d",
+                "ON",
+                "HASH",
+                "PREFIX",
+                "1",
+                "d:",
+                "SCHEMA",
+                "loc",
+                "GEO",
+                "v",
+                "VECTOR",
+                "HNSW",
+                "6",
+                "TYPE",
+                "FLOAT32",
+                "DIM",
+                "2",
+                "DISTANCE_METRIC",
+                "L2",
+            ])
+            .is_ok()
+        );
+        c.cmd(&[b"HSET", b"d:1", b"loc", b"1,1", b"v", &near]);
+        c.cmd(&[b"HSET", b"d:2", b"loc", b"2,2", b"v", &far]);
+        checkpoint(&mut c);
+        c.cmds(&["HSET", "d:1", "loc", "bad"]);
+    }
+    kill_server(&mut srv1);
+
+    let port2 = free_port();
+    let mut srv2 = start_aof_server(port2, &dir, &[]);
+    assert!(
+        wait_for_server(port2, Duration::from_secs(10)),
+        "srv2 start"
+    );
+    {
+        let mut c = Conn::connect(port2);
+        let r = c.cmd(&[
+            b"FT.SEARCH",
+            b"d",
+            b"*=>[KNN 2 @v $b]",
+            b"PARAMS",
+            b"2",
+            b"b",
+            &near,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]);
+        assert_eq!(found_keys(&r), ["d:2"]);
+        // Let in again, it is found.
+        c.cmds(&["HSET", "d:1", "loc", "1,1"]);
+        let r = c.cmd(&[
+            b"FT.SEARCH",
+            b"d",
+            b"*=>[KNN 1 @v $b]",
+            b"PARAMS",
+            b"2",
+            b"b",
+            &near,
+            b"NOCONTENT",
+            b"DIALECT",
+            b"2",
+        ]);
+        assert_eq!(found_keys(&r), ["d:1"]);
+    }
+    send_shutdown_nosave(port2);
+    let _ = wait_for_exit(&mut srv2, Duration::from_secs(8));
+    let _ = std::fs::remove_dir_all(&dir);
+}

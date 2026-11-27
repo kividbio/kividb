@@ -1090,7 +1090,7 @@ impl ShardMap {
 
     /// `gap` zero bytes and then `extra` added to `key`'s string, as
     /// [`append_str`](Self::append_str) adds `extra` alone.
-    fn append_after(
+    pub(crate) fn append_after(
         &mut self,
         key: &[u8],
         gap: usize,

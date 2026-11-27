@@ -257,6 +257,32 @@ fn test_rpush_lrange_slices() {
     assert_eq!(c.cmds(&["LRANGE", "l", "5", "10"]).as_array().len(), 0);
 }
 
+#[test]
+fn test_list_ranges_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["RPUSH", "l", "a", "b", "c"]);
+    for args in [
+        ["LRANGE", "l", "01", "1"],
+        ["LRANGE", "l", "0", "+1"],
+        ["LRANGE", "l", "-0", "1"],
+        ["LTRIM", "l", "01", "1"],
+        ["LTRIM", "l", "0", "+1"],
+        ["LTRIM", "l", "-0", "1"],
+    ] {
+        assert_eq!(
+            c.cmds(&args),
+            RespValue::Error("ERR value is not an integer or out of range".into())
+        );
+    }
+
+    let binding = c.cmds(&["LRANGE", "l", "0", "-1"]);
+    let items: Vec<&str> = binding.as_array().iter().map(|v| v.as_str()).collect();
+    assert_eq!(items, vec!["a", "b", "c"]);
+}
+
 // Manual test scenario:
 //   RPUSH l a b c
 //   LPOP l          → "a"

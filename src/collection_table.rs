@@ -86,17 +86,16 @@ use rand::Rng;
 // Where the memory comes from
 // ---------------------------------------------------------------------------
 
-/// Where a table's blocks come from: its group arrays and arena chunks
-/// ([`Memory::alloc`]) and its elements' entries ([`Memory::alloc_entry`],
+/// Where a table's blocks come from: its group arrays ([`Memory::alloc_array`]),
+/// arena chunks ([`Memory::alloc`]) and its elements' entries ([`Memory::alloc_entry`],
 /// aligned to [`ENTRY_ALIGN`]). One small interface so that the entries'
 /// allocator can change, and so that the tests can count.
 ///
 /// # Safety
-/// `alloc` returns a block of `layout`'s size and alignment, zeroed when
-/// `zeroed` is true; `alloc_entry` a block of at least `size` bytes aligned
-/// to [`ENTRY_ALIGN`]; neither fails silently. `free` takes back a block
-/// `alloc` gave for the same layout, `free_entry` one `alloc_entry` gave for
-/// the same size.
+/// `alloc` and `alloc_array` return blocks of their layout's size and
+/// alignment, zeroed when asked; `alloc_entry` returns a block of at least
+/// `size` bytes aligned to [`ENTRY_ALIGN`]. None fails silently. Each free
+/// method takes back a block from its matching allocation method.
 ///
 /// A block may be freed on any thread, not only the one that allocated it:
 /// a table is `Send` (a key's value is written by whichever thread runs the
@@ -130,6 +129,23 @@ pub unsafe trait Memory {
     /// What an entry of `size` bytes counts for in `used_memory`.
     fn entry_charged(size: usize) -> usize {
         Self::charged(entry_layout(size))
+    }
+    /// A main group array, zeroed if asked. Kept separate from entries because the
+    /// default memory can use dedicated slab classes for small arrays.
+    fn alloc_array(layout: Layout, zeroed: bool) -> NonNull<u8> {
+        Self::alloc(layout, zeroed)
+    }
+    /// Give back a block returned by `alloc_array`.
+    ///
+    /// # Safety
+    /// `block` came from `alloc_array` with this layout and is not used again.
+    unsafe fn free_array(block: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's promise.
+        unsafe { Self::free(block, layout) }
+    }
+    /// What an array allocation counts for in `used_memory`.
+    fn array_charged(layout: Layout) -> usize {
+        Self::charged(layout)
     }
 }
 
@@ -215,10 +231,24 @@ unsafe impl Memory for SlabMemory {
 /// costs, and is counted in `used_memory` at, its class's size; a slab
 /// nobody owns gives its pages back as soon as it empties (one a thread
 /// owns, when the thread lets go of it: INFO `value_slab_pool_bytes` counts
-/// them). Entries over
-/// `value_slab::POOL_MAX_BLOCK`, the group arrays and the arena chunks come from
-/// the system allocator.
+/// them). Entries over `value_slab::POOL_MAX_BLOCK` and arena chunks use
+/// the system allocator. Main group arrays up to
+/// `value_slab::CHUNK_MAX_BLOCK` use the chunk classes; larger arrays use
+/// the system allocator with eight-byte alignment and room to align the
+/// groups within the block, preserving its zeroed-allocation (`calloc`) path.
 pub struct EntryPool;
+
+impl EntryPool {
+    /// Only the exact cache-line array layouts have the stronger alignment
+    /// guaranteed by these chunk classes. Other layouts use the system.
+    #[inline]
+    fn array_class(layout: Layout) -> Option<usize> {
+        if layout.align() != 64 || layout.size() < 64 || !layout.size().is_power_of_two() {
+            return None;
+        }
+        crate::value_slab::chunk_class_of(layout.size())
+    }
+}
 
 // SAFETY: a pool block of `pool_class_of(size)` is at least `size` bytes
 // and aligned to 8; a larger entry is `SystemMemory`'s. `free_entry` picks
@@ -256,6 +286,44 @@ unsafe impl Memory for EntryPool {
     #[inline]
     fn entry_charged(size: usize) -> usize {
         crate::value_slab::pool_class_of(size).map_or(size, crate::value_slab::block_size)
+    }
+
+    #[inline]
+    fn alloc_array(layout: Layout, zeroed: bool) -> NonNull<u8> {
+        if let Some(class) = Self::array_class(layout) {
+            // Group arrays are whole cache lines. The chunk classes have a
+            // block size equal to this request, and their block starts are
+            // aligned to 64 bytes: the slab base and each block stride are
+            // multiples of 64, and the slab's bump starts at zero.
+            debug_assert_eq!(layout.align(), 64);
+            debug_assert_eq!(layout.size() % 64, 0);
+            debug_assert_eq!(crate::value_slab::block_size(class), layout.size());
+            let block = crate::value_slab::alloc(class);
+            if zeroed {
+                // Slab blocks are uninitialised; unlike alloc_zeroed, clear
+                // the array before exposing its groups.
+                unsafe { ptr::write_bytes(block.as_ptr(), 0, layout.size()) };
+            }
+            block
+        } else {
+            SystemMemory::alloc(layout, zeroed)
+        }
+    }
+
+    #[inline]
+    unsafe fn free_array(block: NonNull<u8>, layout: Layout) {
+        if let Some(class) = Self::array_class(layout) {
+            // SAFETY: alloc_array used this class for the same layout.
+            unsafe { crate::value_slab::free(block, class) };
+        } else {
+            // SAFETY: the caller's promise.
+            unsafe { SystemMemory::free(block, layout) };
+        }
+    }
+
+    #[inline]
+    fn array_charged(layout: Layout) -> usize {
+        Self::array_class(layout).map_or(layout.size(), crate::value_slab::block_size)
     }
 }
 
@@ -583,41 +651,49 @@ impl Arena {
 
 /// `2^bits` groups, zeroed when made.
 ///
-/// The block is asked for aligned to 8 and 56 bytes longer, and the groups
-/// start at its first multiple of 64 (`offset` bytes in). Asked for aligned
-/// to 64, the system allocator zeroes a block with `memset` (Rust's
-/// `alloc_zeroed` for an alignment above 16 is `posix_memalign` and a
-/// fill), which for the 64 MiB of a 3M-element table took 13 ms on the
-/// write that started the growth; `calloc` gets fresh pages from the kernel
-/// already zeroed, and they are touched a few at a time by later writes.
+/// Slab-sized arrays need no alignment reserve. Larger arrays keep an
+/// eight-byte-aligned request with 56 spare bytes: asking for alignment
+/// 64 makes the system allocator use `posix_memalign` and `memset` instead
+/// of `calloc`. Zeroing a 64 MiB array that way took 13 ms on the write
+/// starting a growth; `calloc` leaves fresh zero pages untouched until
+/// later writes need them.
 #[derive(Clone, Copy)]
 struct Array {
     groups: NonNull<Group>,
     bits: u8,
-    /// Bytes from the block's start to `groups`: 0 to 56.
+    /// Bytes from the block's start to `groups`: 0 to 56; zero for slabs.
     offset: u8,
 }
 
-/// Room asked for beyond the groups, to align them to 64.
+/// Room to align the fallback's groups while keeping its calloc route.
 const ARRAY_SLACK: usize = 64 - 8;
 
 impl Array {
     fn layout(bits: u8) -> Layout {
         let bytes = std::mem::size_of::<Group>()
             .checked_shl(u32::from(bits))
-            .and_then(|b| b.checked_add(ARRAY_SLACK))
             .expect("a group array fits in memory");
-        Layout::from_size_align(bytes, 8).expect("a group array fits in memory")
+        let (bytes, align) = if bytes <= crate::value_slab::CHUNK_MAX_BLOCK {
+            (bytes, 64)
+        } else {
+            (
+                bytes
+                    .checked_add(ARRAY_SLACK)
+                    .expect("a group array fits in memory"),
+                8,
+            )
+        };
+        Layout::from_size_align(bytes, align).expect("a group array fits in memory")
     }
 
     fn alloc<A: Memory>(bits: u8) -> Self {
         debug_assert!(bits <= MAX_BITS);
-        let block = A::alloc(Self::layout(bits), true);
+        let block = A::alloc_array(Self::layout(bits), true);
         let offset = (64 - block.as_ptr().addr() % 64) % 64;
         debug_assert!(offset <= ARRAY_SLACK && offset % 8 == 0);
         Array {
-            // SAFETY: `offset <= ARRAY_SLACK`: the groups, `64 << bits`
-            // bytes from there, are in the block.
+            // SAFETY: slab blocks are already aligned; the fallback has
+            // ARRAY_SLACK bytes beyond the groups to cover this offset.
             groups: unsafe { block.add(offset) }.cast(),
             bits,
             offset: offset as u8,
@@ -627,12 +703,12 @@ impl Array {
     /// # Safety
     /// Made by [`Self::alloc`] with `A`; no group of it is used again.
     unsafe fn free<A: Memory>(self) {
-        // SAFETY: the caller's promise: the block starts `offset` bytes
-        // before the groups.
+        // SAFETY: the caller's promise; the block starts `offset` bytes
+        // before the groups, as recorded when it was allocated.
         unsafe {
             let block = self.groups.cast::<u8>().sub(usize::from(self.offset));
-            A::free(block, Self::layout(self.bits))
-        }
+            A::free_array(block, Self::layout(self.bits))
+        };
     }
 
     #[inline]
@@ -1227,6 +1303,7 @@ pub struct CollectionTable<K: Kind, A: Memory = EntryPool> {
     /// so that the header packs into 80 bytes.
     groups: NonNull<Group>,
     bits: u8,
+    /// The main array's alignment offset, as in [`Array::offset`].
     offset: u8,
     /// [`RESEED_DUE`] and [`DEFER_FREE`].
     flags: u8,
@@ -1291,7 +1368,7 @@ unsafe impl<A: Memory> Send for Retired<A> {}
 impl<A: Memory> Retired<A> {
     /// What freeing it gives back, as `allocation_size` counted it.
     pub fn bytes(&self) -> usize {
-        A::charged(Array::layout(self.array.bits)) + self.arena.bytes::<A>()
+        A::array_charged(Array::layout(self.array.bits)) + self.arena.bytes::<A>()
     }
 }
 
@@ -2205,14 +2282,14 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
     /// its class's size). Not the table's own header,
     /// which is inside whatever holds the table.
     pub fn allocation_size(&self) -> usize {
-        let mut bytes = A::charged(Array::layout(self.main().bits)) + self.entry_bytes;
+        let mut bytes = A::array_charged(Array::layout(self.main().bits)) + self.entry_bytes;
         if let Some(rare) = self.rare.as_ref() {
             bytes += std::mem::size_of::<Rare>() + rare.arena.bytes::<A>();
             if let Some(old) = rare.old.as_ref() {
-                bytes += A::charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
+                bytes += A::array_charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
             }
             if let Some((array, arena)) = rare.retired.as_ref() {
-                bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
+                bytes += A::array_charged(Array::layout(array.bits)) + arena.bytes::<A>();
             }
         }
         bytes
@@ -2228,10 +2305,10 @@ impl<K: Kind, A: Memory> CollectionTable<K, A> {
         };
         let mut bytes = 0;
         if let Some(old) = rare.old.as_ref() {
-            bytes += A::charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
+            bytes += A::array_charged(Array::layout(old.array.bits)) + old.arena.bytes::<A>();
         }
         if let Some((array, arena)) = rare.retired.as_ref() {
-            bytes += A::charged(Array::layout(array.bits)) + arena.bytes::<A>();
+            bytes += A::array_charged(Array::layout(array.bits)) + arena.bytes::<A>();
         }
         bytes
     }
@@ -5293,6 +5370,123 @@ mod tests {
         assert!(set.iter().all(|m| copy_set.contains(&m)));
         drop((copy, hash, copy_set, set));
         assert_eq!(live(), (blocks0, chunks0, bytes0));
+    }
+
+    /// Small main arrays use dedicated value-slab chunk classes. Each
+    /// class is a whole number of cache lines, so the returned block itself
+    /// is 64-byte aligned and needs no 56-byte alignment reserve.
+    #[test]
+    fn small_group_arrays_use_aligned_chunk_slabs() {
+        for bits in 0..=7 {
+            let layout = Array::layout(bits);
+            assert_eq!(layout.size(), 64 << bits);
+            let class = EntryPool::array_class(layout).unwrap();
+            assert_eq!(crate::value_slab::block_size(class), layout.size());
+            assert_eq!(EntryPool::array_charged(layout), layout.size());
+            for _ in 0..2 {
+                let arrays: Vec<_> = (0..16).map(|_| Array::alloc::<EntryPool>(bits)).collect();
+                for array in arrays {
+                    assert_eq!(array.groups.as_ptr().addr() % 64, 0);
+                    for index in 0..array.len() {
+                        // SAFETY: a live zeroed group in this array.
+                        let group = unsafe { &*array.group(index) };
+                        assert_eq!(group.ctrl, 0);
+                        assert!(group.slots.iter().all(|slot| slot.is_null()));
+                    }
+                    // Dirty every byte, including the slots, so reuse must
+                    // clear more than the allocator's free-list pointer.
+                    // SAFETY: the whole live allocation; never read dirty.
+                    unsafe {
+                        ptr::write_bytes(array.groups.as_ptr().cast::<u8>(), 0x5a, layout.size());
+                        array.free::<EntryPool>();
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn group_array_class_rejects_other_layouts() {
+        for (size, align) in [(32, 64), (64, 8), (192, 64), (64, 128), (16_384, 64)] {
+            let layout = Layout::from_size_align(size, align).unwrap();
+            assert!(EntryPool::array_class(layout).is_none());
+            let block = EntryPool::alloc_array(layout, true);
+            assert_eq!(block.as_ptr().addr() % align, 0);
+            // SAFETY: this exact layout allocated the block above.
+            unsafe { EntryPool::free_array(block, layout) };
+        }
+    }
+
+    #[test]
+    fn group_array_charge_matches_the_allocation_counter() {
+        for bits in 0..=8 {
+            let layout = Array::layout(bits);
+            let warm = Array::alloc::<EntryPool>(bits);
+            // SAFETY: no group is used again; warms the class metadata.
+            unsafe { warm.free::<EntryPool>() };
+            let before = crate::memory_use::allocated_by_this_thread()
+                .expect("the allocation-counter test needs its own thread counter");
+            let array = Array::alloc::<EntryPool>(bits);
+            assert_eq!(
+                crate::memory_use::allocated_by_this_thread().unwrap() - before,
+                EntryPool::array_charged(layout) as isize
+            );
+            // SAFETY: the live allocation is no longer used.
+            unsafe { array.free::<EntryPool>() };
+            assert_eq!(
+                crate::memory_use::allocated_by_this_thread().unwrap(),
+                before
+            );
+        }
+    }
+
+    /// Large arrays keep the padded, eight-byte-aligned allocation so
+    /// zeroed system allocations can use calloc rather than an eager memset.
+    #[test]
+    fn large_group_arrays_keep_the_calloc_layout() {
+        let array = Array::alloc::<EntryPool>(8);
+        let layout = Array::layout(8);
+        assert_eq!(layout.size(), crate::value_slab::CHUNK_MAX_BLOCK * 2 + 56);
+        assert_eq!(layout.align(), 8);
+        assert!(EntryPool::array_class(layout).is_none());
+        assert_eq!(array.groups.as_ptr().addr() % 64, 0);
+        assert!(array.offset <= 56 && array.offset.is_multiple_of(8));
+        for index in 0..array.len() {
+            // SAFETY: a live group from the zeroed fallback allocation.
+            let group = unsafe { &*array.group(index) };
+            assert_eq!(group.ctrl, 0);
+            assert!(group.slots.iter().all(|slot| slot.is_null()));
+        }
+        assert_eq!(EntryPool::array_charged(layout), layout.size());
+        // SAFETY: no group is used after this point.
+        unsafe { array.free::<EntryPool>() };
+
+        // Pin the layout of the 64 MiB growth without touching its pages.
+        let large = Array::layout(20);
+        assert_eq!(large.size(), (64 << 20) + 56);
+        assert_eq!(large.align(), 8);
+        assert!(EntryPool::array_class(large).is_none());
+    }
+
+    /// A main array allocated by one thread can be freed by another.
+    #[test]
+    fn a_group_array_is_freed_on_another_thread() {
+        for bits in [0, 1, 7, 8] {
+            let (address, offset) = std::thread::spawn(move || {
+                let array = Array::alloc::<EntryPool>(bits);
+                (array.groups.as_ptr() as usize, array.offset)
+            })
+            .join()
+            .unwrap();
+            let array = Array {
+                groups: NonNull::new(address as *mut Group).unwrap(),
+                bits,
+                offset,
+            };
+            // SAFETY: the allocation came from the thread above and is not
+            // used again; the allocating thread has already ended.
+            unsafe { array.free::<EntryPool>() };
+        }
     }
 
     /// The model tests' operations on the memory tables use, the entry

@@ -522,7 +522,12 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     let mut newly_added_text_fields: Vec<String> = Vec::new();
     let added_filter_fields: Vec<crate::vector::SchemaField> = new_fields
         .iter()
-        .filter(|f| matches!(f.field_type, FieldType::Tag | FieldType::Numeric))
+        .filter(|f| {
+            matches!(
+                f.field_type,
+                FieldType::Tag | FieldType::Numeric | FieldType::Geo
+            )
+        })
         .cloned()
         .collect();
     for field in &new_fields {
@@ -548,6 +553,10 @@ fn ft_alter(ctx: &mut Ctx) -> Option<Vec<u8>> {
     }
     let kept_keys = !def.gives_ids();
     def.fields.extend(new_fields);
+    def.has_geo = def
+        .fields
+        .iter()
+        .any(|f| matches!(f.field_type, FieldType::Geo));
     // An index of vectors alone that is given its first TEXT, TAG or
     // NUMERIC field counts its documents by their ids from here on: each
     // is given one below, whatever was added and with SKIPINITIALSCAN too.
@@ -980,7 +989,9 @@ pub(crate) fn ft_aggregate(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => {
             scanned = true;
             crate::commands::search::scan_docs(db_ref, deadline, |key, value| {
-                if !def.covers(&crate::key_bytes::bytes_of(key)) {
+                // A document the index left out (a GEO field holding no point)
+                // is not one of its rows.
+                if !def.covers(&crate::key_bytes::bytes_of(key)) || def.refusals.refused(key) {
                     return;
                 }
                 if not_served(key) {
@@ -2481,6 +2492,10 @@ fn backfill_new_vector_fields(ctx: &Ctx, index_name: &str, new_field_names: &[St
     // a search of the new field finds them from here on.
     let keeps_keys = !def.gives_ids();
     crate::vector::walk_documents(&ctx.store[def.db_index], &def, |key, inner| {
+        // A document the index left out stays out.
+        if def.refusals.refused(key) {
+            return;
+        }
         if keeps_keys {
             def.docs.add(key);
         }

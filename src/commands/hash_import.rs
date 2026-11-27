@@ -185,6 +185,7 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             );
             crate::vector::maybe_index_pairs(
                 ctx.index_store,
+                ctx.store,
                 db,
                 key,
                 &pairs,

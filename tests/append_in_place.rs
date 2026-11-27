@@ -961,3 +961,177 @@ fn used_memory_stays_across_setranges_in_place() {
     assert!((after - before).abs() < 256 << 10, "{before} -> {after}");
     assert_eq!(c.usage("big"), usage);
 }
+
+/// A `BGSAVE` holds each string it captured: `SETRANGE`s growing it from
+/// its end meanwhile copy it once, then write in the copy's room. The dump
+/// has the bytes from before; the live value has every growth, zero gap
+/// included.
+#[test]
+fn a_bgsave_writes_the_bytes_from_before_growing_setranges() {
+    let server = Server::start(&[], true);
+    let mut c = server.conn();
+    fill(&mut c, &SIZES);
+    assert_eq!(
+        c.cmd(&[b"BGSAVE"]),
+        V::Str(b"Background saving started".to_vec())
+    );
+    let held = server.snapshot_held(1);
+    for len in SIZES {
+        let k = key(len);
+        assert_eq!(setrange(&mut c, &k, len, b"ab"), V::Int(len as i64 + 2));
+        assert_eq!(setrange(&mut c, &k, len + 5, b"cd"), V::Int(len as i64 + 7));
+    }
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("rdb_last_bgsave_status"), "ok");
+    for len in SIZES {
+        assert!(
+            c.get(&key(len)) == V::Str(with(len, b"ab\0\0\0cd")),
+            "{len}"
+        );
+    }
+    let server = server.restart(&[]);
+    let mut c = server.conn();
+    for len in SIZES {
+        assert!(
+            c.get(&key(len)) == V::Str(pattern(len)),
+            "{len} in the dump"
+        );
+    }
+}
+
+/// `used_memory` follows the block a growing `SETRANGE` grows, as for an
+/// `APPEND`: up by a quarter at the first growth, then flat while later
+/// growths fit the room; `MEMORY USAGE` counts the room.
+#[test]
+fn used_memory_counts_the_room_a_growing_setrange_keeps() {
+    let server = Server::start(&[], false);
+    let mut c = server.conn();
+    let used = |c: &mut Conn| c.info("used_memory").parse::<i64>().unwrap();
+    let len = 8 << 20;
+    c.cmd(&[b"SET", b"big", &pattern(len)]);
+    let usage = c.usage("big");
+    let before = used(&mut c);
+    setrange(&mut c, "big", len, b"x");
+    let grown = used(&mut c) - before;
+    let room = ((len + 1) / 4) as i64;
+    assert!(
+        (room - (64 << 10)..room + (256 << 10)).contains(&grown),
+        "{grown} for {room}"
+    );
+    assert!(
+        c.usage("big") - usage >= room - 64,
+        "MEMORY USAGE counts the room"
+    );
+    for i in 0..1000 {
+        setrange(&mut c, "big", len + 1 + i * 10, b"0123456789");
+    }
+    let after = used(&mut c) - before;
+    assert!(
+        (after - grown).abs() < 256 << 10,
+        "{after} after growths in the room"
+    );
+    assert_eq!(c.cmd(&[b"STRLEN", b"big"]), V::Int(len as i64 + 1 + 10_000));
+}
+
+/// Growing `SETRANGE`s, in the room and past it, with and without a gap,
+/// reach a replica and the AOF: the replica ends with the master's bytes
+/// and a restart replays them.
+#[test]
+fn growing_setranges_reach_the_replica_and_the_aof() {
+    let aof = ["--appendonly", "yes", "--appendfsync", "always"];
+    let master = Server::start(&aof, false);
+    let mut m = master.conn();
+    let sizes = &SIZES[..3];
+    fill(&mut m, sizes);
+    let port = master.port.to_string();
+    let replica = Server::start(&["--replicaof", "127.0.0.1", &port], false);
+    let mut r = replica.conn();
+    r.wait_for("master_link_status", "up");
+    let before: i64 = m.info("rdb_changes_since_last_save").parse().unwrap();
+    let mut wants = vec![];
+    for &len in sizes {
+        let mut want = pattern(len);
+        for i in 0..50 {
+            let gap = if i % 2 == 0 { 0 } else { 4095 };
+            let offset = want.len() + gap;
+            setrange(&mut m, &key(len), offset, b"gh");
+            want = patched(want, offset, b"gh");
+        }
+        wants.push(want);
+    }
+    let after: i64 = m.info("rdb_changes_since_last_save").parse().unwrap();
+    assert_eq!(after - before, 50 * sizes.len() as i64, "dirty");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    for (&len, want) in sizes.iter().zip(&wants) {
+        assert!(
+            m.get(&key(len)) == V::Str(want.clone()),
+            "{len} on the master"
+        );
+        while r.get(&key(len)) != V::Str(want.clone()) {
+            assert!(Instant::now() < deadline, "{len}: the replica differs");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let digest = |c: &mut Conn| c.cmd(&[b"DEBUG", b"DIGEST-VALUE", key(len).as_bytes()]);
+        assert_eq!(digest(&mut m), digest(&mut r), "{len}");
+    }
+    drop(r);
+    drop(replica);
+    let master = master.restart(&aof);
+    let mut m = master.conn();
+    for (&len, want) in sizes.iter().zip(&wants) {
+        assert!(m.get(&key(len)) == V::Str(want.clone()), "{len} replayed");
+    }
+}
+
+/// A `SETRANGE` that grows a watched string in its room fails the
+/// `EXEC`; an empty one past the end does not.
+#[test]
+fn a_growing_setrange_in_the_room_fails_a_watch() {
+    let server = Server::start(&[], false);
+    let mut c = server.conn();
+    let mut other = server.conn();
+    let len = 1 << 20;
+    fill(&mut c, &[len]);
+    // The first growth makes the room; the watched one writes in it.
+    setrange(&mut other, &key(len), len, b"a");
+    for (patch, fails) in [(&b"b"[..], true), (&b""[..], false)] {
+        c.cmd(&[b"WATCH", key(len).as_bytes()]);
+        let strlen = match other.cmd(&[b"STRLEN", key(len).as_bytes()]) {
+            V::Int(n) => n as usize,
+            v => panic!("{v:?}"),
+        };
+        setrange(&mut other, &key(len), strlen + 3, patch);
+        c.cmd(&[b"MULTI"]);
+        c.cmd(&[b"PING"]);
+        let exec = c.cmd(&[b"EXEC"]);
+        assert_eq!(exec == V::Nil, fails, "{patch:?}: {exec:?}");
+    }
+}
+
+/// The room a growing `SETRANGE` keeps is allocated memory that `maxmemory`
+/// counts: with `noeviction`, a limit with room for the string but not for
+/// the quarter more its block grows by refuses the write after the growth,
+/// and leaves the string as the growth left it.
+#[test]
+fn maxmemory_counts_the_room_a_growing_setrange_keeps() {
+    let server = Server::start(&["--maxmemory-policy", "noeviction"], false);
+    let mut c = server.conn();
+    let used = |c: &mut Conn| c.info("used_memory").parse::<i64>().unwrap();
+    let len = 8 << 20;
+    c.cmd(&[b"SET", b"big", &pattern(len)]);
+    let before = used(&mut c);
+    let limit = (before + (1 << 20)).to_string();
+    let set = c.cmd(&[b"CONFIG", b"SET", b"maxmemory", limit.as_bytes()]);
+    assert_eq!(set, V::Str(b"OK".to_vec()));
+    assert_eq!(setrange(&mut c, "big", len, b"x"), V::Int(len as i64 + 1));
+    let grown = used(&mut c) - before;
+    assert!(grown > 1 << 20, "{grown}: the room is counted");
+    let refused = setrange(&mut c, "big", len + 1, b"y");
+    assert!(
+        matches!(&refused, V::Err(e) if e.starts_with("OOM")),
+        "{refused:?}"
+    );
+    assert_eq!(c.cmd(&[b"STRLEN", b"big"]), V::Int(len as i64 + 1));
+    assert!(c.get("big") == V::Str(with(len, b"x")));
+}

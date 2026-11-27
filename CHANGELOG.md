@@ -9,6 +9,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrading
 
+- **A `GEO` field is known only from this release on (#1004).** Create one
+  once every node runs this release, replicas first:
+  - a snapshot (or a full sync) that holds an index with a `GEO` field is
+    refused by an earlier version, whole, rather than loaded with the field
+    read as TEXT;
+  - an earlier replica refuses the `FT.CREATE … GEO` it is sent, and
+    answers without that index while the master has it;
+  - an earlier version replaying an AOF skips the refused `FT.CREATE`, as
+    it skips any record it cannot apply: the data is all there, the index
+    is not;
+  - in a cluster with an earlier master, a query with a `GEO` clause or
+    `GEOFILTER` is an error (that master refuses its part), not a partial
+    reply.
+
 - **Cluster: masters vote on when the slots a replica claims came to its
   master.** Asked for its vote, a master refuses it to a replica that claims
   a slot of its master at an older epoch than the slot came to the master
@@ -154,6 +168,21 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `CLUSTER SLOTS` until it comes back.
 
 ### Added
+
+- **`GEO` fields in `FT.CREATE`, `@field:[lon lat radius unit]` and
+  `GEOFILTER` (part of #1004).** As in Redis 8.10: a HASH field holds
+  `"lon,lat"`, a JSON one a string of that form or an array of them; the
+  radius is in `m`, `km`, `mi` or `ft`, and several `GEOFILTER`s narrow the
+  query together. A point is found as `GEOSEARCH … BYRADIUS` finds a member:
+  the cells around the centre are read off postings kept as a NUMERIC
+  field's are, with the geohash as the value, and each point is measured by
+  the centre of its geohash's cell. A document whose `GEO` field holds no
+  point is left out of the index, every field of it, and each such write is
+  counted in FT.INFO's `hash_indexing_failures`, with the last error and key
+  under `Index Errors`. `SORTBY` on a `GEO` field and `GEOSHAPE` fields are
+  still refused. `FT.INFO` shows `Index Errors` for every index, `N/A` where
+  nothing was refused, as Redis does, and for an index with a `GEO` field,
+  `refused_docs` and `refused_docs_bytes`.
 
 - **`CONFIG REWRITE` writes the ACL users when no `aclfile` is set, as
   Redis does; the config file takes `user` lines.** A `user <name>
@@ -675,10 +704,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   arithmetic on a nil value` was not counted at all.
 
 - **`error` reads a number as Lua 5.1 does (#1054).** Raised with a level,
-  a number gets the place before it, as a string does: `error(42)` on
-  line 2 is `user_script:2: 42`. What a script catches is what it would
-  catch in Redis: `pcall(error, 42)` gives the string `"42"`, where it gave
-  the number; `pcall(error, 42, 0)` still gives the number.
+  a number gets the place before it, as a string does, and is written
+  `%.14g`, as Redis's Lua writes it: `error(42)` on line 2 is
+  `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`;
+  `error(10/2, 0)` replies `ERR 5`. A number a table raises as its `err`
+  is written so too: `error({err = -0.0})` replies `-0`, and
+  `error({err = 1e15})` replies `1e+15`. What a script catches is what it
+  would catch in Redis: `pcall(error, 42)` gives the string `"42"`, where
+  it gave the number; `pcall(error, 42, 0)` still gives the number.
+
+- **`error` of a value that is not a string replies it with no place of its
+  own (#1054).** `error(nil)`, `error(true)`, `error(false)`, `error()` and
+  `error(42, 0)` reply `ERR nil`, `ERR true`, `ERR false`, `ERR nil` and
+  `ERR 42`, then `script: <sha>, on @user_script:N.` with the line they
+  were raised on, as in Redis; they replied `ERR user_script:1: nil …`
+  whatever the line. Inside `coroutine.wrap`, `N` is the line in the
+  coroutine, where Redis names the line of the call: Lua 5.4's `wrap`
+  places a string only and raises anything else as it is (Redis's, Lua
+  5.1's, places a number too, so that `error(42, 0)` there replies
+  `ERR user_script:4: 42 …`).
+
+- **A nil index error reads `attempt to index a nil value` however it is
+  raised (#1054).** Caught and raised again with `error(e, 0)`, it replied
+  the whole of Lua 5.4's message (`attempt to index a nil value (local
+  't')`); it is cut now as the one raised where it happened is. Only
+  Lua's own note is cut: a message a script wrote itself, as
+  `attempt to index a nil value: bad key x`, is replied whole.
 
 - **A function library's lines are counted from its `#!lua` line, under
   Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
@@ -991,6 +1042,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A write counts one change, as any write command does. A signed
   `INCRBY` that wraps past the field's largest value replies with the
   value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
+- **A `SETRANGE` written from a string's end grows it as an `APPEND`
+  does (part of #1016).** When the key holds a string and the value is
+  written at or past its end, the string grows into the room its block
+  keeps; a block with no room left is grown with `realloc`, which the
+  allocator may do by moving it, and a string held elsewhere is copied
+  once, each into a block with room for a quarter more, at most 16 MiB.
+  Before this change such a `SETRANGE` copied a string of more than
+  26,208 bytes whole on every call. A missing key is made at its
+  length, and a value that starts inside the string is written as
+  before. The room is allocated memory: `used_memory`, `maxmemory` and
+  `MEMORY USAGE` count it. Replies, time to live, `WATCH`, keyspace
+  events, the dirty count, the AOF and replication are unchanged.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
@@ -1852,6 +1915,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     its text), and `JSON.DEBUG MEMORY` reports the new sizes. The
     analysis of where the bytes went, and suite 45, are IIITManjeet's.
 
+- **Small hashes and sets whose elements are too long to stay packed take
+  less memory (#782).** A table that fits one group takes that group's
+  64 bytes from a slab class, without the 56 bytes previously reserved to
+  align it. A six-field hash with a JSON-encoded 1,800-byte payload and
+  five small values takes 2,176 bytes, down from 2,232, including its shared
+  allocation but not its key or keyspace table. Arrays above 8 KiB keep the padded
+  allocation that lets the system allocator use `calloc`. The
+  `small-table` case of regression suite `19-hash-memory` gates
+  `used_memory` and RSS a key for this shape.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
@@ -2557,10 +2630,14 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **A script's error says where in the script it happened, as in Redis
   (#1054).** A runtime error keeps the `user_script:N:` Lua gives it, and
   its reply ends `script: <sha>, on @user_script:N.`, `N` being the line
-  it left the script from. An `EVAL`'d script that does not compile is
-  reported as `SCRIPT LOAD` reports it, `Error compiling script (new
-  function): user_script:N: …`, where it said `user_script:1` whatever the
-  line. `FCALL` names `user_function` and the function.
+  it left the script from (`=[C]:-1` when `error` was called by a C
+  function, as with `string.gsub(s, p, error)`, as Redis has it). An
+  `EVAL`'d script that does not compile is reported as `SCRIPT LOAD`
+  reports it, `Error compiling script (new function): user_script:N: …`,
+  where it said `user_script:1` whatever the line. `error(nil)`,
+  `error(true)`, `error(false)`, `error()` and `error(42, 0)` name the line
+  they were raised on.
+  `FCALL` names `user_function` and the function, a table error too.
 
 - **`CONFIG REWRITE` writes every setting the server runs with, and no
   `replicaof` after `REPLICAOF NO ONE`.** It writes each setting

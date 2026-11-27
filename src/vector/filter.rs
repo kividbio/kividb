@@ -26,7 +26,7 @@
 // `VECTOR_RANGE` query returned nothing at all without saying why.
 
 use super::stem::Language;
-use super::{DistanceMetric, FieldType, IndexDef, SchemaField, VectorType};
+use super::{DistanceMetric, FieldType, IndexDef, IndexOn, SchemaField, VectorType};
 use ahash::AHashMap;
 
 /// `PARAMS` of a query: name → value.
@@ -131,6 +131,18 @@ pub enum Filter {
         lo_exclusive: bool,
         hi: f64,
         hi_exclusive: bool,
+    },
+    /// `@field:[lon lat radius unit]`, or `GEOFILTER` (#1004): a point of
+    /// the GEO `field` within `radius_m` metres of (`lon`, `lat`). `json`:
+    /// the index is on JSON, whose fields hold several points.
+    Geo {
+        field: String,
+        lon: f64,
+        lat: f64,
+        radius_m: f64,
+        json: bool,
+        /// The unit the radius was given in, lower case: for `FT.EXPLAIN`.
+        unit: String,
     },
     /// `@field != v`
     NumericNot {
@@ -239,6 +251,27 @@ impl Filter {
             _ => false,
         }
     }
+}
+
+/// A GEO clause's radius in metres: positive, in `m`, `km`, `mi` or `ft`
+/// (any case), as Redis 8.10 takes it. An infinite one reaches every point.
+pub fn geo_radius(radius: f64, unit: &str) -> Result<f64, String> {
+    let radius_m = crate::geohash::to_meters(radius, unit)
+        .ok_or_else(|| "Invalid GeoFilter unit".to_string())?;
+    if radius.is_nan() || radius <= 0.0 {
+        return Err("Invalid GeoFilter radius".into());
+    }
+    Ok(radius_m)
+}
+
+/// A GEO clause's centre: a finite longitude within ±180 and latitude
+/// within ±90, as Redis 8.10 takes it (a latitude past what a geohash holds
+/// is a centre no point is near, not an error).
+pub fn geo_lon_lat(lon: f64, lat: f64) -> Result<(f64, f64), String> {
+    if !(-180.0..=180.0).contains(&lon) || !(-90.0..=90.0).contains(&lat) {
+        return Err("Invalid GeoFilter lat/lon".into());
+    }
+    Ok((lon, lat))
 }
 
 /// The TEXT fields of `def` that `INFIELDS` names (by attribute, the name
@@ -889,6 +922,36 @@ impl<'a> Parser<'a> {
         self.pos += len + 1;
         let tokens: Vec<&str> = inner.split_whitespace().collect();
 
+        // `[lon lat radius unit]`: a GEO field's syntax, and no other's.
+        if let [lon, lat, radius, unit] = tokens.as_slice() {
+            if !matches!(field.field_type, FieldType::Geo) {
+                return Err(format!(
+                    "Expected a GEO field at offset {start} near {}",
+                    field.attribute()
+                ));
+            }
+            // `nan` is no number here, as in Redis.
+            let number = |token: &str| match self.number(token) {
+                Ok(v) if !v.is_nan() => Ok(v),
+                _ => Err(self.syntax_error_at(inner_start)),
+            };
+            let (lon, lat, radius) = (number(lon)?, number(lat)?, number(radius)?);
+            let unit = match unit.strip_prefix('$') {
+                Some(name) => self.param_text(name)?,
+                None => unit.to_string(),
+            };
+            let radius_m = geo_radius(radius, &unit)?;
+            let lon_lat = geo_lon_lat(lon, lat)?;
+            return Ok(Filter::Geo {
+                field: field.name.clone(),
+                lon: lon_lat.0,
+                lat: lon_lat.1,
+                radius_m,
+                json: matches!(self.def.on, IndexOn::Json),
+                unit: unit.to_ascii_lowercase(),
+            });
+        }
+
         if tokens
             .first()
             .is_some_and(|t| t.eq_ignore_ascii_case("VECTOR_RANGE"))
@@ -1514,6 +1577,29 @@ pub fn eval(filter: &Filter, doc: &dyn Doc) -> bool {
 
         Filter::NumericNot { field, value } => {
             numeric_value(doc, field).is_some_and(|n| n != *value)
+        }
+
+        Filter::Geo {
+            field,
+            lon,
+            lat,
+            radius_m,
+            json,
+            ..
+        } => {
+            crate::geohash::centre_searchable(*lat)
+                && doc.field_bytes(field).is_some_and(|raw| {
+                    super::geo::points(raw, *json).is_ok_and(|points| {
+                        points.iter().any(|&(point_lon, point_lat)| {
+                            crate::geohash::hash_within(
+                                crate::geohash::geohash_bits(point_lon, point_lat),
+                                *lon,
+                                *lat,
+                                *radius_m,
+                            )
+                        })
+                    })
+                })
         }
 
         Filter::Text {

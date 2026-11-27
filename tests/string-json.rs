@@ -635,6 +635,29 @@ fn test_setrange() {
     assert_eq!(c.cmds(&["STRLEN", "newkey"]).as_int(), 8);
 }
 
+#[test]
+fn test_string_ranges_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "k", "Hello World"]);
+    for args in [
+        ["GETRANGE", "k", "01", "1"],
+        ["GETRANGE", "k", "0", "+1"],
+        ["SUBSTR", "k", "-0", "1"],
+        ["SETRANGE", "k", "01", "x"],
+        ["SETRANGE", "k", "+1", "x"],
+        ["SETRANGE", "k", "-0", "x"],
+    ] {
+        assert_eq!(
+            c.cmds(&args).error_str(),
+            "ERR value is not an integer or out of range"
+        );
+    }
+    assert_eq!(c.cmds(&["GET", "k"]).as_str(), "Hello World");
+}
+
 // Manual test scenario:
 //   SET k "hello"
 //   GETEX k EX 100           → "hello"  (sets TTL)
