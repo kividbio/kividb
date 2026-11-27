@@ -371,17 +371,18 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         Some("0"),
         "{completed_line}"
     );
-    // Four reads in a row under 4 KiB, with nothing left to parse: the batch
-    // that finished the request gave the buffer back to 4 KiB, which is not
-    // a private one, and `qbuf-free` is reported for private buffers only.
+    // The buffer the request needed is kept: the turns that held a part of
+    // it needed it, and it is given back only after sixteen turns in a row
+    // have not (`UNUSED_TURNS`).
     assert_eq!(
         client_metric(&completed_line, "qbuf-free="),
-        Some("0"),
+        Some("16384"),
         "{completed_line}"
     );
 
-    // The buffer is not private any more: nothing is held for the idle
-    // threshold to reclaim, and the next read keeps it at 4 KiB.
+    // io_uring reclaims an idle private buffer only past the 32 KiB resize
+    // threshold, as Redis does: a quiet spell and the read after it keep
+    // this one.
     std::thread::sleep(Duration::from_secs(3));
     let idle_line = {
         let list = observer.cmd(&["CLIENT", "LIST"]);
@@ -391,8 +392,8 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     };
     assert_eq!(
         client_metric(&idle_line, "qbuf-free="),
-        Some("0"),
-        "an idle io_uring client holds its 4 KiB read buffer, not a private one: {idle_line}"
+        Some("16384"),
+        "an idle io_uring client keeps its 16 KiB private buffer: {idle_line}"
     );
 
     assert_eq!(partial.cmd(&["PING"]), s("PONG"));
@@ -413,8 +414,8 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
     );
     assert_eq!(
         client_metric(&floor_line, "qbuf-free="),
-        Some("0"),
-        "the 4 KiB buffer stays small across reads: {floor_line}"
+        Some("16384"),
+        "the 16 KiB buffer is kept across a small read: {floor_line}"
     );
 
     let info = partial.cmd(&["CLIENT", "INFO"]);
@@ -422,6 +423,25 @@ fn query_buffer_metrics_track_partial_and_completed_commands() {
         panic!("CLIENT INFO did not return a string: {info:?}");
     };
     assert_eq!(client_metric(&info, "qbuf="), Some("0"), "{info}");
+
+    // Sixteen more small requests: the buffer goes back to 4 KiB, which is
+    // not a private one, and `qbuf-free` is reported for private buffers
+    // only.
+    for _ in 0..16 {
+        assert_eq!(partial.cmd(&["PING"]), s("PONG"));
+    }
+    let list = observer.cmd(&["CLIENT", "LIST"]);
+    let small_line = client_list_line(&list, "name=uring-qbuf").unwrap_or("");
+    assert_eq!(
+        client_metric(small_line, "qbuf="),
+        Some("0"),
+        "{small_line}"
+    );
+    assert_eq!(
+        client_metric(small_line, "qbuf-free="),
+        Some("0"),
+        "the buffer goes back once small requests have not needed it: {small_line}"
+    );
 }
 
 fn client_query_buffer_size(line: &str) -> Option<usize> {

@@ -37195,6 +37195,162 @@
           "keep": 0.6
         }
       ]
+    },
+    "56-burst-between-commands/tokio/burst_cpu_us": {
+      "suite": "56-burst-between-commands",
+      "config": "tokio",
+      "metric": "burst_cpu_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 284.0166,
+        "candidate": 253.2641,
+        "redis": 312.8654,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "56-burst-between-commands/tokio/burst_reads": {
+      "suite": "56-burst-between-commands",
+      "config": "tokio",
+      "metric": "burst_reads",
+      "unit": "reads",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 13.0,
+        "candidate": 2.0,
+        "redis": 3.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 0,
+          "abs": 0.25
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "56-burst-between-commands/tokio/slow_cpu_us": {
+      "suite": "56-burst-between-commands",
+      "config": "tokio",
+      "metric": "slow_cpu_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 113.4863,
+        "candidate": 120.4373,
+        "redis": 96.9379,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "56-burst-between-commands/uring/burst_cpu_us": {
+      "suite": "56-burst-between-commands",
+      "config": "uring",
+      "metric": "burst_cpu_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 252.9976,
+        "candidate": 252.4986,
+        "redis": 305.4377,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
+    },
+    "56-burst-between-commands/uring/burst_reads": {
+      "suite": "56-burst-between-commands",
+      "config": "uring",
+      "metric": "burst_reads",
+      "unit": "reads",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 2.0,
+        "candidate": 2.0,
+        "redis": 3.0,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "rel",
+          "pct": 0,
+          "abs": 0.25
+        },
+        {
+          "kind": "vs_v1_2_2",
+          "max_x": 1.1
+        }
+      ]
+    },
+    "56-burst-between-commands/uring/slow_cpu_us": {
+      "suite": "56-burst-between-commands",
+      "config": "uring",
+      "metric": "slow_cpu_us",
+      "unit": "us",
+      "better": "lower",
+      "recorded": {
+        "v1_2_2": 106.9595,
+        "candidate": 127.5567,
+        "redis": 96.2118,
+        "vm": "Standard_D8s_v5",
+        "cpu": "Intel(R) Xeon(R) Platinum 8370C CPU @ 2.80GHz",
+        "date": "2026-11-27",
+        "commit": "7f7c0541",
+        "label": "buffer-reuse-56-d8s_v5",
+        "rustc": "1.100.0",
+        "nproc": 8
+      },
+      "gate": [
+        {
+          "kind": "info"
+        }
+      ]
     }
   }
 }

@@ -789,8 +789,15 @@ const READ_SIZE: usize = 4 * 1024;
 /// so small that a client with a small receive buffer filled it with their
 /// overhead, and it and the server then waited for each other for good.
 const READ_BUFFER: usize = 32 * 1024;
-/// Reads in a row that `READ_SIZE` would have held before a grown buffer shrinks.
-const SHORT_READS: u32 = 4;
+/// Turns in a row that did not need more than `READ_SIZE` of the buffer
+/// before a grown, empty one goes back to `READ_SIZE`. A turn needs more
+/// when its read fills its room, when the buffer holds more than
+/// `READ_SIZE` after the read, or when a request is still partly held at
+/// the turn's end: a client whose requests arrive across several small
+/// reads, or that sends a pipelined burst between a few single commands,
+/// keeps the size it uses from one to the next. A quiet client gets it back
+/// sooner, from the idle timer below.
+const UNUSED_TURNS: u32 = 16;
 
 /// Write one response batch straight to TCP (normal client hot path).
 #[inline]
@@ -1104,8 +1111,9 @@ where
 
     // ── Connection state ─────────────────────────────────────────────────
     let mut buffer = Vec::with_capacity(READ_SIZE);
-    // Reads in a row under `READ_SIZE`, and whether the last filled its room.
-    let mut short_reads = 0u32;
+    // Turns in a row that did not need more than `READ_SIZE` of the buffer
+    // (see `UNUSED_TURNS`), and whether the last read filled its room.
+    let mut unused_turns = 0u32;
     let mut last_read_full = false;
     let mut private_query_buffer = false;
     query_buffer.update(0, buffer.capacity(), private_query_buffer);
@@ -1214,12 +1222,14 @@ where
         // `carried` still holds it, and the client would keep the two (#869).
         let mut fed_from_carried = false;
         if unpresented == 0 && carried.is_empty() && !skip_read {
-            // Only small requests lately: an empty, grown buffer goes back to `READ_SIZE`.
-            if short_reads >= SHORT_READS && buffer.is_empty() && buffer.capacity() > READ_SIZE {
+            // Not needed past `READ_SIZE` lately: an empty, grown buffer goes
+            // back to `READ_SIZE`.
+            if unused_turns >= UNUSED_TURNS && buffer.is_empty() && buffer.capacity() > READ_SIZE {
                 buffer = Vec::with_capacity(READ_SIZE);
                 private_query_buffer = false;
                 query_buffer.update(0, buffer.capacity(), private_query_buffer);
-                // The replies' buffer too, to what is still in it.
+                // The replies' buffer too: empty, as every turn's replies
+                // are written before the next turn reads.
                 combined.shrink_to(READ_SIZE);
             }
             // First, so any room past `READ_SIZE` takes the capped read below.
@@ -1370,10 +1380,10 @@ where
                 buffer.reserve(READ_BUFFER - buffer.len());
             }
             last_read_full = n == room;
-            short_reads = if n < READ_SIZE {
-                short_reads.saturating_add(1)
-            } else {
+            unused_turns = if last_read_full || buffer.len() > READ_SIZE {
                 0
+            } else {
+                unused_turns.saturating_add(1)
             };
             // Bytes arrived from the socket: the client is active, so its idle
             // clock restarts. Once per read, not once per command — a pipeline
@@ -3589,11 +3599,15 @@ where
                 buffer = Vec::with_capacity(4 * 1024);
                 query_buffer_peak = 0;
             }
-        // Only compact when we've consumed a meaningful chunk AND there's
-        // data left to preserve. This amortizes the memmove cost.
-        } else if read_start > 0 && read_start > buffer.len() / 2 {
-            buffer.drain(0..read_start);
-            read_start = 0;
+        } else {
+            // A request partly held: the buffer is in use.
+            unused_turns = 0;
+            // Only compact when we've consumed a meaningful chunk AND there's
+            // data left to preserve. This amortizes the memmove cost.
+            if read_start > 0 && read_start > buffer.len() / 2 {
+                buffer.drain(0..read_start);
+                read_start = 0;
+            }
         }
         query_buffer.update(
             buffer.len().saturating_sub(read_start) + carried.len() - carried_from,

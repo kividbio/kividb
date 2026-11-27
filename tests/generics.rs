@@ -1757,7 +1757,7 @@ fn test_large_pipeline_is_read_in_larger_reads_until_idle() {
 
     assert_eq!(reads_for_pipeline(&mut client), 2, "4 KiB, then the rest");
     assert_eq!(reads_for_pipeline(&mut client), 1, "room kept while busy");
-    for _ in 0..4 {
+    for _ in 0..17 {
         client.cmds(&["PING"]);
     }
     assert_eq!(

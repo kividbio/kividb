@@ -8,7 +8,8 @@ size once the connection's reads are small again (and, on the Tokio loop,
 once it has been quiet for `query-buffer-idle-resize-after`).
 
 Configurations (each a fresh server; CONNS connections, 10,000, opened from
-one client process; `CONFIG SET maxclients 20000` first):
+one client process; `CONFIG SET maxclients 20000` first). The count is the
+same at any SCALE: `clients` is gated equal to the recorded count.
 
   tokio-idle  `--io-model tokio`: connections that send nothing
   tokio-ping  `--io-model tokio`: each sends one `PING`, reads its reply,
@@ -38,7 +39,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
-from suite import Suite, Config, rel, bound, info, KEEP_IMPROVEMENT, scaled  # noqa: E402
+from suite import Suite, Config, rel, bound, info, KEEP_IMPROVEMENT  # noqa: E402
 from rss import vmrss_mib, MIB  # noqa: E402
 
 S = Suite("55-idle-connection-memory", [
@@ -62,7 +63,7 @@ def recv_exactly(s, n):
 
 @S.run
 def run(ctx):
-    conns = scaled(CONNS, step=100)
+    conns = CONNS
     soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft < conns + 100:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(hard, conns + 1000), hard))

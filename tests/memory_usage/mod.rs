@@ -360,18 +360,19 @@ impl Conn {
         last
     }
 
-    /// Five `PING`s, one at a time: brings this connection's buffers to the
-    /// small size every connection starts with. The server keeps a buffer
-    /// that a long pipeline grew (32 KiB for reads, and as much as the
-    /// replies for writes) until four reads in a row have been small, and
-    /// then gives it back, on either I/O model; the buffers are in
+    /// Seventeen `PING`s, one at a time: brings this connection's buffers to
+    /// the small size every connection starts with. The server keeps a
+    /// buffer that a long pipeline grew (32 KiB for reads, and as much as the
+    /// replies for writes) until sixteen turns in a row have not needed more
+    /// than a small read's room, and then gives it back, on either I/O model
+    /// (before the next read on the Tokio loop); the buffers are in
     /// `used_memory`, so a count taken after a pipeline and one taken
     /// before it differ by what the pipeline grew, unless both are taken
     /// from a connection in this state. [`Conn::settled_used_memory`] does
     /// that. Not a matter of waiting: the idle timer that also gives a grown
     /// buffer back may or may not have fired.
     pub fn small_reads(&mut self) {
-        for _ in 0..5 {
+        for _ in 0..17 {
             assert!(matches!(self.cmd(&[b"PING"]), Reply::Simple));
         }
     }

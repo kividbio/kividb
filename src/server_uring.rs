@@ -1192,14 +1192,22 @@ const READ_BUFFER: usize = 32 * 1024;
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
 /// The room a connection's reads start with, and what its read buffer goes
-/// back to once its reads have been small for a while (`SHORT_READS` in a
-/// row under it, with nothing left to parse): a read is always in flight,
-/// with its buffer in the kernel, so an idle connection holds this much for
-/// reading. A read that fills it makes the next one `READ_BUFFER`'s room.
+/// back to once it has gone `UNUSED_TURNS` turns without needing more: a
+/// read is always in flight, with its buffer in the kernel, so an idle
+/// connection holds this much for reading. A read that fills it makes the
+/// next one `READ_BUFFER`'s room.
 const READ_SIZE: usize = 4 * 1024;
-/// Reads in a row under `READ_SIZE` before a grown, empty read buffer goes
-/// back to `READ_SIZE`, and the reply buffers with it.
-const SHORT_READS: u32 = 4;
+/// Turns in a row that did not need more than `READ_SIZE` of the read
+/// buffer before a grown, empty one goes back to `READ_SIZE`, and the reply
+/// buffers with it. A turn needs more when its read fills the room it was
+/// given, when the buffer holds more than `READ_SIZE` after the read, or
+/// when a request is still partly held at the turn's end. So a client whose
+/// requests arrive across several small reads, or that sends a pipelined
+/// burst between a few single commands, keeps the size it uses from one
+/// request or burst to the next, rather than growing and giving it back
+/// each time; one that sends only small requests for this many turns gives
+/// it back.
+const UNUSED_TURNS: u32 = 16;
 
 /// A connection's subscriptions, made at its first SUBSCRIBE, with the task
 /// that writes its messages. On this thread: the stream is not `Send`. It
@@ -1357,10 +1365,14 @@ pub async fn handle_client(
     // holds it: see `READ_SIZE`.
     let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_SIZE);
     // Whether the next read is given `READ_SIZE`'s room rather than
-    // `READ_BUFFER`'s; and the reads in a row that brought less than
-    // `READ_SIZE`.
+    // `READ_BUFFER`'s; and the turns in a row that did not need more than
+    // `READ_SIZE` of the read buffer (see `UNUSED_TURNS`).
     let mut read_small = true;
-    let mut short_reads = 0u32;
+    let mut unused_turns = 0u32;
+    // The capacity past which the reply buffer just written is let go of
+    // rather than kept: `BIG_BUFFER`, or none when the buffers are given
+    // back while a reply larger than `READ_SIZE` waits to be written.
+    let mut keep_written = BIG_BUFFER;
     let mut private_query_buffer = false;
     let mut last_query_buffer_activity = Instant::now();
     let query_buffer_idle_resize_after =
@@ -1618,13 +1630,30 @@ pub async fn handle_client(
         // whichever finishes first. Reading straight into
         // `parse_buf` — the same zero-copy path an ordinary client uses — keeps
         // the buffer owned by this loop for exactly the duration of the read.
-        // Query-buffer shrinking therefore happens *between* batches: right
-        // after a read completes (the buffer is then owned by this loop, with
-        // no operation in flight), before the next read is submitted. An idle
-        // client whose oversized buffer is not followed by another read keeps
-        // that buffer until the next read opportunity; that is the accepted
-        // io_uring tradeoff for not racing the read (Redis shrinks such buffers
-        // from its client cron instead).
+        // The buffers are therefore rebuilt only *between* batches, when this
+        // loop owns them and no read or write that points into them is in
+        // flight:
+        //
+        // - a private buffer past the resize threshold, right after a read
+        //   completes, once the client was idle for
+        //   `query-buffer-idle-resize-after` or its recent peak is under
+        //   half of it (below);
+        // - a read buffer past `BIG_BUFFER`, at the end of the turn that
+        //   leaves it empty;
+        // - a grown read buffer, back to `READ_SIZE`, at the end of a turn
+        //   that leaves it empty once `UNUSED_TURNS` turns in a row have not
+        //   needed more than `READ_SIZE` of it; the reply buffers with it,
+        //   the spare one at once (no write is in flight then) and the one
+        //   holding this turn's replies at once if those fit in `READ_SIZE`,
+        //   or else after they are written, so that a large reply is not
+        //   copied just before it is sent.
+        //
+        // The read submitted with a write takes `parse_buf` with it, so none
+        // of these happens while it is pending: it is awaited at the top of
+        // the next turn first. An idle client whose oversized buffer is not
+        // followed by another read keeps that buffer until the next read
+        // opportunity; that is the accepted io_uring tradeoff for not racing
+        // the read (Redis shrinks such buffers from its client cron instead).
         //
         // Whether this turn's bytes were moved out of `carried`, already
         // held, rather than read: what is already held is not reserved for
@@ -1714,17 +1743,17 @@ pub async fn handle_client(
                     // `READ_BUFFER`'s room.
                     if n == room {
                         read_small = false;
-                        short_reads = 0;
+                        unused_turns = 0;
                         // As the Tokio loop does: the room a read brings the
                         // rest of a burst in, whatever a request cut inside
                         // a bulk string reserved.
                         if parse_buf.capacity() < READ_BUFFER {
                             parse_buf.reserve(READ_BUFFER - parse_buf.len());
                         }
-                    } else if n < READ_SIZE {
-                        short_reads = short_reads.saturating_add(1);
+                    } else if parse_buf.len() > READ_SIZE {
+                        unused_turns = 0;
                     } else {
-                        short_reads = 0;
+                        unused_turns = unused_turns.saturating_add(1);
                     }
                     (unparsed, n)
                 }
@@ -3909,25 +3938,38 @@ pub async fn handle_client(
                 parse_buf = Vec::with_capacity(READ_BUFFER);
                 query_buffer_peak = 0;
             }
-            // Only small requests lately, and nothing of them left: the
-            // read buffer goes back to `READ_SIZE`, and the reply buffers
-            // to what this turn's replies need, so a connection that went
-            // quiet after a burst does not keep the burst's buffers in its
-            // reads. Once, when its reads turn small: a connection whose
-            // buffers are small already does no more than the comparison.
-            if short_reads >= SHORT_READS && parse_buf.capacity() > READ_SIZE {
+            // `UNUSED_TURNS` turns without needing more than `READ_SIZE`,
+            // and nothing left to parse: the read buffer goes back to
+            // `READ_SIZE`, and the reply buffers with it, so a connection
+            // that went quiet after a burst does not keep the burst's
+            // buffers in its reads. Once: a connection whose buffers are
+            // small already does no more than the comparison.
+            if unused_turns >= UNUSED_TURNS && parse_buf.capacity() > READ_SIZE {
                 parse_buf = Vec::with_capacity(READ_SIZE);
                 read_small = true;
                 private_query_buffer = false;
                 query_buffer_peak = 0;
-                out_buf.shrink_to(READ_SIZE);
-                spare_buf.shrink_to(0);
+                // The spare buffer is empty: the last write is done.
+                if out_buf.len() <= READ_SIZE {
+                    out_buf.shrink_to(READ_SIZE);
+                    spare_buf = Vec::new();
+                } else {
+                    // This turn's replies are left where they are: the
+                    // buffer that holds them is let go of once they are
+                    // written, and this one takes the next turn's.
+                    spare_buf = Vec::with_capacity(READ_SIZE);
+                    keep_written = 0;
+                }
             }
-        } else if parse_start > 0 && parse_start > parse_buf.len() / 2 {
-            let remaining = parse_buf.len() - parse_start;
-            parse_buf.copy_within(parse_start.., 0);
-            parse_buf.truncate(remaining);
-            parse_start = 0;
+        } else {
+            // A request partly held: the buffer is in use.
+            unused_turns = 0;
+            if parse_start > 0 && parse_start > parse_buf.len() / 2 {
+                let remaining = parse_buf.len() - parse_start;
+                parse_buf.copy_within(parse_start.., 0);
+                parse_buf.truncate(remaining);
+                parse_start = 0;
+            }
         }
         query_buffer.update(
             parse_buf.len().saturating_sub(parse_start) + carried.len() - carried_from,
@@ -4175,9 +4217,11 @@ pub async fn handle_client(
             reply_limit.drained();
             spare_buf = returned;
             spare_buf.clear();
-            // Nor is one that grew to hold one large reply.
-            if spare_buf.capacity() > BIG_BUFFER {
-                spare_buf = Vec::with_capacity(65536);
+            // Nor is one that grew to hold one large reply, or one written
+            // after the buffers were given back (`keep_written`).
+            if spare_buf.capacity() > keep_written {
+                spare_buf = Vec::with_capacity(keep_written.min(65536));
+                keep_written = BIG_BUFFER;
             }
             // Out of the loop rather than returned from, so that what the
             // connection holds after it is let go of too.
