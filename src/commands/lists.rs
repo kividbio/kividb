@@ -337,11 +337,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match crate::commands::login::strict_integer(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            let stop: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let stop: i64 = match crate::commands::login::strict_integer(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -430,12 +430,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
 
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match crate::commands::login::strict_integer(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
 
-            let stop: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let stop: i64 = match crate::commands::login::strict_integer(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
