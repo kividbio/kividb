@@ -412,3 +412,30 @@ fn a_request_sent_in_parts_survives_the_buffers_going_back() {
         }
     }
 }
+
+/// A request whose first part arrives in the read that would make the
+/// buffers go back, behind a whole one: the buffer keeps it, and the rest
+/// completes it, after a quiet spell too.
+#[test]
+fn a_request_cut_at_the_read_that_would_shrink_survives() {
+    for &io_model in io_models() {
+        let server = Server::start(io_model);
+        let mut c = server.conn();
+        for size in [5, 3 * LARGE] {
+            // Three small reads after the large one: the fourth is this.
+            c.grow_then_settle(3);
+            let value = "q".repeat(size);
+            let request = encode(&["SET", "cut", &value]);
+            let cut = 40.min(request.len() / 2);
+            let mut first = encode(&["PING"]);
+            first.extend_from_slice(&request[..cut]);
+            c.writer.write_all(&first).unwrap();
+            assert_eq!(c.read(), V::Str("PONG".into()), "{io_model}, {size}");
+            std::thread::sleep(QUIET);
+            c.writer.write_all(&request[cut..]).unwrap();
+            assert!(c.read().ok(), "{io_model}, {size}");
+            assert_eq!(c.cmd(&["STRLEN", "cut"]), V::Int(size as i64), "{io_model}");
+            assert_eq!(c.cmd(&["PING"]), V::Str("PONG".into()), "{io_model}");
+        }
+    }
+}
