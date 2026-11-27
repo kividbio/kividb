@@ -25,7 +25,6 @@
 #![allow(dead_code)]
 
 use std::cmp::Ordering;
-use std::hash::BuildHasher;
 use std::ops::Bound;
 
 use ordered_float::OrderedFloat;
@@ -449,6 +448,11 @@ impl<W: Word> Table<W> {
     }
 
     #[inline]
+    fn empty_at(&self, i: usize) -> bool {
+        self.slots[i] == W::default()
+    }
+
+    #[inline]
     fn full(&self) -> bool {
         (self.live + self.tombs + 1) * 8 > self.slots.len() * 7
     }
@@ -583,6 +587,11 @@ struct Store {
     index: Index,
     hasher: ahash::RandomState,
     inners: usize,
+    /// A removal leaves the member's word to its caller (who has it).
+    keep_word: bool,
+    /// Rebuilds of the index so far: a position found before a placement is
+    /// good after it only if none came between.
+    gen: u64,
 }
 
 /// A leaf split: the new leaf (right of the old one) and the separator.
@@ -664,6 +673,7 @@ impl Store {
                 }
             }
         }
+        self.gen += 1;
         self.index = if wide {
             Index::Wide(widened)
         } else {
@@ -964,9 +974,12 @@ impl Store {
                 debug_assert!(m == member && leaf.score(pos).to_bits() == score.to_bits());
             }
             seen(member, leaf.score(pos));
-            (pos, leaf.order[pos], self.hash(member), leaf.long_of(pos))
+            let h = if self.keep_word { 0 } else { self.hash(member) };
+            (pos, leaf.order[pos], h, leaf.long_of(pos))
         };
-        self.unindex(h, (id, slot));
+        if !self.keep_word {
+            self.unindex(h, (id, slot));
+        }
         self.leaf_mut(id).cut(pos);
         if let Some(n) = long {
             self.longs.take(n);
@@ -1040,6 +1053,8 @@ impl Large {
                 index: Index::Narrow(Table::with_room(members)),
                 hasher: ahash::RandomState::new(),
                 inners: 1,
+                keep_word: false,
+                gen: 0,
             },
             len: 0,
             queued: false,
@@ -1158,13 +1173,21 @@ impl Large {
                 }
                 out
             }
-            Err(_) => {
+            Err(mut vacant) => {
                 let (score, out) = decide(None);
                 if let Some(score) = score {
                     let score = score + 0.0;
-                    self.grow_index();
+                    if with_index!(&self.st.index, t => t.full()) {
+                        self.grow_index();
+                        vacant = self.st.lookup(member, h).expect_err("a new member");
+                    }
+                    let gen = self.st.gen;
                     let (leaf, slot) = self.place(score, member);
-                    self.index_new(member, h, leaf, slot);
+                    if gen == self.st.gen {
+                        with_index!(&mut self.st.index, t => t.set(vacant, Word::make(leaf, slot, h)));
+                    } else {
+                        self.index_new(member, h, leaf, slot);
+                    }
                     self.len += 1;
                 }
                 out
@@ -1192,12 +1215,24 @@ impl Large {
                 return;
             }
         }
-        // Out (its word with it) and in again, its word put back where a
-        // lookup now finds room for it.
-        let _ = i;
+        // Out and in again. Its word is held at its position as a
+        // tombstone meanwhile (which keeps the probe run whole, and matches
+        // no entry a split or a merge moves), and rewritten there after.
+        with_index!(&mut self.st.index, t => {
+            t.slots[i] = Word::TOMB;
+            t.live -= 1;
+            t.tombs += 1;
+        });
+        self.st.keep_word = true;
         self.take_out(Find::Key(old, member), &mut |_, _| {});
+        self.st.keep_word = false;
+        let gen = self.st.gen;
         let (leaf, slot) = self.place(score, member);
-        self.index_new(member, h, leaf, slot);
+        if gen == self.st.gen {
+            with_index!(&mut self.st.index, t => t.set(i, Word::make(leaf, slot, h)));
+        } else {
+            self.index_new(member, h, leaf, slot);
+        }
         self.len += 1;
     }
 
@@ -1212,10 +1247,15 @@ impl Large {
     }
 
     pub fn remove(&mut self, member: &[u8]) -> bool {
-        let Some(score) = self.score(member) else {
+        let h = self.st.hash(member);
+        let Ok((i, leaf, slot)) = self.st.lookup(member, h) else {
             return false;
         };
+        let score = self.entry(leaf, slot).1;
+        with_index!(&mut self.st.index, t => t.clear(i));
+        self.st.keep_word = true;
         self.take_out(Find::Key(score, member), &mut |_, _| {});
+        self.st.keep_word = false;
         self.shrink_index();
         true
     }
@@ -1239,6 +1279,7 @@ impl Large {
                 out = Some(take(member, score));
             }
         });
+        self.shrink_index();
         out
     }
 
@@ -1357,7 +1398,7 @@ impl Large {
             let mut steps = 0;
             loop {
                 let w = t.slots[i];
-                if w == Default::default() && (i >= last || i < first) {
+                if t.empty_at(i) && (i >= last || i < first) {
                     break;
                 }
                 if w.live() {

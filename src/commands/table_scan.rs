@@ -70,6 +70,7 @@ pub fn hscan_reply<A: Memory>(
 /// cursor, then the members of the page that match `pattern`, each followed
 /// by its score (as Redis writes it, a bulk string under RESP3 too) unless
 /// `no_scores`.
+#[allow(dead_code)] // the large form pages itself (`SortedSetInner::scan_page`)
 pub fn zscan_reply<A: Memory>(
     set: &CollectionTable<Scores, A>,
     cursor: u64,
