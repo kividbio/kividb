@@ -723,10 +723,11 @@ impl<'q> Scoring<'q> {
                     _ => self.aggregate(Kind::Union, children),
                 }
             }
-            Filter::Numeric { .. } | Filter::NumericNot { .. } | Filter::VectorRange { .. } => {
-                super::filter::eval(filter, fields)
-                    .then(|| Res::leaf(Kind::Numeric, self.numeric_value(), Vec::new()))
-            }
+            Filter::Numeric { .. }
+            | Filter::NumericNot { .. }
+            | Filter::Geo { .. }
+            | Filter::VectorRange { .. } => super::filter::eval(filter, fields)
+                .then(|| Res::leaf(Kind::Numeric, self.numeric_value(), Vec::new())),
             Filter::Not(inner) => match self.node(def, postings, text, inner, doc, fields) {
                 Some(_) => None,
                 None if super::filter::eval(inner, fields) => None,

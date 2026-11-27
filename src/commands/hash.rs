@@ -55,6 +55,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Now update any matching vector indexes — outside the shard lock
             crate::vector::maybe_index_pairs(
                 ctx.index_store,
+                ctx.store,
                 *ctx.selected_db,
                 key,
                 pairs,
@@ -186,6 +187,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             crate::vector::maybe_index_pairs(
                 ctx.index_store,
+                ctx.store,
                 *ctx.selected_db,
                 key,
                 pairs,
@@ -2687,6 +2689,7 @@ fn run_hsetex(ctx: &mut Ctx) -> Option<Vec<u8>> {
     } else {
         crate::vector::maybe_index_pairs(
             ctx.index_store,
+            ctx.store,
             db,
             &key,
             pairs,
