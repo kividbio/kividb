@@ -1621,8 +1621,12 @@ fn meet_the_newcomer(nodes: &[Node], gate: Option<&SaveGate>) -> String {
                 .any(|l| l.contains(&address) && l.contains("handshake")),
             "{shown}"
         );
+        // Every save held, not the first alone: a save that is synced
+        // without the lock reaches the failpoint beside another, and one
+        // left held would keep node 0 from showing the new node.
         gate.set_hold(|_| false);
-        gate.release(&held);
+        drop(held);
+        gate.release_all();
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -1947,8 +1951,23 @@ impl SaveGate {
 
     /// Let the save held at `failpoint` go on.
     fn release(&self, failpoint: &std::path::Path) {
+        // The file first, and only then off the list: once it is off the
+        // list the gate's thread may take the file away itself (when `hold`
+        // has changed since), so it may be gone already.
+        match std::fs::remove_file(failpoint) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("removing {}: {e}", failpoint.display()),
+        }
         self.held.lock().retain(|p| p != failpoint);
-        std::fs::remove_file(failpoint).unwrap();
+    }
+
+    /// Let every save held go on.
+    fn release_all(&self) {
+        let held: Vec<PathBuf> = self.held.lock().clone();
+        for failpoint in held {
+            self.release(&failpoint);
+        }
     }
 
     fn finish(mut self) {
