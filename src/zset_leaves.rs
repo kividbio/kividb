@@ -57,9 +57,12 @@ const CAP: usize = 32;
 /// No leaf.
 const NIL: u32 = u32::MAX;
 
+/// `used` and `offs` first: a lookup by slot reads the block's first line
+/// (slots are taken lowest first) and then the entry.
 #[repr(C)]
 struct Leaf {
     used: u64,
+    offs: [u16; SLOTS],
     prev: u32,
     next: u32,
     top: u16,
@@ -67,7 +70,6 @@ struct Leaf {
     len: u8,
     _pad: u8,
     order: [u8; SLOTS],
-    offs: [u16; SLOTS],
     heap: [u8; HEAP],
 }
 
