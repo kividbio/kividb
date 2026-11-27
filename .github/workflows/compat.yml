@@ -32,6 +32,8 @@ jobs:
       OUT: ${{ github.workspace }}/compat-results
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # the harnesses run code fetched from other projects; nothing here pushes
 
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
         with:
@@ -131,6 +133,25 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: benchmarks/ci/run-harness.sh ratelimit-scripts
+
+      # Open WebUI's Valkey vector store, as shipped (#1039). Redis is not Valkey and fails every
+      # check, so the first step holds KiviDB to its kividb-passes.txt; the second runs the same
+      # checks against valkey-bundle, which must pass them all.
+      - name: open-webui-valkey
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh open-webui-valkey
+
+      - name: open-webui-valkey control
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/open-webui-valkey-compat/control.sh "$WORK/open-webui-valkey"
+
+      # What the KiviDB operator's metrics sidecar (redis_exporter) reports, against Redis's.
+      - name: redis-exporter
+        if: ${{ !cancelled() }}
+        timeout-minutes: 5
+        run: benchmarks/ci/run-harness.sh redis-exporter
 
       - name: Keep the results
         if: ${{ !cancelled() }}

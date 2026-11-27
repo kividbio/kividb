@@ -71,6 +71,12 @@
 //! classes included. Its classes are 8 bytes apart up to 64 (an 11-byte
 //! entry takes 16, a 20-byte one 24), then as the keyspace's, and its
 //! blocks are aligned to 8.
+//!
+//! **Chunks and group arrays.** [`chunk_class_of`]'s classes use the same
+//! nonmoving slabs as the entry pool. For power-of-two block sizes from
+//! 64 through [`CHUNK_MAX_BLOCK`], [`alloc`] guarantees 64-byte alignment:
+//! slab starts and block strides are multiples of 64, including reused
+//! blocks. Collection group arrays rely on this stronger alignment.
 
 use std::cell::{Cell, UnsafeCell};
 use std::ptr::{self, NonNull};
@@ -129,9 +135,22 @@ pub const POOL_MAX_BLOCK: usize = 4096;
 /// to 64, 16 apart to 512, 32 apart to 2 KiB and 64 apart to 4 KiB
 /// (8 + 28 + 48 + 32).
 const POOL_CLASSES: usize = 116;
-/// Every class: the keyspace's, then the entry pool's.
-const ALL_CLASSES: usize = CLASSES + POOL_CLASSES;
-const _: () = assert!(block_size(ALL_CLASSES - 1) == POOL_MAX_BLOCK);
+/// The largest block of the list-chunk and collection-group-array classes
+/// ([`chunk_class_of`]): classes of their own, of the entry pool's kind
+/// (64 KiB slabs, never emptied by
+/// compaction, given back as soon as they are empty), numbered after the
+/// pool's: the pool's sizes up to 4 KiB, then 128 bytes apart. A chunk of 64
+/// elements of 64 bytes takes 4,224 bytes, of 100 bytes 6,528. Classes of
+/// their own keep chunks and group arrays apart from collection entries,
+/// as they come and go at different times.
+pub const CHUNK_MAX_BLOCK: usize = 8192;
+/// The chunks' classes: as many as the pool's, then those above 4 KiB.
+const CHUNK_CLASSES: usize = POOL_CLASSES + (CHUNK_MAX_BLOCK - POOL_MAX_BLOCK) / 128;
+/// Every class: the keyspace's, the entry pool's, then the chunks'.
+const ALL_CLASSES: usize = CLASSES + POOL_CLASSES + CHUNK_CLASSES;
+const _: () = assert!(block_size(CLASSES + POOL_CLASSES - 1) == POOL_MAX_BLOCK);
+const _: () = assert!(block_size(CLASSES + 2 * POOL_CLASSES - 1) == POOL_MAX_BLOCK);
+const _: () = assert!(block_size(ALL_CLASSES - 1) == CHUNK_MAX_BLOCK);
 // A slab's class is kept in two bytes.
 const _: () = assert!(ALL_CLASSES <= u16::MAX as usize);
 
@@ -396,6 +415,20 @@ pub fn pool_class_of(size: usize) -> Option<usize> {
     )
 }
 
+/// The class of a list chunk or group array's block of `size` bytes, if a slab holds it
+/// (see [`CHUNK_MAX_BLOCK`]): the size of the entry pool's class up to
+/// [`POOL_MAX_BLOCK`], then 128 bytes apart.
+#[inline]
+pub fn chunk_class_of(size: usize) -> Option<usize> {
+    if size <= POOL_MAX_BLOCK {
+        Some(pool_class_of(size)? + POOL_CLASSES)
+    } else if size <= CHUNK_MAX_BLOCK {
+        Some(CLASSES + 2 * POOL_CLASSES + (size - POOL_MAX_BLOCK - 1) / 128)
+    } else {
+        None
+    }
+}
+
 /// Each class's block size, looked up: on every block given and taken.
 const SIZES: [u16; ALL_CLASSES] = {
     let mut sizes = [0; ALL_CLASSES];
@@ -421,8 +454,14 @@ const fn size_of_class(class: usize) -> usize {
         } else if pool < 84 {
             // From 544 bytes to 2 KiB, the keyspace's classes from its 32nd.
             size_of_class(pool - 4)
-        } else {
+        } else if pool < POOL_CLASSES {
             2048 + (pool - 83) * 64
+        } else if pool < 2 * POOL_CLASSES {
+            // The chunks' classes (`chunk_class_of`): the pool's sizes...
+            size_of_class(class - POOL_CLASSES)
+        } else {
+            // ... then 128 bytes apart.
+            POOL_MAX_BLOCK + (pool - 2 * POOL_CLASSES + 1) * 128
         };
     }
     if class < 32 {
@@ -748,6 +787,8 @@ static NOBODY: u8 = 0;
 
 /// A block of class `class`'s size, aligned to sixteen bytes for the
 /// keyspace's classes and to eight for the entry pool's.
+/// Chunk classes with power-of-two block sizes from 64 through
+/// [`CHUNK_MAX_BLOCK`] guarantee 64-byte alignment as well.
 ///
 /// Must not panic (#358, #370): the active defrag thread lives on after a
 /// panic in a pass, with its own slabs, and allocates again. A panic here
@@ -1244,6 +1285,7 @@ fn reserve(size: usize) -> Option<usize> {
         // 1 MiB at a time, and under `enabled=always` the first write to a
         // region would take 2 MiB of RSS. A kernel without them refuses the
         // advice, and there is nothing to keep off.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         libc::madvise(aligned as *mut libc::c_void, size, libc::MADV_NOHUGEPAGE);
     }
     Some(aligned)
@@ -1696,6 +1738,13 @@ pub(crate) fn evacuating_slabs() -> usize {
         .sum()
 }
 
+/// For tests: whether the slab `block` is in is [`FULL`]: nobody's, too
+/// full to be listed for blocks, and in its class's list of full slabs.
+#[cfg(test)]
+pub(crate) fn is_full(block: *const u8) -> bool {
+    slab_of(block).state.load(Ordering::Acquire) == FULL
+}
+
 /// For tests: empty only the slab `block` is in, as [`plan_evacuation`]
 /// would, until the guard is dropped, panic or not. No other slab changes,
 /// and [`finish_evacuation`] does not see it. `None` unless nobody owns the
@@ -1901,6 +1950,29 @@ pub fn check_lists(quiescent: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Group arrays depend on this alignment for both fresh slab blocks
+    /// and blocks returned through a free list.
+    #[test]
+    fn power_of_two_chunk_blocks_are_cache_line_aligned() {
+        for bits in 6..=13 {
+            let size = 1 << bits;
+            let class = chunk_class_of(size).unwrap();
+            assert_eq!(block_size(class), size);
+            assert_eq!(slab_size(class) % 64, 0);
+            // Cross a slab boundary, then return and reuse the blocks.
+            let count = SLAB / size + 1;
+            for _ in 0..2 {
+                let blocks: Vec<_> = (0..count).map(|_| alloc(class)).collect();
+                for block in blocks {
+                    assert_eq!(block.as_ptr().addr() % 64, 0, "class size {size}");
+                    // SAFETY: this block was allocated in this class above
+                    // and is not used after the free.
+                    unsafe { free(block, class) };
+                }
+            }
+        }
+    }
 
     /// Up to 2 KiB, 16 and 32 bytes apart in 64 KiB slabs; above, in large
     /// slabs, each class a slab over a count of blocks, at most 2.5 % above

@@ -326,6 +326,15 @@ const NOT_MEMORY_OR_PERCENT: &str = "ERR argument must be a memory or percent va
 /// for a `server` of `redis` at 7.4 or later (#451).
 pub(crate) const REDIS_VERSION: &str = "8.10.0";
 
+/// The Valkey release whose search and hash commands this server answers:
+/// `INFO`'s `valkey_version`. Clients that take a server for Valkey read it
+/// (Open WebUI's Valkey vector store asks for 9.0.1 or later before it uses
+/// valkey-search's commands). It is 9.0.1, the lowest release those clients
+/// accept, and not valkey-bundle 9.2.0's: the hash field commands of Valkey 9
+/// and valkey-search 1.2's search commands are answered, not every command of
+/// 9.x (`COMMANDLOG`, `DELIFEQ`, `CLUSTER MIGRATESLOTS`).
+pub(crate) const VALKEY_VERSION: &str = "9.0.1";
+
 /// The reply to a script command in a build without Lua. Job queues such as
 /// BullMQ and Sidekiq show it to their users, so it names the build to use.
 #[cfg(not(feature = "lua"))]
@@ -396,29 +405,8 @@ fn warn_clamped(param: &str, asked: usize, kept: usize) {
 }
 
 /// A setting's own name, for one Redis also takes under an older one.
-fn config_name(name: &str) -> &str {
-    match name {
-        "cluster-slave-no-failover" => "cluster-replica-no-failover",
-        "slave-lazy-flush" => "replica-lazy-flush",
-        "slave-serve-stale-data" => "replica-serve-stale-data",
-        "slave-read-only" => "replica-read-only",
-        "slave-ignore-maxmemory" => "replica-ignore-maxmemory",
-        "slave-announce-ip" => "replica-announce-ip",
-        "cluster-slave-validity-factor" => "cluster-replica-validity-factor",
-        "list-max-ziplist-size" => "list-max-listpack-size",
-        "slave-priority" => "replica-priority",
-        "slave-announce-port" => "replica-announce-port",
-        "repl-ping-slave-period" => "repl-ping-replica-period",
-        "min-slaves-to-write" => "min-replicas-to-write",
-        "min-slaves-max-lag" => "min-replicas-max-lag",
-        "lua-time-limit" => "busy-reply-threshold",
-        "hash-max-ziplist-entries" => "hash-max-listpack-entries",
-        "zset-max-ziplist-entries" => "zset-max-listpack-entries",
-        "hash-max-ziplist-value" => "hash-max-listpack-value",
-        "zset-max-ziplist-value" => "zset-max-listpack-value",
-        "slaveof" => "replicaof",
-        other => other,
-    }
+pub(crate) fn config_name(name: &str) -> &str {
+    crate::config::setting_name(name)
 }
 
 /// `CONFIG SET appendonly yes` with the AOF off: the log made, and the
@@ -638,6 +626,8 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                         default_user.passwords = vec![crate::acl::sha256_hex(value)];
                     }
                 }
+                // As set, for `CONFIG REWRITE`: the store keeps a hash.
+                ctx.repl_state.set_requirepass(value);
                 Some(resp_simple("OK"))
             }
             "appendonly" => match value {
@@ -669,18 +659,26 @@ fn config_set_one(ctx: &mut Ctx, param: &str, value: &str) -> Vec<u8> {
                                      Valid values: debug, verbose, notice, warning, nothing",
                 )),
             },
-            // Taken with the command gate held alone (`run_command`): no
-            // command that went by the old setting is still running.
-            "lua-parallel-scripts" => match value.to_ascii_lowercase().as_str() {
+            "search-flat-int8" => match value.to_ascii_lowercase().as_str() {
                 "yes" => {
-                    crate::tag_locks::set_enabled(true);
+                    crate::vector::flat_int8::set_enabled(true);
                     Some(resp_simple("OK"))
                 }
                 "no" => {
-                    crate::tag_locks::set_enabled(false);
+                    crate::vector::flat_int8::set_enabled(false);
                     Some(resp_simple("OK"))
                 }
                 _ => Some(resp_error("ERR argument must be 'yes' or 'no'")),
+            },
+            // Taken with the command gate held alone (`run_command`). A
+            // script that read the old setting before the gate may still
+            // run: see `tag_locks::set_mode` for why that is safe.
+            "lua-parallel-scripts" => match crate::config::ParallelScripts::parse(value) {
+                Some(mode) => {
+                    crate::tag_locks::set_mode(mode);
+                    Some(resp_simple("OK"))
+                }
+                None => Some(resp_error("ERR argument must be 'yes', 'tags' or 'no'")),
             },
             "key-access-tracking" => match value.to_ascii_lowercase().as_str() {
                 "yes" => {
@@ -1666,6 +1664,17 @@ pub(crate) fn config_set_global(param: &str, value: &str) -> Option<Vec<u8>> {
                      - argument must be between 1 and 4 inclusive",
                 )),
             },
+            // The shape of the search commands' RESP3 replies.
+            "search-resp3-reply" => {
+                if crate::commands::search::set_resp3_reply(value) {
+                    Some(resp_simple("OK"))
+                } else {
+                    Some(resp_error(
+                        "ERR CONFIG SET failed (possibly related to argument 'search-resp3-reply') \
+                         - argument(s) must be one of the following: auto, redis, valkey",
+                    ))
+                }
+            }
             "search-on-timeout" => {
                 let policy = value.to_ascii_lowercase();
                 if matches!(
@@ -2204,85 +2213,9 @@ static REMEMBERED_CONFIG: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::BTreeMap<String, String>>,
 > = std::sync::LazyLock::new(|| {
     parking_lot::Mutex::new(
-        [
-            ("list-max-listpack-size", "-2"),
-            ("list-max-ziplist-size", "-2"),
-            ("list-compress-depth", "0"),
-            ("hll-sparse-max-bytes", "3000"),
-            ("proto-max-bulk-len", "536870912"),
-            ("client-query-buffer-limit", "1073741824"),
-            ("latency-tracking", "yes"),
-            ("latency-tracking-info-percentiles", "50 99 99.9"),
-            ("maxclients", "10000"),
-            ("maxmemory-clients", "0"),
-            // No save points: nothing is saved on a timer.
-            ("save", ""),
-            ("appendfsync", "everysec"),
-            // `DEL` frees what it deletes before it replies (#152).
-            ("lazyfree-lazy-user-del", "no"),
-            ("lazyfree-lazy-user-flush", "no"),
-            ("lazyfree-lazy-expire", "yes"),
-            ("lazyfree-lazy-server-del", "yes"),
-            ("close-on-replica-write", "yes"),
-            ("hz", "10"),
-            ("activerehashing", "yes"),
-            ("lazyfree-lazy-eviction", "no"),
-            ("timeout", "0"),
-            ("tcp-keepalive", "300"),
-            ("latency-monitor-threshold", "0"),
-            ("ts-duplicate-policy", "last"),
-            ("aof-ack-after-write", "yes"),
-            ("rdbcompression", "no"),
-        ]
-        .into_iter()
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .chain([
-            (
-                "set-max-intset-entries".to_string(),
-                crate::member_set::DEFAULT_INTSET_MAX.to_string(),
-            ),
-            (
-                "set-max-listpack-entries".to_string(),
-                crate::member_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "set-max-listpack-value".to_string(),
-                crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "hash-max-listpack-entries".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "hash-max-ziplist-entries".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "hash-max-listpack-value".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "hash-max-ziplist-value".to_string(),
-                crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "zset-max-listpack-entries".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "zset-max-ziplist-entries".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
-            ),
-            (
-                "zset-max-listpack-value".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-            (
-                "zset-max-ziplist-value".to_string(),
-                crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
-            ),
-        ])
-        .collect(),
+        crate::redis_settings::remembered_defaults()
+            .into_iter()
+            .collect(),
     )
 });
 
@@ -2304,6 +2237,24 @@ fn output_buffer_limits(ctx: &Ctx) -> String {
         },
     );
     limits.to_config_string()
+}
+
+/// [`config_rows`] with each secret's current value where `CONFIG GET`
+/// shows `**redacted**`: what `CONFIG REWRITE` writes, and what a `CONFIG
+/// SET` of several settings puts back when one of them is refused. Never a
+/// reply to a client.
+fn config_rows_with_secrets(ctx: &Ctx) -> Vec<(String, String)> {
+    let (_, master_auth) = ctx.repl_state.master_credentials();
+    let mut rows = config_rows(ctx);
+    for (name, value) in rows.iter_mut() {
+        match name.as_str() {
+            "requirepass" => *value = ctx.repl_state.requirepass(),
+            "masterauth" => value.clone_from(&master_auth),
+            "cluster-bus-secret" => value.clone_from(&ctx.config.cluster_bus_secret),
+            _ => {}
+        }
+    }
+    rows
 }
 
 /// Every setting `CONFIG GET` knows, with its value now: the ones that are
@@ -2476,13 +2427,17 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         ("tcp-backlog", "511".to_string()),
         ("lua-time-limit", lua_time_limit.clone()),
         (
-            "lua-parallel-scripts",
-            if crate::tag_locks::enabled() {
+            "search-flat-int8",
+            if crate::vector::flat_int8::enabled() {
                 "yes"
             } else {
                 "no"
             }
             .to_string(),
+        ),
+        (
+            "lua-parallel-scripts",
+            crate::tag_locks::mode().name().to_string(),
         ),
         ("busy-reply-threshold", lua_time_limit),
         (
@@ -2525,6 +2480,10 @@ fn config_rows(ctx: &Ctx) -> Vec<(String, String)> {
         (
             "search-on-timeout",
             crate::commands::search_tools::config_value("ON_TIMEOUT").to_ascii_lowercase(),
+        ),
+        (
+            "search-resp3-reply",
+            crate::commands::search::resp3_reply().to_string(),
         ),
         (
             "search-default-dialect",
@@ -4731,6 +4690,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 // The Redis release whose commands and replies this server
                 // follows. Clients read it to decide what they may send.
                 out.push_str(&format!("redis_version:{REDIS_VERSION}\r\n"));
+                out.push_str(&format!("valkey_version:{VALKEY_VERSION}\r\n"));
                 // There is no Redis build behind that version: these are
                 // the fields a Redis build fills in, for the clients and
                 // tools that read them.
@@ -5708,10 +5668,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     // it would be alone, in order; if one is refused, the
                     // ones before it are put back to what they were.
                     let before = if settings.len() > 1 {
-                        config_rows(ctx)
+                        config_rows_with_secrets(ctx)
                     } else {
                         Vec::new()
                     };
+                    // `requirepass` is put back exactly: the default user's
+                    // passwords as they were (`ACL SETUSER default >...`
+                    // may have given it several), and the text kept for
+                    // `CONFIG REWRITE`.
+                    let auth_before = (settings.len() > 1).then(|| {
+                        let user = ctx
+                            .acl_store
+                            .read()
+                            .get("default")
+                            .map(|u| (u.nopass, u.passwords.clone()));
+                        (user, ctx.repl_state.requirepass())
+                    });
                     for (i, (param, value)) in settings.iter().enumerate() {
                         let mut reply = config_set_one(ctx, param, value);
                         // Redis's own reply to a setting it does not know
@@ -5734,6 +5706,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                             }
                             for (param, _) in &settings[..i] {
                                 match before.iter().find(|(known, _)| known == param) {
+                                    Some(_) if param == "requirepass" => {}
                                     Some((_, old)) => {
                                         config_set_one(ctx, param, old);
                                     }
@@ -5741,6 +5714,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                         REMEMBERED_CONFIG.lock().remove(param);
                                     }
                                 }
+                            }
+                            if let Some((user, text)) = auth_before.as_ref()
+                                && settings[..i].iter().any(|(p, _)| p == "requirepass")
+                            {
+                                if let Some((nopass, passwords)) = user
+                                    && let Some(default) = ctx.acl_store.write().get_mut("default")
+                                {
+                                    default.nopass = *nopass;
+                                    default.passwords.clone_from(passwords);
+                                }
+                                ctx.repl_state.set_requirepass(text);
                             }
                             return Some(reply);
                         }
@@ -5779,7 +5763,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 "REWRITE" => {
                     use crate::config::RewriteError;
-                    match ctx.config.with_values(&config_rows(ctx)).rewrite_to_disk() {
+                    let rows = config_rows_with_secrets(ctx);
+                    let mut config = ctx.config.with_values(&rows);
+                    config.users = crate::acl::config_lines(ctx.acl_store, &config.requirepass);
+                    match config.rewrite_with(&rows) {
                         Ok(()) => Some(resp_simple("OK")),
                         Err(RewriteError::NoConfigFile) => Some(resp_error(
                             "ERR The server is running without a config file",
@@ -5792,6 +5779,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Err(RewriteError::Io(e)) => {
                             Some(resp_error(&format!("ERR Rewriting config file: {e}")))
                         }
+                        Err(RewriteError::DirectorySync(e)) => Some(resp_error(&format!(
+                            "ERR Rewriting config file: the file was replaced, but its \
+                             directory could not be synced: {e}"
+                        ))),
                     }
                 }
                 "HELP" => Some(help(
@@ -6718,6 +6709,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     match field.as_str() {
                         "LIB-NAME" => {
                             ctx.client_registry.update(ctx.client_id, |info| {
+                                info.glide = crate::client_registry::is_glide_lib_name(&value);
                                 info.lib_name = value;
                             });
                             Some(resp_simple("OK"))

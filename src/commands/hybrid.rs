@@ -41,13 +41,6 @@ use crate::resp::write::{
 use crate::vector::score::Scorer;
 use crate::vector::{DistanceMetric, FieldType, KnnResult, LiveIndex, VectorAlgo};
 
-/// The protocol a reply is written in: a script's own (`redis.setresp`)
-/// inside one, the client's otherwise.
-#[inline]
-fn reply_resp(ctx: &Ctx) -> u8 {
-    crate::commands::handler::effective_resp_for_reply(ctx)
-}
-
 // ── Parsed command ──────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
@@ -751,6 +744,17 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
     if crate::cluster::search::coordinates(ctx) {
         return Err("ERR FT.HYBRID is not supported across a cluster's masters yet".into());
     }
+    // The index is looked for before the rest is read, as Redis does: a
+    // command for an index that is not there says so, whatever it says after.
+    // The name is looked up as it is written, so that bytes that are not text
+    // name no index.
+    let given = ctx.cmd.get(1).copied();
+    if let Some(given) = given {
+        let name = String::from_utf8_lossy(given);
+        if ctx.index_store.read().get(name.as_ref()).is_none() {
+            return Err(crate::commands::search::no_such_index(&name));
+        }
+    }
     let q = parse(&ctx.cmd)?;
     let scorer = match &q.scorer {
         Some(name) => scorer_named(name)?,
@@ -918,16 +922,22 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
         return Err("SEARCH_TIMEOUT Timeout limit was reached".into());
     }
     let total = rows.len();
+    // valkey-search's reply: the count, then each row as RESP2 lays it out.
+    let (resp, valkey) = crate::commands::search::search_shape(ctx);
     let shown = shown_fields(&q);
     let grouped = q.tail.iter().any(|a| is(a, "GROUPBY"));
     let results: Vec<Vec<u8>> = rows
         .into_iter()
         .skip(q.limit_offset)
         .take(q.limit_count)
-        .map(|row| row_reply(&row, &shown, grouped, load_all, reply_resp(ctx)))
+        .map(|row| row_reply(&row, &shown, grouped, load_all, resp, valkey))
         .collect();
+    if valkey {
+        let mut reply = vec![resp_integer(total as i64)];
+        reply.extend(results);
+        return Ok(resp_array(reply));
+    }
 
-    let resp = reply_resp(ctx);
     let millis = started.elapsed().as_secs_f64() * 1000.0;
     let execution_time = if resp == 3 {
         resp_double_resp3(millis)
@@ -1022,6 +1032,7 @@ fn row_reply(
     grouped: bool,
     load_all: bool,
     resp: u8,
+    valkey: bool,
 ) -> Vec<u8> {
     let mut pairs: Vec<(&str, &str)> = Vec::new();
     if grouped {
@@ -1054,7 +1065,7 @@ fn row_reply(
             } else {
                 crate::commands::aggregate_pipeline::value_reply(value, resp)
             };
-            [resp_bulk_str(name), value]
+            [crate::commands::search::reply_name(name, valkey), value]
         })
         .collect();
     resp_map_for(resp, encoded)

@@ -23,6 +23,10 @@ fn key_value_pairs<'a>(cmd: &[&'a [u8]]) -> Vec<(&'a [u8], &'a [u8])> {
         .collect()
 }
 
+fn strict_i64(raw: &[u8]) -> Option<i64> {
+    crate::commands::login::strict_integer(raw)
+}
+
 /// The shards a command's keys are in, each once, in the order they stand
 /// in the database.
 ///
@@ -318,14 +322,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // GET: capture old value before any mutation (nil if absent/wrong-type)
             let old_val: Option<SharedBytes> = if want_get {
                 match existing {
-                    Some(ValueRef::String(v)) => Some(v.to_shared()),
+                    Some(ValueRef::String(v)) => {
+                        crate::stats::record_hit();
+                        Some(v.to_shared())
+                    }
                     Some(_) => {
+                        crate::stats::record_hit();
                         // Redis returns WRONGTYPE if GET is used on a non-string key
                         return Some(resp_error(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
                         ));
                     }
-                    None => None,
+                    None => {
+                        crate::stats::record_miss();
+                        None
+                    }
                 }
             } else {
                 None
@@ -473,7 +484,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     resp_bulk(&v)
                 }
                 store::Lookup::Live(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     resp_error("WRONGTYPE Operation against a key holding the wrong kind of value")
                 }
                 store::Lookup::Absent => {
@@ -561,13 +572,17 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let key: &[u8] = k;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
+                    crate::stats::record_miss();
                     continue;
                 }
                 let shard = store::get_shard(db, key);
                 let map = read_lock!(shard);
 
                 if map.contains_key(key) {
+                    crate::stats::record_hit();
                     count += 1;
+                } else {
+                    crate::stats::record_miss();
                 }
             }
 
@@ -588,30 +603,19 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             let next = match map.get(key) {
                 None => 1i64,
-                Some(ValueRef::String(v)) => {
-                    let s = match std::str::from_utf8(v.as_ref()) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            return Some(resp_error("ERR value is not an integer or out of range"));
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
+                    // At i64::MAX it wrapped to i64::MIN, or panicked in a
+                    // debug build (#124).
+                    Some(n) => match n.checked_add(1) {
+                        Some(n) => n,
+                        None => {
+                            return Some(resp_error("ERR increment or decrement would overflow"));
                         }
-                    };
-
-                    match s.parse::<i64>() {
-                        // At i64::MAX it wrapped to i64::MIN, or panicked in a
-                        // debug build (#124).
-                        Ok(n) => match n.checked_add(1) {
-                            Some(n) => n,
-                            None => {
-                                return Some(resp_error(
-                                    "ERR increment or decrement would overflow",
-                                ));
-                            }
-                        },
-                        Err(_) => {
-                            return Some(resp_error("ERR value is not an integer or out of range"));
-                        }
+                    },
+                    None => {
+                        return Some(resp_error("ERR value is not an integer or out of range"));
                     }
-                }
+                },
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
@@ -635,24 +639,35 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(0));
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                Some(ValueRef::String(v)) => Some(resp_integer(v.len() as i64)),
-                Some(_) => Some(resp_error(
-                    "WRONGTYPE Operation against a key holding the wrong kind of value",
-                )),
-                None => Some(resp_integer(0)),
+                Some(ValueRef::String(v)) => {
+                    crate::stats::record_hit();
+                    Some(resp_integer(v.len() as i64))
+                }
+                Some(_) => {
+                    crate::stats::record_hit();
+                    Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ))
+                }
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_integer(0))
+                }
             }
         }
 
         // ── APPEND ────────────────────────────────────────────────────────────────────
         // Appends bytes to the existing string, creating it if absent.
-        // Returns the new length. Because Arc<[u8]> is immutable, we must allocate
-        // a new buffer with the concatenated bytes — this is the only way.
+        // Returns the new length. Written where the string is kept when
+        // nothing but its key holds it, a long one in a block with room to
+        // spare for the next appends; else copied once (`append_str`).
         "APPEND" => {
             if cmd.len() != 3 {
                 return Some(resp_error(
@@ -667,34 +682,22 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // At the end of the string, in its own entry, when it has room.
-            if let Some(len) = map.append_in_place(key, suffix) {
-                drop(map);
-                notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
-                return Some(resp_integer(len as i64));
+            // As Redis: a string does not grow past 512 MB.
+            match map.append_str(key, suffix, MAX_STRING_LEN) {
+                Ok((len, written)) => {
+                    drop(map);
+                    // The entry it replaced, if any, freed unlocked.
+                    drop(written);
+                    notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
+                    Some(resp_integer(len as i64))
+                }
+                Err(store::AppendRefused::TooLong) => Some(resp_error(
+                    "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+                )),
+                Err(store::AppendRefused::WrongType) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
-            let new_val: SharedBytes = match map.get(key) {
-                None => SharedBytes::from(*suffix),
-                Some(ValueRef::String(existing)) => {
-                    // As Redis: a string does not grow past 512 MB.
-                    if existing.len() + suffix.len() > MAX_STRING_LEN {
-                        return Some(resp_error(
-                            "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
-                        ));
-                    }
-                    SharedBytes::concat(&[&existing, suffix])
-                }
-                Some(_) => {
-                    return Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ));
-                }
-            };
-            let len = new_val.len() as i64;
-            map.insert(key, KiviDBValue::String(new_val));
-            drop(map);
-            notify(ctx.pubsub, *ctx.selected_db, KS_STRING, "append", key);
-            Some(resp_integer(len))
         }
 
         // ── GETDEL ────────────────────────────────────────────────────────────────────
@@ -737,7 +740,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
                 store::Removal::Kept => {
                     drop(map);
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -773,7 +776,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     resp_bulk(&v)
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ));
@@ -904,6 +907,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         crate::stats::record_hit();
                         resp_bulk(v.as_bytes())
                     }
+                    Some(store::Lookup::Live(_)) => {
+                        crate::stats::record_hit();
+                        nil.clone()
+                    }
                     _ => {
                         crate::stats::record_miss();
                         nil.clone()
@@ -957,7 +964,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let delta: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -967,10 +974,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Check overflow properly
             let next = match map.get(key) {
                 None => delta,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_add(delta) {
                         Some(result) => result,
                         None => {
@@ -1005,10 +1009,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let mut map = write_lock!(shard);
             let next = match map.get(key) {
                 None => -1i64,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_sub(1) {
                         Some(r) => r,
                         None => {
@@ -1036,7 +1037,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let delta: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let delta: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -1044,11 +1045,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
             let next = match map.get(key) {
-                None => -delta,
-                Some(ValueRef::String(v)) => match std::str::from_utf8(&v)
-                    .ok()
-                    .and_then(|s| s.parse::<i64>().ok())
-                {
+                None => match delta.checked_neg() {
+                    Some(n) => n,
+                    None => return Some(resp_error("ERR decrement would overflow")),
+                },
+                Some(ValueRef::String(v)) => match strict_i64(v.as_bytes()) {
                     Some(n) => match n.checked_sub(delta) {
                         Some(r) => r,
                         None => {
@@ -1137,24 +1138,29 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match strict_i64(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            let end: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let end: i64 = match strict_i64(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_bulk(b""));
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                None => Some(resp_bulk(b"")),
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_bulk(b""))
+                }
                 Some(ValueRef::String(_)) if start < 0 && end < 0 && start > end => {
+                    crate::stats::record_hit();
                     Some(resp_bulk(b""))
                 }
                 Some(ValueRef::String(v)) => {
@@ -1170,16 +1176,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     } else {
                         end.min(len - 1)
                     } as usize;
+                    crate::stats::record_hit();
                     if s > e || len == 0 {
-                        crate::stats::record_miss();
                         Some(resp_bulk(b""))
                     } else {
-                        crate::stats::record_hit();
                         Some(resp_bulk(&v[s..=e]))
                     }
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -1190,6 +1195,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
         // ── SETRANGE ──────────────────────────────────────────────────────────────────
         // Overwrites bytes at a given offset, zero-padding if needed.
         // Creates the key if it doesn't exist (treats it as empty string).
+        // Written where the string is kept when nothing else holds it and its
+        // block has room; otherwise copied once (`edit_str_in_place`). A
+        // string written from its end on grows as an `APPEND` grows it
+        // (`append_after`).
         "SETRANGE" => {
             if cmd.len() != 4 {
                 return Some(resp_error(
@@ -1197,7 +1206,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let offset: usize = match parse_utf8(cmd[2]).and_then(|s| s.parse::<i64>().ok()) {
+            let offset: usize = match strict_i64(cmd[2]) {
                 Some(n) if n >= 0 => n as usize,
                 Some(_) => return Some(resp_error("ERR offset is out of range")),
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
@@ -1221,36 +1230,59 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let mut map = write_lock!(shard);
-            // In the string's own entry, when it has room.
-            if !patch.is_empty()
-                && let Some(len) = map.set_range_in_place(key, offset, patch)
-            {
-                return Some(resp_integer(len as i64));
-            }
-            let existing: Vec<u8> = match map.get(key) {
-                None => vec![],
-                Some(ValueRef::String(v)) => v.to_vec(), // copy into owned Vec to mutate
+            let (len, found) = match map.get(key) {
+                None => (0, false),
+                Some(ValueRef::String(v)) => (v.len(), true),
                 Some(_) => {
                     return Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ));
                 }
             };
-            // Nothing to write: the string is as it was, and a key that
-            // was not there is not created.
+            // Nothing to write: the string is as it was, and a key that was
+            // not there is not created. Checked here because the helpers
+            // grow the string to `offset` even for an empty patch. Not a
+            // write, as in Redis: nothing propagated or counted, and no
+            // `WATCH` broken.
             if patch.is_empty() {
-                return Some(resp_integer(existing.len() as i64));
+                ctx.skip_write_side_effects = true;
+                return Some(resp_integer(len as i64));
             }
-            let required_len = offset + patch.len();
-            let mut buf = existing;
-            if buf.len() < required_len {
-                buf.resize(required_len, 0u8); // zero-pad
-            }
-            buf[offset..offset + patch.len()].copy_from_slice(patch);
-            let new_len = buf.len() as i64;
-            drop(map.set_str(key, buf.as_slice()));
+            let (new_len, written) = if found && offset >= len {
+                // From its end on, the string grows as an `APPEND` grows it:
+                // in the room its block keeps, else its block grown, or
+                // copied once if something else holds it, with room for the
+                // next. A key made here is made at its length, and a patch
+                // that starts inside the string is an edit.
+                match map.append_after(key, offset - len, patch, MAX_STRING_LEN) {
+                    Ok(grown) => grown,
+                    // Neither is reached: the key is a string under this
+                    // lock, and the length was checked above.
+                    Err(store::AppendRefused::TooLong) => {
+                        return Some(resp_error(
+                            "ERR string exceeds maximum allowed size (proto-max-bulk-len)",
+                        ));
+                    }
+                    Err(store::AppendRefused::WrongType) => {
+                        return Some(resp_error(
+                            "WRONGTYPE Operation against a key holding the wrong kind of value",
+                        ));
+                    }
+                }
+            } else {
+                let Some(written) = map.edit_str_in_place(key, offset, patch) else {
+                    // Not reached: the key was a string or absent under this
+                    // lock, and the length was checked above.
+                    return Some(resp_error(
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    ));
+                };
+                (len.max(offset + patch.len()), written)
+            };
             drop(map);
-            Some(resp_integer(new_len))
+            // A copied string's old entry is freed with the shard unlocked.
+            drop(written);
+            Some(resp_integer(new_len as i64))
         }
 
         // ── GETEX ─────────────────────────────────────────────────────────────────────
@@ -1313,7 +1345,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         Some(v.to_shared())
                     }
                     Some(_) => {
-                        crate::stats::record_miss();
+                        crate::stats::record_hit();
                         return Some(resp_error(
                             "WRONGTYPE Operation against a key holding the wrong kind of value",
                         ));
@@ -1427,20 +1459,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Fetch both values under their respective shard read locks.
             // We read key1 first, drop lock, then read key2. This avoids holding
             // two shard locks simultaneously (deadlock risk if same shard).
+            // Both keys are looked up (and counted) before either's type
+            // is refused, as Redis does.
+            let mut wrong_type = false;
             let s1: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key1) {
                     expire_on_read(ctx.store, *ctx.selected_db, key1);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key1);
                     let map = read_lock!(shard);
-                    match map.get(key1) {
+                    let found = map.get(key1);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
@@ -1450,22 +1487,29 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let s2: SharedBytes = {
                 if is_expired(ctx.store, *ctx.selected_db, key2) {
                     expire_on_read(ctx.store, *ctx.selected_db, key2);
+                    crate::stats::record_miss();
                     SharedBytes::from(&[][..])
                 } else {
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key2);
                     let map = read_lock!(shard);
-                    match map.get(key2) {
+                    let found = map.get(key2);
+                    crate::stats::record_lookup(found.is_some());
+                    match found {
                         Some(ValueRef::String(v)) => v.to_shared(),
                         Some(_) => {
-                            return Some(resp_error(
-                                "WRONGTYPE Operation against a key holding the wrong kind of value",
-                            ));
+                            wrong_type = true;
+                            SharedBytes::from(&[][..])
                         }
                         None => SharedBytes::from(&[][..]),
                     }
                 }
             };
+            if wrong_type {
+                return Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
 
             // ── LCS DP core ──────────────────────────────────────────────────────────
             // Standard O(N*M) DP. We use a flat Vec<u32> as the DP table to avoid
@@ -1631,12 +1675,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
-            match map.get(key) {
+            let found = map.get(key);
+            crate::stats::record_lookup(found.is_some());
+            match found {
                 None => Some(resp_null_bulk()),
                 Some(ValueRef::String(v)) => {
                     let hex = value_digest(&v);
@@ -1910,7 +1957,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         let next = cmd.get(i + 1).copied();
         match (tok.as_str(), next) {
             ("BYINT", Some(raw)) if !mode_set => {
-                incr_int = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+                incr_int = match strict_i64(raw) {
                     Some(v) => v,
                     None => return resp_error("ERR Increment is not an integer or out of range"),
                 };
@@ -1969,11 +2016,9 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Int => {
             let bound = |raw: Option<&[u8]>, default: i64, what: &str| match raw {
                 None => Ok(default),
-                Some(raw) => parse_utf8(raw)
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .ok_or_else(|| {
-                        resp_error(&format!("ERR {what} is not an integer or out of range"))
-                    }),
+                Some(raw) => strict_i64(raw).ok_or_else(|| {
+                    resp_error(&format!("ERR {what} is not an integer or out of range"))
+                }),
             };
             let l = match bound(lbound_raw, i64::MIN, "LBOUND") {
                 Ok(v) => v,
@@ -2018,7 +2063,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         None if persist => IncrexExpiry::Persist,
         None => IncrexExpiry::Keep,
         Some((unit, raw)) => {
-            let n: i64 = match parse_utf8(raw).and_then(|s| s.parse().ok()) {
+            let n: i64 = match strict_i64(raw) {
                 Some(v) => v,
                 None => return resp_error(ERR_VALUE_NOT_INTEGER),
             };
@@ -2067,7 +2112,7 @@ fn cmd_increx(ctx: &mut Ctx) -> Vec<u8> {
         IncrexMode::Int => {
             let current: i64 = match existing {
                 None => 0,
-                Some(v) => match std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()) {
+                Some(v) => match strict_i64(v) {
                     Some(n) => n,
                     None => return resp_error(ERR_VALUE_NOT_INTEGER),
                 },
@@ -2348,5 +2393,598 @@ mod write_shards_tests {
         for writer in writers {
             writer.join().unwrap();
         }
+    }
+}
+
+#[cfg(test)]
+mod setrange_tests {
+    use super::*;
+    use crate::commands::bitmap::tests::{
+        Holder, SIZES, SMALL, alone, counting, dispatched, in_entry, put, stored, with_ctx,
+    };
+    use std::sync::Arc;
+
+    /// `line`, split at spaces (a trailing space is an empty patch), run by
+    /// the strings handler on `store`'s database 0: the reply, whether the
+    /// write is left unpropagated, and the most the handler allocated at
+    /// once, if this thread counts it.
+    fn run(store: &store::Store, line: &str) -> (Vec<u8>, bool, Option<isize>) {
+        with_ctx(store, line, &crate::watch::NoopWatchRegistry, |mut ctx| {
+            let name = line.split(' ').next().unwrap();
+            let (reply, peak) = crate::memory_use::peak_during(|| handle(&mut ctx, name));
+            (reply.unwrap(), ctx.skip_write_side_effects, peak)
+        })
+    }
+
+    /// [`run`] in a test that counts allocations (see `counting`).
+    fn counted(store: &store::Store, line: &str) -> (Vec<u8>, bool, isize) {
+        let (reply, skipped, peak) = run(store, line);
+        (
+            reply,
+            skipped,
+            peak.expect("a thread that counts its allocations"),
+        )
+    }
+
+    /// `len` bytes that differ from their neighbours.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    const WRONGTYPE: &[u8] = b"-WRONGTYPE";
+
+    /// A patch inside a string nothing else holds is written where the
+    /// string is, at every size up to 64 MiB: no copy, and the reply is the
+    /// length.
+    #[test]
+    fn a_setrange_inside_a_string_nothing_else_holds_copies_nothing() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_inside_a_string_nothing_else_holds_copies_nothing",
+            || {
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    for offset in [0, len / 2, len - 3] {
+                        let line = format!("SETRANGE k {offset} abc");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!((reply, skipped), (resp_integer(len as i64), false));
+                        assert!(peak < SMALL, "{len} {offset}: {peak} bytes");
+                        value[offset..offset + 3].copy_from_slice(b"abc");
+                        assert_eq!(stored(&store, b"k"), Some((value.clone(), at)), "{len}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// Held by a snapshot (the entry) or a reply (the bytes), the string is
+    /// copied once and the holder keeps the bytes it held; bytes in the
+    /// entry that a reply copied out are not held, and stay in place.
+    #[test]
+    fn a_setrange_of_a_held_string_copies_it_once_and_the_holder_keeps_its_bytes() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_of_a_held_string_copies_it_once_and_the_holder_keeps_its_bytes",
+            || {
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let inline = in_entry(&store, b"k");
+                    let holders = [Holder::Nothing, Holder::Entry, Holder::Bytes];
+                    for (holder, offset) in holders.into_iter().zip([0, 2, 4]) {
+                        let (old, at) = stored(&store, b"k").unwrap();
+                        let shard = store::get_shard(&store[0], b"k");
+                        let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                        let bytes =
+                            (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                                Some(ValueRef::String(b)) => b.to_shared(),
+                                _ => panic!("no string"),
+                            });
+                        let line = format!("SETRANGE k {offset} zz");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        let case = format!("{len} {holder:?}");
+                        assert_eq!(
+                            (reply, skipped),
+                            (resp_integer(len as i64), false),
+                            "{case}"
+                        );
+                        value[offset..offset + 2].copy_from_slice(b"zz");
+                        let (now, moved_to) = stored(&store, b"k").unwrap();
+                        assert_eq!(now, value, "{case}");
+                        let copied = holder == Holder::Entry || holder == Holder::Bytes && !inline;
+                        assert_eq!(moved_to != at, copied, "{case}");
+                        if copied {
+                            // One copy, not a copy to change and then another to store.
+                            let most = (len + len / 2) as isize + SMALL;
+                            assert!(peak >= len as isize && peak < most, "{case}: {peak}");
+                        } else {
+                            assert!(peak < SMALL, "{case}: {peak} bytes");
+                        }
+                        if let Some(Some(entry)) = &entry {
+                            assert!(
+                                matches!(entry.value(), ValueRef::String(b) if b[..] == old[..]),
+                                "{case}"
+                            );
+                        }
+                        if let Some(bytes) = &bytes {
+                            assert_eq!(bytes[..], old[..], "{case}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// Growth stays where the string is while its block keeps its class,
+    /// the gap zero-filled. A patch that starts inside the string and runs
+    /// past its block copies it once into a new block; one from its end on
+    /// grows a block of the system allocator's as an `APPEND` does, by a
+    /// quarter (moved only if the allocator must), not copied.
+    #[test]
+    fn a_setrange_grows_in_place_only_within_its_block() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_grows_in_place_only_within_its_block",
+            || {
+                let slab = |len: usize| crate::value_slab::class_of(len + 8);
+                let top = crate::value_slab::block_size(slab(16 << 10).unwrap()) - 8;
+                assert!(top > (16 << 10) + 2, "no room in the class");
+                // "k" and 110 bytes make a 123-byte entry, in the class of 113
+                // to 128, as 100 bytes do; 120 bytes pass it.
+                for (len, end, stays) in [
+                    (100, 110, true),
+                    (100, 120, false),
+                    (16 << 10, top, true),
+                    (top, top + 1, false),
+                    (64 << 10, (64 << 10) + 1, false),
+                    (64 << 10, (64 << 10) + 10, false),
+                    (1 << 20, (1 << 20) + 10, false),
+                ] {
+                    let store = store::new_store(1);
+                    let mut value = pattern(len);
+                    put(&store, b"k", &value);
+                    let (_, at) = stored(&store, b"k").unwrap();
+                    let line = format!("SETRANGE k {} ab", end - 2);
+                    let (reply, skipped, peak) = counted(&store, &line);
+                    assert_eq!((reply, skipped), (resp_integer(end as i64), false), "{len}");
+                    value.resize(end - 2, 0);
+                    value.extend_from_slice(b"ab");
+                    let (now, moved_to) = stored(&store, b"k").unwrap();
+                    assert_eq!(now, value, "{len}");
+                    let from_end = end - 2 >= len;
+                    if stays {
+                        assert_eq!(moved_to, at, "{len}");
+                        assert!(peak < SMALL, "{len}: {peak} bytes");
+                    } else if from_end && slab(len).is_none() {
+                        // The block grown by its room: no copy allocated.
+                        let most = (end / 4 + 2) as isize + SMALL;
+                        assert!(peak < most, "{len} to {end}: {peak}");
+                    } else {
+                        assert_ne!(moved_to, at, "{len}");
+                        let most = (end + end / 2) as isize + SMALL;
+                        assert!(peak >= len as isize && peak < most, "{len}: {peak}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// An empty patch writes nothing and copies nothing: the reply is the
+    /// length, a missing key is not made, a string does not grow to the
+    /// offset (however far), and another type is refused. It is not a
+    /// write: nothing is propagated or counted.
+    #[test]
+    fn an_empty_setrange_writes_nothing_and_copies_nothing() {
+        counting(
+            "commands::strings::setrange_tests::an_empty_setrange_writes_nothing_and_copies_nothing",
+            || {
+                let store = store::new_store(1);
+                for line in [
+                    "SETRANGE m 10 ",
+                    "SETRANGE m 0 ",
+                    "SETRANGE m 1099511627776 ",
+                ] {
+                    let (reply, skipped, peak) = counted(&store, line);
+                    assert_eq!((reply, skipped), (resp_integer(0), true), "{line}");
+                    assert!(peak < SMALL, "{line}: {peak} bytes");
+                    assert_eq!(stored(&store, b"m"), None, "{line}");
+                }
+                for len in SIZES.into_iter().chain([64 << 20]) {
+                    let value = pattern(len);
+                    put(&store, b"k", &value);
+                    let was = stored(&store, b"k");
+                    for offset in [0, len / 2, len + 10, 1 << 40] {
+                        let line = format!("SETRANGE k {offset} ");
+                        let (reply, skipped, peak) = counted(&store, &line);
+                        assert_eq!((reply, skipped), (resp_integer(len as i64), true));
+                        assert!(peak < SMALL, "{len} {offset}: {peak} bytes");
+                        assert_eq!(stored(&store, b"k"), was, "{len} {offset}");
+                    }
+                }
+                let set = crate::member_set::MemberSet::new();
+                let set = KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
+                drop(store::get_shard(&store[0], b"s").write().insert(b"s", set));
+                let (reply, _, _) = counted(&store, "SETRANGE s 0 ");
+                assert!(reply.starts_with(WRONGTYPE), "{reply:?}");
+            },
+        );
+    }
+
+    /// A key's time to live stays, in place or copied; a key past it is
+    /// written as a new one, zero-filled to the offset, without one.
+    /// Another type, a length past 512 MB and a bad offset are refused, and
+    /// leave everything as it was.
+    #[test]
+    fn setrange_keeps_a_time_to_live_and_refuses_what_it_cannot_write() {
+        let store = store::new_store(1);
+        let later = crate::commands::helpers::now_ms() + 3_600_000;
+        for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+            let key = name.as_bytes();
+            let shard = store::get_shard(&store[0], key);
+            drop(
+                shard
+                    .write()
+                    .insert_str_expiring(key, pattern(len), Some(later)),
+            );
+            let at = stored(&store, key).unwrap().1;
+            assert_eq!(
+                run(&store, &format!("SETRANGE {name} 0 a")).0,
+                resp_integer(len as i64)
+            );
+            assert_eq!(stored(&store, key).unwrap().1, at, "{name}: in place");
+            let held = shard.read().get_ref(key);
+            let line = format!("SETRANGE {name} {} b", len + 1);
+            assert_eq!(run(&store, &line).0, resp_integer(len as i64 + 2));
+            drop(held);
+            assert_ne!(stored(&store, key).unwrap().1, at, "{name}: copied");
+            assert_eq!(shard.read().expires(key), Some(later), "{name}");
+            let mut want = pattern(len);
+            want[0] = b'a';
+            want.extend_from_slice(b"\0b");
+            assert_eq!(stored(&store, key).unwrap().0, want, "{name}");
+        }
+        let shard = store::get_shard(&store[0], b"past");
+        drop(shard.write().insert_str_expiring(b"past", b"abc", Some(1)));
+        assert_eq!(run(&store, "SETRANGE past 2 x").0, resp_integer(3));
+        assert_eq!(stored(&store, b"past").unwrap().0, b"\0\0x");
+        assert_eq!(shard.read().expires(b"past"), None);
+
+        let set = crate::member_set::MemberSet::new();
+        let set = KiviDBValue::Set(Arc::new(parking_lot::RwLock::new(set)));
+        drop(
+            store::get_shard(&store[0], b"set")
+                .write()
+                .insert(b"set", set),
+        );
+        assert!(run(&store, "SETRANGE set 0 x").0.starts_with(WRONGTYPE));
+        let map = store::get_shard(&store[0], b"set").read();
+        assert!(matches!(map.get(b"set"), Some(ValueRef::Set(_))));
+        drop(map);
+
+        put(&store, b"k", b"abc");
+        for (line, error) in [
+            (
+                "SETRANGE k 536870912 x",
+                "-ERR string exceeds maximum allowed size",
+            ),
+            (
+                "SETRANGE k 536870911 xy",
+                "-ERR string exceeds maximum allowed size",
+            ),
+            ("SETRANGE k -1 x", "-ERR offset is out of range"),
+            (
+                "SETRANGE k x x",
+                "-ERR value is not an integer or out of range",
+            ),
+        ] {
+            let reply = run(&store, line).0;
+            assert!(reply.starts_with(error.as_bytes()), "{line}: {reply:?}");
+        }
+        assert_eq!(stored(&store, b"k").unwrap().0, b"abc");
+    }
+
+    /// Through the dispatcher, a `SETRANGE` written in place breaks a
+    /// `WATCH` on its key and announces `setrange`, as one that copies a
+    /// held string does. An empty one breaks no watch and announces
+    /// nothing. Alone: the event flags are the process's.
+    #[test]
+    fn a_setrange_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::strings::setrange_tests::a_setrange_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                for (name, len) in [("inline", 100), ("slab", 16 << 10), ("own", 64 << 10)] {
+                    let key = name.as_bytes();
+                    put(&store, key, &pattern(len));
+                    let mut want = pattern(len);
+                    for (offset, patch, held) in [(0, "ab", false), (2, "cd", true), (4, "", false)]
+                    {
+                        let shard = store::get_shard(&store[0], key);
+                        let held = held.then(|| shard.read().get_ref(key));
+                        let at = stored(&store, key).unwrap().1;
+                        let broken = Arc::new(AtomicBool::new(false));
+                        watches.watch(0, key, Arc::clone(&broken), false);
+                        events::hold();
+                        let line = format!("SETRANGE {name} {offset} {patch}");
+                        let reply = dispatched(&store, &line, &watches);
+                        let announced = events::release();
+                        let case = format!("{line:?}, held: {}", held.is_some());
+                        assert_eq!(reply, resp_integer(len as i64), "{case}");
+                        want[offset..offset + patch.len()].copy_from_slice(patch.as_bytes());
+                        let (now, moved_to) = stored(&store, key).unwrap();
+                        assert_eq!(now, want, "{case}");
+                        assert_eq!(moved_to == at, held.is_none(), "{case}");
+                        let breaks = !patch.is_empty();
+                        assert_eq!(broken.load(Relaxed), breaks, "{case}: the watch");
+                        let want_events: Vec<(Vec<u8>, Arc<[u8]>)> = if patch.is_empty() {
+                            vec![]
+                        } else {
+                            let mut space = b"__keyspace@0__:".to_vec();
+                            space.extend_from_slice(key);
+                            let event = b"__keyevent@0__:setrange".to_vec();
+                            vec![
+                                (space, Arc::from(&b"setrange"[..])),
+                                (event, Arc::from(key)),
+                            ]
+                        };
+                        assert_eq!(announced, want_events, "{case}: the events");
+                        drop(held);
+                    }
+                }
+            },
+        );
+    }
+
+    /// A capture of the dataset (what `BGSAVE`, a full sync, an AOF rewrite
+    /// and `BACKUP` write out) holds each string's entry: `SETRANGE`s after
+    /// it change the live value only, and the image has the bytes from
+    /// before.
+    #[test]
+    fn a_capture_keeps_the_bytes_from_before_a_setrange() {
+        let store = store::new_store(1);
+        let keys = ["inline", "slab", "own"];
+        let lens = [100, 16 << 10, 1 << 20];
+        for (key, len) in keys.into_iter().zip(lens) {
+            put(&store, key.as_bytes(), &pattern(len));
+        }
+        let frozen = crate::snapshot::freeze_dataset(&store, None).unwrap();
+        for (key, len) in keys.into_iter().zip(lens) {
+            let at = stored(&store, key.as_bytes()).unwrap().1;
+            // The first copies the string; the second finds it unheld.
+            for line in [
+                format!("SETRANGE {key} 0 zz"),
+                format!("SETRANGE {key} 4 yy"),
+            ] {
+                assert_eq!(run(&store, &line).0, resp_integer(len as i64), "{line}");
+            }
+            let (now, moved_to) = stored(&store, key.as_bytes()).unwrap();
+            assert_ne!(moved_to, at, "{key}");
+            assert_eq!(&now[..6], &[b'z', b'z', 2, 3, b'y', b'y'], "{key}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dump.kdb");
+        let path = path.to_str().unwrap();
+        frozen.write_file(path).unwrap();
+        let loaded = crate::snapshot::load_snapshot(path).unwrap();
+        for (key, len) in keys.into_iter().zip(lens) {
+            match loaded.dbs[0].get(&store::Key::from(key)) {
+                Some(KiviDBValue::String(b)) => assert!(b[..] == pattern(len)[..], "{key}"),
+                _ => panic!("{key} not in the image"),
+            }
+        }
+    }
+
+    /// Through the dispatcher, a `SETRANGE` that grows a string from its
+    /// end (by growing its block, in its room, or copied from a holder)
+    /// breaks a `WATCH` on its key and announces `setrange`, and the holder
+    /// keeps the bytes it held. Alone: the event flags are the process's.
+    #[test]
+    fn a_setrange_grown_from_the_end_breaks_a_watch_and_announces_itself() {
+        alone(
+            "commands::strings::setrange_tests::a_setrange_grown_from_the_end_breaks_a_watch_and_announces_itself",
+            || {
+                use crate::keyspace_events as events;
+                use crate::watch::WatchNotifier;
+                use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+                events::KS_FLAGS.store(events::parse_ks_flags("KE$"), Relaxed);
+                let store = store::new_store(1);
+                let watches = crate::watch::WatchRegistryInner::new();
+                let len = 64 << 10;
+                put(&store, b"k", &pattern(len));
+                let mut want = pattern(len);
+                for (gap, held) in [(5, false), (0, false), (3, true)] {
+                    let shard = store::get_shard(&store[0], b"k");
+                    let held = held.then(|| shard.read().get_ref(b"k"));
+                    let before = want.clone();
+                    let broken = Arc::new(AtomicBool::new(false));
+                    watches.watch(0, b"k", Arc::clone(&broken), false);
+                    events::hold();
+                    let offset = want.len() + gap;
+                    let line = format!("SETRANGE k {offset} ab");
+                    let reply = dispatched(&store, &line, &watches);
+                    let announced = events::release();
+                    want.resize(offset, 0);
+                    want.extend_from_slice(b"ab");
+                    let case = format!("{line:?}, held: {}", held.is_some());
+                    assert_eq!(reply, resp_integer(want.len() as i64), "{case}");
+                    assert_eq!(stored(&store, b"k").unwrap().0, want, "{case}");
+                    assert!(broken.load(Relaxed), "{case}: the watch");
+                    let want_events: Vec<(Vec<u8>, Arc<[u8]>)> = vec![
+                        (b"__keyspace@0__:k".to_vec(), Arc::from(&b"setrange"[..])),
+                        (b"__keyevent@0__:setrange".to_vec(), Arc::from(&b"k"[..])),
+                    ];
+                    assert_eq!(announced, want_events, "{case}: the events");
+                    if let Some(Some(entry)) = &held {
+                        let kept =
+                            matches!(entry.value(), ValueRef::String(b) if b[..] == before[..]);
+                        assert!(kept, "{case}: the holder's bytes");
+                    }
+                }
+            },
+        );
+    }
+
+    /// How many of the calls that grow a string from `from` to `to` bytes
+    /// may allocate when growth leaves a quarter more room each time (as
+    /// `shared_bytes::room_for_append` does under 64 MiB): one per growth
+    /// of the block.
+    fn growths(from: usize, to: usize) -> usize {
+        ((to as f64 / from as f64).ln() / 1.25f64.ln()).ceil() as usize + 1
+    }
+
+    /// `SETRANGE`s from the end of a string with a block of its own grow it
+    /// as `APPEND`s do: a call that allocates grows the block by a quarter
+    /// (the allocator moves it if it must), and the calls after it write in
+    /// that room. No call allocates a second whole copy, and a gap before
+    /// the patch is zero-filled.
+    #[test]
+    fn setranges_from_the_end_of_a_large_string_grow_it_in_its_room() {
+        counting(
+            "commands::strings::setrange_tests::setranges_from_the_end_of_a_large_string_grow_it_in_its_room",
+            || {
+                for len in [64 << 10, 1 << 20, 64 << 20] {
+                    for gap in [0, 4095] {
+                        let store = store::new_store(1);
+                        let mut value = pattern(len);
+                        put(&store, b"k", &value);
+                        let mut allocating = 0;
+                        for _ in 0..100 {
+                            let offset = value.len() + gap;
+                            let line = format!("SETRANGE k {offset} x");
+                            let (reply, skipped, peak) = counted(&store, &line);
+                            value.resize(offset, 0);
+                            value.push(b'x');
+                            let case = format!("{len} +{gap}");
+                            assert_eq!(
+                                (reply, skipped),
+                                (resp_integer(value.len() as i64), false),
+                                "{case}"
+                            );
+                            if peak >= SMALL {
+                                allocating += 1;
+                                // The block grown by its room, not copied.
+                                let most = value.len() / 4 + gap + 1;
+                                assert!(peak < most as isize + SMALL, "{case}: {peak}");
+                            }
+                        }
+                        let most = growths(len, value.len());
+                        assert!(allocating <= most, "{len} +{gap}: {allocating} > {most}");
+                        assert_eq!(stored(&store, b"k").unwrap().0, value, "{len} +{gap}");
+                    }
+                }
+            },
+        );
+    }
+
+    /// Held by a snapshot (the entry) or a reply (the bytes), a string a
+    /// `SETRANGE` grows from its end is copied once, into a block with
+    /// room, and the holder keeps the bytes it held; the growths after it
+    /// write in that room while the holder still holds the old bytes.
+    /// Alone: it holds over 300 MB at once, more than the process's count
+    /// may move by while `memory_use`'s tests run beside it.
+    #[test]
+    fn a_held_string_grown_from_its_end_is_copied_once() {
+        alone(
+            "commands::strings::setrange_tests::a_held_string_grown_from_its_end_is_copied_once",
+            || {
+                for len in [64 << 10, 64 << 20] {
+                    for holder in [Holder::Entry, Holder::Bytes] {
+                        let store = store::new_store(1);
+                        let mut value = pattern(len);
+                        put(&store, b"k", &value);
+                        let shard = store::get_shard(&store[0], b"k");
+                        let entry = (holder == Holder::Entry).then(|| shard.read().get_ref(b"k"));
+                        let bytes =
+                            (holder == Holder::Bytes).then(|| match shard.read().get(b"k") {
+                                Some(ValueRef::String(b)) => b.to_shared(),
+                                _ => panic!("no string"),
+                            });
+                        let case = format!("{len} {holder:?}");
+                        let mut peaks = vec![];
+                        for _ in 0..10 {
+                            let line = format!("SETRANGE k {} ab", value.len());
+                            let (reply, _, peak) = counted(&store, &line);
+                            value.extend_from_slice(b"ab");
+                            assert_eq!(reply, resp_integer(value.len() as i64), "{case}");
+                            peaks.push(peak);
+                        }
+                        // One copy, with an append's room: a quarter more.
+                        let most = (len + len / 4) as isize + 64 + SMALL;
+                        assert!(
+                            peaks[0] >= len as isize && peaks[0] < most,
+                            "{case}: {peaks:?}"
+                        );
+                        assert!(peaks[1..].iter().all(|&p| p < SMALL), "{case}: {peaks:?}");
+                        assert_eq!(stored(&store, b"k").unwrap().0, value, "{case}");
+                        if let Some(Some(entry)) = &entry {
+                            let kept = matches!(entry.value(), ValueRef::String(b) if b[..] == pattern(len)[..]);
+                            assert!(kept, "{case}");
+                        }
+                        if let Some(bytes) = &bytes {
+                            assert!(bytes[..] == pattern(len)[..], "{case}");
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    /// A `SETRANGE` that makes its key allocates the string at its length,
+    /// as Redis's `sdsnewlen` does: no room is kept for growth nobody asked
+    /// for.
+    #[test]
+    fn a_setrange_on_a_missing_key_keeps_no_room() {
+        counting(
+            "commands::strings::setrange_tests::a_setrange_on_a_missing_key_keeps_no_room",
+            || {
+                for offset in [64 << 10, 64 << 20] {
+                    let store = store::new_store(1);
+                    // The table made first: only the string is counted.
+                    put(&store, b"other", b"v");
+                    let line = format!("SETRANGE m {offset} x");
+                    let (reply, _, peak) = counted(&store, &line);
+                    assert_eq!(reply, resp_integer(offset as i64 + 1));
+                    assert!(
+                        peak >= offset as isize && peak < offset as isize + SMALL,
+                        "{offset}: {peak}"
+                    );
+                }
+            },
+        );
+    }
+
+    /// A key's time to live stays across growth from the end, in the room
+    /// and copied from a holder.
+    #[test]
+    fn a_setrange_grown_from_the_end_keeps_the_time_to_live() {
+        let store = store::new_store(1);
+        let later = crate::commands::helpers::now_ms() + 3_600_000;
+        let len = 1 << 20;
+        let shard = store::get_shard(&store[0], b"k");
+        drop(
+            shard
+                .write()
+                .insert_str_expiring(b"k", pattern(len), Some(later)),
+        );
+        let held = shard.read().get_ref(b"k");
+        assert_eq!(
+            run(&store, &format!("SETRANGE k {len} a")).0,
+            resp_integer(len as i64 + 1)
+        );
+        drop(held);
+        assert_eq!(
+            run(&store, &format!("SETRANGE k {} b", len + 5)).0,
+            resp_integer(len as i64 + 6)
+        );
+        assert_eq!(shard.read().expires(b"k"), Some(later));
+        let mut want = pattern(len);
+        want.extend_from_slice(b"a\0\0\0\0b");
+        assert_eq!(stored(&store, b"k").unwrap().0, want);
     }
 }

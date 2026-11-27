@@ -1774,6 +1774,92 @@ fn what_a_capture_lays_out_is_not_counted_as_it_is_made() {
     assert_eq!(c.cmd(&["LLEN", "big"]).i(), 300_000);
 }
 
+/// The document order section of a snapshot (an index's documents' keys,
+/// first written first) is laid out after the capture, as it is written:
+/// what it holds, the numbers and ids copied at the capture and the list
+/// of keys it sorts, is counted as not to be evicted for while it is, and
+/// given back once it is written (`snapshot-order-section` holds the save
+/// with the list made).
+#[test]
+fn the_document_order_a_save_lays_out_is_not_counted() {
+    let dir = tempfile::tempdir().unwrap().keep();
+    let server = Server::start_in_env(
+        dir,
+        &[],
+        &[("KIVIDB_TEST_FAILPOINTS", "snapshot-order-section")],
+    );
+    let mut c = server.conn();
+    c.cmd(&[
+        "FT.CREATE",
+        "ix",
+        "ON",
+        "HASH",
+        "PREFIX",
+        "1",
+        "d:",
+        "SCHEMA",
+        "t",
+        "NUMERIC",
+        "SORTABLE",
+    ]);
+    const DOCS: i64 = 200_000;
+    for batch in 0..DOCS / 1000 {
+        let mut buf = Vec::new();
+        for i in 0..1000 {
+            let key = format!("d:{}", batch * 1000 + i);
+            buf.extend_from_slice(
+                format!(
+                    "*4\r\n$4\r\nHSET\r\n${}\r\n{key}\r\n$1\r\nt\r\n$1\r\n5\r\n",
+                    key.len()
+                )
+                .as_bytes(),
+            );
+        }
+        c.writer.write_all(&buf).unwrap();
+        for _ in 0..1000 {
+            c.read();
+        }
+    }
+    assert_eq!(c.not_counted(), 0);
+    let before = c.used_memory() - c.not_counted();
+
+    assert_eq!(c.cmd(&["BGSAVE"]).s(), "Background saving started");
+    let held = server.dir.join("failpoint.snapshot-order-section.1");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !held.exists() {
+        assert!(Instant::now() < deadline, "no save reached {held:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Deleted meanwhile: the save keeps their keys, and counts them.
+    for i in 0..1000 {
+        c.cmd(&["DEL", &format!("d:{i}")]);
+    }
+    let used = c.used_memory();
+    let not_counted = c.not_counted();
+    // At least the sorted list: a number and a key's pointer a document.
+    assert!(
+        not_counted >= DOCS * 24,
+        "{not_counted} bytes not counted while the order section is written"
+    );
+    assert!(
+        used - not_counted < before + 2 * MB,
+        "counted {} bytes while the order section is written, {before} before",
+        used - not_counted
+    );
+    std::fs::remove_file(held).unwrap();
+    c.wait_for("persistence", "rdb_bgsave_in_progress", "0");
+    assert_eq!(c.info("persistence", "rdb_last_bgsave_status"), "ok");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while c.not_counted() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} bytes are still not counted",
+            c.not_counted()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The sorted sets of `feeds` of 800 members each (Mastodon's home feeds,
 /// #825).
 fn load_feeds(c: &mut Conn, feeds: std::ops::Range<usize>) {
@@ -2131,6 +2217,16 @@ impl Conn {
     }
 }
 
+/// The bytes of `args` as a client sends them, a RESP array of bulk strings.
+fn resp_len(args: &[&str]) -> usize {
+    let header = |n: usize| 1 + n.to_string().len() + 2;
+    header(args.len())
+        + args
+            .iter()
+            .map(|a| header(a.len()) + a.len() + 2)
+            .sum::<usize>()
+}
+
 /// Connections made and served before a test holds a thread of the server:
 /// one made while it is held may wait to be accepted.
 fn ready_conns(server: &Server, n: usize) -> Vec<Conn> {
@@ -2259,7 +2355,8 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
     for i in 0..200 {
         assert!(c.cmd(&["SET", &format!("user:{i}"), &value]).ok());
     }
-    let conns = ready_conns(&server, 10);
+    const WRITERS: usize = 10;
+    let conns = ready_conns(&server, WRITERS);
     let before = c.counted_less_clients();
     let limit = c.used_memory() - 2 * MB;
     let lowered = lower_limit(&server, &mut c, limit);
@@ -2288,7 +2385,12 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
         .collect();
     let mut peak = 0;
     while writes.iter().any(|w| !w.is_finished()) {
-        peak = peak.max(c.counted_less_clients());
+        // Two readings, the smaller kept: `INFO` reads `used_memory` before
+        // it totals the clients' buffers, and a buffer that shrinks, or a
+        // request that starts running, in between reads high once. A key
+        // let in stays, and shows in both.
+        let reading = c.counted_less_clients().min(c.counted_less_clients());
+        peak = peak.max(reading);
         std::thread::sleep(Duration::from_millis(5));
     }
     let refused: i32 = writes.into_iter().map(|w| w.join().unwrap()).sum();
@@ -2296,13 +2398,25 @@ fn volatile_writes_while_the_last_volatile_key_is_being_freed_are_refused() {
     // Those that came while the list was still being freed, at least: what
     // came after it was freed found room.
     assert!(refused > 0, "no write was refused");
-    // Not a key without a time to live let in over the limit: memory use,
-    // less the writes on their way in (ten of 8 KB at once, now that they
-    // all come while the list is being freed), no higher than before the
-    // writes, and a write's worth.
+    // Not a key without a time to live let in over the limit: memory use
+    // no higher than before the writes, the writes on their way in and a
+    // write's worth. On their way in: each writer's request while it runs,
+    // which the clients' buffers do not count then (a connection counts
+    // what is left in its buffer after the command it is running), and
+    // which all ten have at once while the list is being freed. A write's
+    // worth: a request's bytes, as a key let in would hold them.
+    let request = resp_len(&[
+        "SET",
+        &format!("sess:{}:49", WRITERS - 1),
+        &value,
+        "EX",
+        "100000",
+    ]) as i64;
+    let allowed = (WRITERS as i64 + 1) * request;
     assert!(
-        peak <= before + 64 * KB,
-        "{peak} counted at most, {before} before the writes"
+        peak <= before + allowed,
+        "{peak} counted at most, {before} before the writes: {} over, {allowed} allowed",
+        peak - before
     );
 }
 

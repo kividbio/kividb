@@ -192,10 +192,33 @@ fn type_name(value: &Value) -> &'static str {
 
 /// Run `f` on the document at `key`. A key that does not exist is `missing`.
 fn read_doc(ctx: &Ctx, key: &[u8], missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
+    look_at_doc(ctx, key, true, missing, f)
+}
+
+/// [`read_doc`] for a command that writes and looks first (`JSON.DEL`,
+/// `JSON.MERGE`): not counted in `keyspace_hits` / `keyspace_misses`, which
+/// count reads.
+fn peek_doc(ctx: &Ctx, key: &[u8], missing: Vec<u8>, f: impl FnOnce(&Value) -> Vec<u8>) -> Vec<u8> {
+    look_at_doc(ctx, key, false, missing, f)
+}
+
+/// The document at `key` handed to `f`; a read counted (`counted`) as Redis
+/// counts one: a hit when the key is there, whatever its type.
+fn look_at_doc(
+    ctx: &Ctx,
+    key: &[u8],
+    counted: bool,
+    missing: Vec<u8>,
+    f: impl FnOnce(&Value) -> Vec<u8>,
+) -> Vec<u8> {
     let db = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db, key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    if counted {
+        crate::stats::record_lookup(found.is_some());
+    }
+    match found {
         Some(ValueRef::Json(tree)) => f(&tree.read()),
         Some(_) => resp_error(WRONG_KEY_TYPE),
         None => missing,
@@ -1073,7 +1096,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let key: &[u8] = key;
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
-                    let Some(ValueRef::Json(tree)) = map.get(key) else {
+                    let found = map.get(key);
+                    crate::stats::record_lookup(found.is_some());
+                    let Some(ValueRef::Json(tree)) = found else {
                         return resp_null_for(resp);
                     };
                     let root = tree.read();
@@ -1102,7 +1127,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             if !query.selects() {
                 return Some(resp_error(NOT_A_SELECTION));
             }
-            let is_json = read_doc(ctx, key, Vec::new(), |_| b"+".to_vec());
+            let is_json = peek_doc(ctx, key, Vec::new(), |_| b"+".to_vec());
             if is_json != b"+" {
                 // Missing (nothing deleted) or of another type (an error).
                 return Some(if is_json.is_empty() {
@@ -1485,7 +1510,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(resp_error(NOT_A_SELECTION));
             }
             if query.is_root() {
-                let exists = read_doc(ctx, key, Vec::new(), |_| b"+".to_vec());
+                let exists = peek_doc(ctx, key, Vec::new(), |_| b"+".to_vec());
                 if exists.is_empty() {
                     // A new document is the patch applied to nothing.
                     let mut document = Value::Null;

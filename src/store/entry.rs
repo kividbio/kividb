@@ -58,9 +58,9 @@
 //! spans two counts of cache lines (its sizes are within one 16- or
 //! 32-byte step, and lines are 64 bytes), and above, where a class is up
 //! to 2.5 % of its size, the hint is past the 8 lines asked for ahead
-//! ([`PREFETCH_LINES`]). A SET over a string of its own writes its block
-//! in place the same way (`SharedBytes::write_in_place`), the entry left
-//! as it is.
+//! ([`PREFETCH_LINES`]). A SET or SETBIT over a string of its own writes
+//! its block in place the same way (`SharedBytes::write_in_place`,
+//! `write_at_in_place`), the entry left as it is.
 //!
 //! **The access word is the exception.** When a key was last used, or how
 //! often (Redis's `robj.lru`), is written in place with the shard locked
@@ -379,7 +379,8 @@ impl Entry {
         let klen = self.klen();
         if self.form() == INLINE {
             let vlen = self.header().vlen as usize;
-            // SAFETY: `vlen` bytes follow the key, never written again.
+            // SAFETY: `vlen` bytes follow the key, written again only in
+            // place: with the shard locked for writing, and no other hold.
             let bytes = unsafe {
                 std::slice::from_raw_parts(
                     self.base().add(key_at(klen, self.has_ttl()) + klen),
@@ -572,26 +573,127 @@ impl Entry {
         }
     }
 
-    /// `patch` written over the inline string from `offset`, which may be
-    /// past its end: the gap is filled with zero bytes. The string grows to
-    /// reach the patch's end, and never shrinks.
+    /// `patch` written over the string from `offset`, which may be past its
+    /// end: the gap is filled with zero bytes. The string grows to reach the
+    /// patch's end, and never shrinks. In this block, or in the string's own.
     ///
     /// # Safety
     /// As [`Entry::write_in_place`], for the string's length after it:
-    /// `fits_in_place(max(len, offset + patch.len()))`.
+    /// `fits_in_place(max(len, offset + patch.len()))`. `patch` is not in the
+    /// block written.
     pub(super) unsafe fn write_at_in_place(self, offset: usize, patch: &[u8]) {
+        if self.form() == WHOLE {
+            // SAFETY: as this function's.
+            return unsafe { self.write_own_at_in_place(offset, patch) };
+        }
         let vlen = self.header().vlen as usize;
         let len = vlen.max(offset + patch.len());
         debug_assert!(self.fits_in_place(len));
         // SAFETY: as in `write_in_place`.
         unsafe {
             let at = (self.0.as_ptr() as *mut u8).add(self.inline_at());
-            if offset > vlen {
-                std::ptr::write_bytes(at.add(vlen), 0, offset - vlen);
-            }
-            std::ptr::copy_nonoverlapping(patch.as_ptr(), at.add(offset), patch.len());
+            crate::shared_bytes::write_at(at, vlen, offset, patch);
             self.set_vlen(len);
         }
+    }
+
+    /// [`write_at_in_place`](Self::write_at_in_place) of a [`WHOLE`]
+    /// entry's string of its own.
+    ///
+    /// # Safety
+    /// As `write_at_in_place`'s.
+    #[inline(never)]
+    unsafe fn write_own_at_in_place(self, offset: usize, patch: &[u8]) {
+        if let KiviDBValue::String(b) = self.whole() {
+            // SAFETY: as in `write_own_in_place`.
+            unsafe { b.write_at_in_place(offset, patch) };
+        }
+    }
+
+    /// A new entry for the string `old` with `patch` written from `offset`,
+    /// as [`write_at_in_place`](Self::write_at_in_place) leaves it: `old` is
+    /// copied once, into the entry if the result fits, else into bytes of
+    /// its own.
+    pub(super) fn string_written_at(
+        key: &[u8],
+        old: &[u8],
+        offset: usize,
+        patch: &[u8],
+        expires: Option<u64>,
+    ) -> Entry {
+        let klen = key.len();
+        let ttl = expires.is_some();
+        let len = old.len().max(offset.saturating_add(patch.len()));
+        if !fits_inline(klen, len, ttl) {
+            let bytes = SharedBytes::written_at(old, offset, patch);
+            return Self::new(key, KiviDBValue::String(bytes), expires);
+        }
+        let at = Self::begin(key, inline_size(klen, len, ttl), INLINE, len, expires);
+        // SAFETY: the block has room for `len` bytes after the key, and
+        // nothing else has it yet; `old` and `write_at` initialize them all.
+        unsafe {
+            let to = (at.as_ptr() as *mut u8).add(key_at(klen, ttl) + klen);
+            std::ptr::copy_nonoverlapping(old.as_ptr(), to, old.len());
+            crate::shared_bytes::write_at(to, old.len(), offset, patch);
+        }
+        Entry(at)
+    }
+
+    /// A new entry for the string `old` with `gap` zero bytes and then
+    /// `extra` after it: copied once, into the entry if it fits, else into
+    /// bytes of their own with the room an append leaves
+    /// (`SharedBytes::appended`).
+    pub(super) fn string_appended(
+        key: &[u8],
+        old: &[u8],
+        gap: usize,
+        extra: &[u8],
+        expires: Option<u64>,
+    ) -> Entry {
+        let len = old.len().saturating_add(gap).saturating_add(extra.len());
+        if fits_inline(key.len(), len, expires.is_some()) {
+            return Self::string_written_at(key, old, old.len() + gap, extra, expires);
+        }
+        let bytes = SharedBytes::appended(old, gap, extra);
+        Self::new(key, KiviDBValue::String(bytes), expires)
+    }
+
+    /// `gap` zero bytes and then `extra` added to the end of the string of
+    /// its own this entry holds, if the table's is the only hold of the
+    /// entry and the entry the only holder of the bytes: in their block, or
+    /// in the block `SharedBytes::append` grows or makes for them (the
+    /// entry stays where it is, its value pointing to the bytes wherever
+    /// they are). Returns whether it was, and if so whether the bytes
+    /// stayed where they were; `None` leaves everything as it was.
+    ///
+    /// # Safety
+    /// The caller holds the shard for writing, the table holds the entry,
+    /// and the string's length after it is at most `shared_bytes::MAX_LEN`.
+    pub(super) unsafe fn append_own(self, gap: usize, extra: &[u8]) -> Option<bool> {
+        // Both counts read through the shared view first: on the copy path
+        // (`None`) no `&mut` to the value is ever made, while the caller
+        // still borrows its bytes.
+        if self.form() != WHOLE || self.holders() != 1 {
+            return None;
+        }
+        // Every new holder of the bytes starts from one that exists, and
+        // this entry is the only one: none can start before this ends.
+        if !matches!(self.whole(), KiviDBValue::String(bytes) if bytes.is_unique()) {
+            return None;
+        }
+        // SAFETY: the only hold is the table's and the shard is locked for
+        // writing: nothing else reads the value, or can reach it, while it
+        // changes (as in `relocate`).
+        let value = unsafe {
+            &mut *(self.base().add(whole_at(self.klen(), self.has_ttl())) as *mut KiviDBValue)
+        };
+        let KiviDBValue::String(bytes) = value else {
+            unreachable!("a string, as read just above")
+        };
+        // SAFETY: the bytes' only holder, out of everybody else's reach, and
+        // nothing keeps their address: a reply copies them, and whatever
+        // keeps them holds them.
+        Some(unsafe { bytes.append(gap, extra) })
     }
 
     /// # Safety

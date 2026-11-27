@@ -1010,12 +1010,15 @@ fn eviction_counts_the_blocks() {
     );
     let pairs = members(10, "member");
     // What a set adds, over 2,000 of them, against what MEMORY USAGE says
-    // of one.
-    let before: i64 = c.info("memory", "used_memory").parse().unwrap();
+    // of one. Both readings are taken once `used_memory` has settled: the
+    // connections the harness opened to see the server up are closed, and
+    // each gives back its buffers (some 170 KB) when the server gets to see
+    // it closed, which on a busy machine can be after the first reading.
+    let before = settled_used(&mut c);
     for i in 0..2000 {
         c.zadd(&format!("probe{i}"), &pairs);
     }
-    let after: i64 = c.info("memory", "used_memory").parse().unwrap();
+    let after = settled_used(&mut c);
     let added = (after - before) / 2000;
     assert_eq!(c.encoding("probe7"), "listpack");
     let each = c.cmd(&["MEMORY", "USAGE", "probe7"]).int();
@@ -1204,11 +1207,39 @@ fn settled_usage(c: &mut Conn, key: &str) -> i64 {
     last
 }
 
+/// `used_memory` once it has stopped changing for a second: what a closed
+/// connection held is given back when the server sees it closed, and a
+/// reading taken before that counts it.
+fn settled_used(c: &mut Conn) -> i64 {
+    let read = |c: &mut Conn| -> i64 { c.info("memory", "used_memory").parse().unwrap() };
+    let mut last = read(c);
+    let mut same = 0;
+    for _ in 0..3000 {
+        thread::sleep(Duration::from_millis(20));
+        let now = read(c);
+        same = if now == last { same + 1 } else { 0 };
+        if same == 50 {
+            break;
+        }
+        last = now;
+    }
+    last
+}
+
 /// Within 5 % of each other (each table has its own random seed, so its
 /// overflow groups differ a little).
 fn about(got: i64, want: i64, what: &str) {
     assert!(
         (got - want).abs() * 100 <= want * 5,
+        "{what}: {got} bytes, against {want}"
+    );
+}
+
+/// At most 5 % over: a set built whole has its index's nodes full, so it can
+/// take less than the same members added one `ZADD` at a time.
+fn at_most(got: i64, want: i64, what: &str) {
+    assert!(
+        (got - want) * 100 <= want * 5,
         "{what}: {got} bytes, against {want}"
     );
 }
@@ -1246,7 +1277,9 @@ fn a_sorted_set_is_sized_for_its_members_not_its_arguments() {
     assert_eq!(c.cmd(&args).int(), 1);
     assert_eq!(c.encoding("one"), "skiplist");
     let one = settled_usage(&mut c, "one");
-    assert!(one < 2_048, "one member named 5,000 times: {one} bytes");
+    // The table's one group, and the index's root over its one leaf, which
+    // `MEMORY USAGE` counts as allocated (about 1.8 KB of the total).
+    assert!(one < 2_560, "one member named 5,000 times: {one} bytes");
     assert_eq!(c.encoding("ten"), "skiplist");
     let want = settled_usage(&mut c, "ref");
     about(
@@ -1269,7 +1302,7 @@ fn a_sorted_set_is_sized_for_its_members_not_its_arguments() {
         assert_eq!(c.cmd(&args).int(), 1_000, "{cmd}");
         let key = args[1];
         assert_eq!(c.encoding(key), "skiplist", "{cmd}");
-        about(settled_usage(&mut c, key), want, cmd);
+        at_most(settled_usage(&mut c, key), want, cmd);
     }
     // GEOADD of 1,000 points, each named five times in one command, against
     // the same points once.

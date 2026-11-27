@@ -326,6 +326,28 @@ fn test_hincrby_hincrbyfloat() {
 }
 
 #[test]
+fn test_hincrby_uses_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    for stored in ["01", "+1", "-0", " 1", "1 "] {
+        c.cmds(&["HSET", "h", "f", stored]);
+        let reply = c.cmds(&["HINCRBY", "h", "f", "1"]);
+        assert!(matches!(&reply, RespValue::Error(e) if e == "ERR hash value is not an integer"));
+        assert_eq!(c.cmds(&["HGET", "h", "f"]).as_str(), stored);
+    }
+
+    for delta in ["01", "+1", "-0"] {
+        let reply = c.cmds(&["HINCRBY", "h", "new", delta]);
+        assert!(
+            matches!(&reply, RespValue::Error(e) if e == "ERR value is not an integer or out of range")
+        );
+        assert_eq!(c.cmds(&["HEXISTS", "h", "new"]).as_int(), 0);
+    }
+}
+
+#[test]
 fn test_hsetnx() {
     let port = free_port();
     start_server(port);

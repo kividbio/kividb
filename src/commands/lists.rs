@@ -225,7 +225,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     None => break,
                                 }
                             }
-                            crate::stats::record_hit();
                             if !items.is_empty() {
                                 drop(inner);
                                 notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "lpop", key);
@@ -234,12 +233,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     }
                 }
-                Some(_) => {
-                    crate::stats::record_miss();
-                    Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
-                }
+                Some(_) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
         }
 
@@ -288,7 +284,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                                     None => break,
                                 }
                             }
-                            crate::stats::record_hit();
                             if !items.is_empty() {
                                 drop(inner);
                                 notify(ctx.pubsub, *ctx.selected_db, KS_LIST, "rpop", key);
@@ -297,12 +292,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         }
                     }
                 }
-                Some(_) => {
-                    crate::stats::record_miss();
-                    Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
-                }
+                Some(_) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
         }
 
@@ -330,7 +322,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_integer(l.read().len() as i64))
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -345,11 +337,11 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 ));
             }
             let key: &[u8] = cmd[1];
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match crate::commands::login::strict_integer(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
-            let stop: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let stop: i64 = match crate::commands::login::strict_integer(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -364,6 +356,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_array(vec![]))
                 }
                 Some(ValueRef::List(l)) => {
+                    crate::stats::record_hit();
                     let inner = l.read();
                     let len = inner.len() as i64;
 
@@ -421,7 +414,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(buf)
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -437,12 +430,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             }
             let key: &[u8] = cmd[1];
 
-            let start: i64 = match parse_utf8(cmd[2]).and_then(|s| s.parse().ok()) {
+            let start: i64 = match crate::commands::login::strict_integer(cmd[2]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
 
-            let stop: i64 = match parse_utf8(cmd[3]).and_then(|s| s.parse().ok()) {
+            let stop: i64 = match crate::commands::login::strict_integer(cmd[3]) {
                 Some(n) => n,
                 None => return Some(resp_error("ERR value is not an integer or out of range")),
             };
@@ -635,7 +628,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     })
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -666,6 +659,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Some(resp_null_bulk())
                 }
                 Some(ValueRef::List(l)) => {
+                    crate::stats::record_hit();
                     let inner = l.read();
                     let len = inner.len() as i64;
                     let real_idx = if idx < 0 { len + idx } else { idx };
@@ -675,18 +669,12 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     }
 
                     match inner.get(real_idx as usize) {
-                        Some(v) => {
-                            crate::stats::record_hit();
-                            Some(resp_bulk(&v))
-                        }
-                        None => {
-                            crate::stats::record_miss();
-                            Some(resp_null_bulk())
-                        }
+                        Some(v) => Some(resp_bulk(&v)),
+                        None => Some(resp_null_bulk()),
                     }
                 }
                 Some(_) => {
-                    crate::stats::record_miss();
+                    crate::stats::record_hit();
                     Some(resp_error(
                         "WRONGTYPE Operation against a key holding the wrong kind of value",
                     ))
@@ -706,27 +694,20 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let map = write_lock!(shard);
 
             match map.get(key) {
-                None => {
-                    crate::stats::record_miss();
-                    Some(resp_integer(0))
-                }
+                None => Some(resp_integer(0)),
                 Some(ValueRef::List(l)) => {
                     let list = Arc::clone(l);
                     drop(map); // release shard lock before locking inner list
                     let mut inner = list.write();
                     inner.extend_front(&cmd[2..]);
-                    crate::stats::record_hit();
                     let len = inner.len();
                     drop(inner);
                     ctx.wait_table.notify_signal(key);
                     Some(resp_integer(len as i64))
                 }
-                Some(_) => {
-                    crate::stats::record_miss();
-                    Some(resp_error(
-                        "WRONGTYPE Operation against a key holding the wrong kind of value",
-                    ))
-                }
+                Some(_) => Some(resp_error(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value",
+                )),
             }
         }
 
@@ -940,7 +921,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         match pop_from(ctx, key, left, 1) {
                             Ok(mut popped) => {
                                 if let Some(element) = popped.pop() {
-                                    crate::stats::record_hit();
                                     return Some(resp_array(vec![
                                         resp_bulk(key),
                                         element.into_bulk(),
@@ -972,7 +952,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match pop_from(ctx, key, !right, count) {
                     Ok(popped) if popped.is_empty() => {}
                     Ok(popped) => {
-                        crate::stats::record_hit();
                         return Some(resp_array(vec![
                             resp_bulk(key),
                             resp_array(popped.into_iter().map(Taken::into_bulk).collect()),
@@ -981,7 +960,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     Err(e) => return Some(e),
                 }
             }
-            crate::stats::record_miss();
             Some(resp_null_array())
         }
 
@@ -1016,10 +994,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 &keys,
                 blocking::timeout_from_secs(timeout_secs),
                 |ctx, _| match list_move::move_one(ctx, &src, &dst, from_left, to_left) {
-                    Ok(Some(element)) => {
-                        crate::stats::record_hit();
-                        Some(element.into_bulk())
-                    }
+                    Ok(Some(element)) => Some(element.into_bulk()),
                     Ok(None) => None,
                     // A destination of the wrong type is an error whenever
                     // it is found; a source of the wrong type, found on
@@ -1060,7 +1035,6 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         match pop_from(ctx, key, left, count) {
                             Ok(popped) if popped.is_empty() => {}
                             Ok(popped) => {
-                                crate::stats::record_hit();
                                 return Some(resp_array(vec![
                                     resp_bulk(key),
                                     resp_array(popped.into_iter().map(Taken::into_bulk).collect()),

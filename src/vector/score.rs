@@ -939,7 +939,7 @@ mod tests {
         .enumerate()
         {
             let fields = [("t".to_string(), std::sync::Arc::from(words.as_bytes()))];
-            index_fields(&def, &format!("doc:{i}"), &fields, Write::Whole);
+            index_fields(&def, &format!("doc:{i}"), &fields, Write::Whole, &[]);
         }
         let filter = super::super::filter::parse_query("apple", &Default::default(), &def)
             .unwrap()

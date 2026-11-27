@@ -120,7 +120,9 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
         // key and the value, as the allocator rounds it. Redis's suite
         // holds it to that (at least the three, at most twice them or 64),
         // which a share of the table's entries does not fit.
-        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2),
+        // A long string an APPEND grew counts the room it keeps for the
+        // next appends too: memory it holds.
+        ValueRef::String(b) => size_class(16 + key.len() + 2 + b.len() + 2) + b.spare(),
 
         // Chunks of packed elements are counted as allocated, room to spare
         // included.
@@ -173,8 +175,8 @@ fn memory_usage(ctx: &mut Ctx) -> Option<Vec<u8>> {
             } else {
                 // In O(1), whatever SAMPLES says: the table (#875) counts its
                 // groups and its members' entries (score and bytes, one
-                // pool block each) as it makes them; the index of their
-                // order is estimated from its length (`score_index`).
+                // pool block each) as it makes them, and the index of
+                // their order its nodes (`CountedOrder::heap_bytes`).
                 let _ = samples;
                 entry() + layout::arc_of::<RwLock<SortedSetInner>>() + inner.allocation_size()
             }

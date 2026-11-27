@@ -83,9 +83,16 @@ pub(super) fn sets_at(ctx: &Ctx, keys: &[&[u8]]) -> Result<Vec<Option<Set>>, Vec
         let gone = lazy_expire_on_read(ctx.store, db, key);
         let shard = store::get_shard(&ctx.store[db], key);
         match read_lock!(shard).get(key).filter(|_| !gone) {
-            None => out.push(None),
-            Some(ValueRef::Set(s)) => out.push(Some(Arc::clone(s))),
+            None => {
+                crate::stats::record_miss();
+                out.push(None)
+            }
+            Some(ValueRef::Set(s)) => {
+                crate::stats::record_hit();
+                out.push(Some(Arc::clone(s)))
+            }
             Some(_) => {
+                crate::stats::record_hit();
                 return Err(resp_error(
                     "WRONGTYPE Operation against a key holding the wrong kind of value",
                 ));
@@ -345,7 +352,6 @@ pub(super) fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
     } else {
         diff_card(&sets, args.limit)
     };
-    crate::stats::record_hit();
     Some(resp_integer(count as i64))
 }
 

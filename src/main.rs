@@ -26,6 +26,7 @@ pub mod command_gate;
 mod commands;
 mod compaction;
 mod config;
+mod counted_btree;
 mod cpus;
 mod deferred;
 mod element;
@@ -450,6 +451,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let _ = crate::commands::server::config_set_global("appendfsync", &cfg.appendfsync);
+    crate::commands::search::set_resp3_reply(&cfg.search_resp3_reply);
     let threads = cfg.resolve_threads();
     #[cfg(feature = "lua")]
     crate::lua_vm_blocking::workers_are(threads);
@@ -458,7 +460,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     RUNTIME_MAXMEMORY.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
     // Without Lua there are no scripts to run beside each other, and the
     // commands are spared looking for a tag to wait on.
-    tag_locks::set_enabled(cfg!(feature = "lua") && config.lua_parallel_scripts);
+    tag_locks::set_mode(if cfg!(feature = "lua") {
+        config.lua_parallel_scripts
+    } else {
+        config::ParallelScripts::No
+    });
+    vector::flat_int8::set_enabled(config.search_flat_int8);
     eviction::configure(&config);
     compaction::configure(&config);
     give_back::set_enabled(config.allocator_give_back);
@@ -890,6 +897,13 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
             }
         }
     }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
+    }
     // start_hub needs a tokio runtime — give it its own single-thread runtime
     // just like the AOF writer, so it never competes with the io_uring workers.
     let hub_tx = {
@@ -937,7 +951,11 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
     crate::tracking::register_for(&store, &tracking_table, &client_registry, &acl_store);
 
     log_info!("Shards per DB  : {}", store::num_shards());
-    log_info!("I/O model      : io_uring");
+    if server_uring::coop_taskrun() {
+        log_info!("I/O model      : io_uring (completions taken at the worker's next system call)");
+    } else {
+        log_info!("I/O model      : io_uring");
+    }
 
     // Local recovery runs on replicas too. A full resync loads into a staging
     // store and swaps it in, so there is nothing to merge with; and a replica
@@ -1309,7 +1327,7 @@ fn run_uring(config: Arc<Config>, started_at: Instant) -> Result<(), Box<dyn std
                     }
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    tokio_uring::start(async move {
+                    server_uring::worker_runtime().start(async move {
                         // Port 0: none, until `CONFIG SET port` opens one.
                         let listener = (addr.port() != 0).then(|| {
                             let socket =
@@ -1779,6 +1797,13 @@ async fn async_main_tokio(
                 std::process::exit(1);
             }
         }
+    }
+    // Never together with `aclfile` (`Config::validate`).
+    if !config.users.is_empty()
+        && let Err(e) = acl::load_config_users(&config.users, &acl_store, &config.requirepass)
+    {
+        log_fatal!("Can't load {e}");
+        std::process::exit(1);
     }
 
     let addr: SocketAddr = config.addr().parse()?;

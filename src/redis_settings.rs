@@ -327,6 +327,104 @@ pub const HIDDEN_SETTINGS: &[(&str, &str)] = &[
     ("watchdog-period", "0"),
 ];
 
+/// Redis's settings that KiviDB keeps but does not act on (`CONFIG SET`
+/// takes them, `CONFIG GET` gives them back), with Redis's defaults: what
+/// `CONFIG GET` says until one is set. `CONFIG REWRITE` writes one only when
+/// it is not at its default, since the file then warns of it at every start.
+pub fn remembered_defaults() -> Vec<(String, String)> {
+    [
+        ("list-max-listpack-size", "-2"),
+        ("list-max-ziplist-size", "-2"),
+        ("list-compress-depth", "0"),
+        ("hll-sparse-max-bytes", "3000"),
+        ("proto-max-bulk-len", "536870912"),
+        ("client-query-buffer-limit", "1073741824"),
+        ("latency-tracking", "yes"),
+        ("latency-tracking-info-percentiles", "50 99 99.9"),
+        ("maxclients", "10000"),
+        ("maxmemory-clients", "0"),
+        // No save points: nothing is saved on a timer.
+        ("save", ""),
+        ("appendfsync", "everysec"),
+        // `DEL` frees what it deletes before it replies (#152).
+        ("lazyfree-lazy-user-del", "no"),
+        ("lazyfree-lazy-user-flush", "no"),
+        ("lazyfree-lazy-expire", "yes"),
+        ("lazyfree-lazy-server-del", "yes"),
+        ("close-on-replica-write", "yes"),
+        ("hz", "10"),
+        ("activerehashing", "yes"),
+        ("lazyfree-lazy-eviction", "no"),
+        ("timeout", "0"),
+        ("tcp-keepalive", "300"),
+        ("latency-monitor-threshold", "0"),
+        ("ts-duplicate-policy", "last"),
+        ("aof-ack-after-write", "yes"),
+        ("rdbcompression", "no"),
+        // `lua-time-limit` is its older name. A build with Lua reads its
+        // own limit for `CONFIG GET`; this is what a build without one says.
+        ("busy-reply-threshold", "5000"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.to_string(), value.to_string()))
+    .chain([
+        (
+            "set-max-intset-entries".to_string(),
+            crate::member_set::DEFAULT_INTSET_MAX.to_string(),
+        ),
+        (
+            "set-max-listpack-entries".to_string(),
+            crate::member_set::DEFAULT_PACKED_ENTRIES.to_string(),
+        ),
+        (
+            "set-max-listpack-value".to_string(),
+            crate::member_set::DEFAULT_PACKED_VALUE.to_string(),
+        ),
+        (
+            "hash-max-listpack-entries".to_string(),
+            crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
+        ),
+        (
+            "hash-max-ziplist-entries".to_string(),
+            crate::hash_fields::DEFAULT_PACKED_ENTRIES.to_string(),
+        ),
+        (
+            "hash-max-listpack-value".to_string(),
+            crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
+        ),
+        (
+            "hash-max-ziplist-value".to_string(),
+            crate::hash_fields::DEFAULT_PACKED_VALUE.to_string(),
+        ),
+        (
+            "zset-max-listpack-entries".to_string(),
+            crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+        ),
+        (
+            "zset-max-ziplist-entries".to_string(),
+            crate::sorted_set::DEFAULT_PACKED_ENTRIES.to_string(),
+        ),
+        (
+            "zset-max-listpack-value".to_string(),
+            crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
+        ),
+        (
+            "zset-max-ziplist-value".to_string(),
+            crate::sorted_set::DEFAULT_PACKED_VALUE.to_string(),
+        ),
+    ])
+    .collect()
+}
+
+/// The default of one of [`remembered_defaults`], or `None` for any other
+/// setting.
+pub fn remembered_default(name: &str) -> Option<String> {
+    remembered_defaults()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v)
+}
+
 /// Whether `name` is one of [`HIDDEN_SETTINGS`].
 pub fn is_hidden(name: &str) -> bool {
     HIDDEN_SETTINGS.iter().any(|(hidden, _)| *hidden == name)

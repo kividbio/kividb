@@ -302,6 +302,13 @@ fn info_reports_the_release_it_follows() {
         info(&mut c, "server", "redis_version").as_deref(),
         Some("8.10.0")
     );
+    // The Valkey release it answers the search and hash commands of: what a
+    // client that gates on `valkey_version` (Open WebUI's Valkey vector
+    // store wants 9.0.1 or later) reads.
+    assert_eq!(
+        info(&mut c, "server", "valkey_version").as_deref(),
+        Some("9.0.1")
+    );
     assert_eq!(
         info(&mut c, "server", "kividb_version").as_deref(),
         Some(env!("CARGO_PKG_VERSION"))

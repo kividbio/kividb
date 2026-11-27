@@ -608,6 +608,10 @@ pub struct ClientInfo {
     pub tracking_noloop: bool,
     pub lib_name: String,
     pub lib_ver: String,
+    /// `lib_name` is a GLIDE client's (see [`is_glide_lib_name`]). It is set
+    /// where `CLIENT SETINFO LIB-NAME` stores the name, so that a search
+    /// reply reads one flag, not a string.
+    pub glide: bool,
     /// Negotiated Redis protocol version per connection (`HELLO`): 2 or 3.
     pub resp: u8,
     /// Port announced with `REPLCONF listening-port`, 0 if none. Read when the
@@ -673,6 +677,7 @@ impl ClientInfo {
             tracking_noloop: false,
             lib_name: String::new(),
             lib_ver: String::new(),
+            glide: false,
             resp: 2,
             replica_listening_port: 0,
             replica_node_id: None,
@@ -779,6 +784,18 @@ impl ClientInfo {
 // oneshot::Sender<()> is Send, so this is automatic — but we note it explicitly.
 
 pub type ClientRegistry = Arc<ClientRegistryInner>;
+
+/// Whether `CLIENT SETINFO LIB-NAME` named a valkey-glide client.
+///
+/// Every GLIDE wrapper sends a name that begins with `Glide`, optionally
+/// followed by a tag in brackets: `GlidePy` (async Python), `GlidePySync`,
+/// `GlideJS` (Node.js), `GlideJava`, `GlideGo`, and `Glide` or `GlideFFI` for
+/// a wrapper that sets none, as in `GlideJava(my-framework:1.2.3)`. The
+/// comparison ignores case.
+pub fn is_glide_lib_name(name: &str) -> bool {
+    name.get(..5)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("glide"))
+}
 
 pub struct ClientRegistryInner {
     clients: RwLock<AHashMap<u64, ClientInfo>>,
@@ -1247,6 +1264,7 @@ impl ClientRegistryInner {
                 tracking_noloop: c.tracking_noloop,
                 lib_name: c.lib_name.clone(),
                 lib_ver: c.lib_ver.clone(),
+                glide: c.glide,
                 resp: c.resp,
                 replica_listening_port: c.replica_listening_port,
                 replica_node_id: c.replica_node_id.clone(),
@@ -1292,6 +1310,7 @@ impl ClientRegistryInner {
             tracking_noloop: c.tracking_noloop,
             lib_name: c.lib_name.clone(),
             lib_ver: c.lib_ver.clone(),
+            glide: c.glide,
             resp: c.resp,
             replica_listening_port: c.replica_listening_port,
             replica_node_id: c.replica_node_id.clone(),
@@ -1317,6 +1336,13 @@ impl ClientRegistryInner {
     #[inline]
     pub fn get_resp(&self, id: u64) -> u8 {
         self.clients.read().get(&id).map(|c| c.resp).unwrap_or(2)
+    }
+
+    /// Whether the connection named itself a GLIDE client
+    /// (`CLIENT SETINFO LIB-NAME`). Read by the search commands only.
+    #[inline]
+    pub fn get_glide(&self, id: u64) -> bool {
+        self.clients.read().get(&id).is_some_and(|c| c.glide)
     }
 
     /// The `NO-TOUCH` flag. A connection's loop keeps its own copy for the

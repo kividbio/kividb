@@ -15,8 +15,21 @@
 //! A block of up to [`crate::value_slab::MAX_BLOCK`] bytes, header and all,
 //! is in KiviDB's own slabs, not the system allocator's (#113): see
 //! `value_slab`.
+//!
+//! **Room to grow.** A slab block's size is its class's, and the length
+//! says the class: a slab block has the room its class leaves and no
+//! more. A larger block is the system allocator's, and has a word of its
+//! own in front of the header ([`SIZE_WORD`]): the block's size, which is
+//! what it was allocated with and is freed with. A block made for a value
+//! of a known length (a `SET`, a load, a copy) is that length's size; one
+//! an `APPEND` makes or grows ([`SharedBytes::append`]) has room to spare
+//! by [`room_for_append`], so that the next appends are written in place,
+//! and a block that has none left is grown with `realloc`. Nothing outside
+//! this file sees the room: the length is what every reader, writer and
+//! copier of the bytes uses, and [`SharedBytes::heap_size`] (what memory
+//! accounting reads) is the block's whole size.
 
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error, realloc};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, Ordering, fence};
 
@@ -33,6 +46,48 @@ struct Header {
 }
 
 const HEADER: usize = std::mem::size_of::<Header>();
+
+/// In front of the header of a block of the system allocator's: the
+/// block's size, this word included.
+const SIZE_WORD: usize = std::mem::size_of::<usize>();
+/// What a block of the system allocator's is aligned to: the size word's.
+const BIG_ALIGN: usize = std::mem::align_of::<usize>();
+const _: () = assert!(SIZE_WORD.is_multiple_of(std::mem::align_of::<Header>()));
+
+/// The most room an append leaves after a value: 16 MiB.
+const MAX_SPARE: usize = 16 << 20;
+/// The longest value an `APPEND` makes (Redis's `proto-max-bulk-len`):
+/// no room is left past it.
+const APPEND_MAX: usize = 512 << 20;
+
+/// The room an append that makes a value of `len` bytes leaves in a block
+/// of the system allocator's: a quarter of `len` more, at most
+/// [`MAX_SPARE`], and none past [`APPEND_MAX`]. Appends grow such a value
+/// by a quarter at a time up to 64 MiB, so each byte appended is copied, on
+/// average, at most four times there even if every growth moves the block;
+/// past it the block grows 16 MiB at a time (about nine copies a byte at
+/// 256 MiB if every growth moved it, though a block that large is one the
+/// allocator grows by remapping its pages). The room left is at most a
+/// fifth of the block.
+#[inline]
+pub fn room_for_append(len: usize) -> usize {
+    let room = len + (len / 4).min(MAX_SPARE);
+    room.min(APPEND_MAX.max(len))
+}
+
+/// Whether bytes of `len` are in a block of the system allocator's, not a
+/// slab's: what says which of the two a block is, and so how it is freed.
+#[inline(always)]
+fn is_big(len: usize) -> bool {
+    crate::value_slab::class_of(HEADER + len).is_none()
+}
+
+/// The layout of a block of the system allocator's of `size` bytes.
+#[inline]
+fn big_layout(size: usize) -> Layout {
+    // Cannot fail: the size is under 2^34 and the alignment eight.
+    Layout::from_size_align(size, BIG_ALIGN).expect("layout of a value")
+}
 
 /// More holders than this and the process stops, as `Arc` does long before
 /// its own count can wrap: a count that wrapped would free bytes in use.
@@ -64,16 +119,34 @@ impl SharedBytes {
     /// `fill` must initialize all `len` bytes at the pointer it is given.
     #[inline]
     unsafe fn make(len: usize, fill: impl FnOnce(*mut u8)) -> Self {
+        // SAFETY: as the caller promises.
+        unsafe { Self::make_with_room(len, len, fill) }
+    }
+
+    /// [`make`](Self::make), in a block with room for `room` bytes if it
+    /// is the system allocator's (a slab block has its class's).
+    ///
+    /// # Safety
+    /// As `make`'s.
+    #[inline]
+    unsafe fn make_with_room(len: usize, room: usize, fill: impl FnOnce(*mut u8)) -> Self {
         let layout = Self::layout(len);
         let to = match crate::value_slab::class_of(layout.size()) {
             Some(class) => crate::value_slab::alloc(class).cast::<Header>(),
             None => {
+                let size = SIZE_WORD + HEADER + room.clamp(len, MAX_LEN);
+                let layout = big_layout(size);
                 // SAFETY: the layout is never of size zero, for the header.
-                let block = unsafe { alloc(layout) } as *mut Header;
-                let Some(to) = NonNull::new(block) else {
+                let base = unsafe { alloc(layout) };
+                if base.is_null() {
                     handle_alloc_error(layout)
-                };
-                to
+                }
+                // SAFETY: the block is `size` bytes, aligned for the word,
+                // and nobody else's; the header follows the word.
+                unsafe {
+                    base.cast::<usize>().write(size);
+                    NonNull::new_unchecked(base.add(SIZE_WORD)).cast::<Header>()
+                }
             }
         };
         let block = to.as_ptr();
@@ -206,6 +279,8 @@ impl SharedBytes {
     /// [`fits`](Self::fits)`(bytes.len())`.
     pub unsafe fn write_in_place(&self, bytes: &[u8]) {
         debug_assert!(self.is_unique() && self.fits(bytes.len()));
+        // The length says how the block is freed: it keeps its kind.
+        debug_assert_eq!(is_big(self.len()), is_big(bytes.len()));
         let block = self.to.as_ptr();
         // SAFETY: as the caller says, nothing reads the bytes or the length
         // while they change, and the block has room for `bytes` in its class.
@@ -219,10 +294,173 @@ impl SharedBytes {
         }
     }
 
+    /// `patch` written over the bytes from `offset`, in this block: as
+    /// [`write_at`] leaves them, with the length grown to the patch's end.
+    ///
+    /// # Safety
+    /// As [`write_in_place`](Self::write_in_place)'s, for the length after
+    /// it: `fits(max(len, offset + patch.len()))`. `patch` is not in the block.
+    pub(crate) unsafe fn write_at_in_place(&self, offset: usize, patch: &[u8]) {
+        let len = self.header().len as usize;
+        let end = len.max(offset + patch.len());
+        debug_assert!(self.is_unique() && self.fits(end));
+        debug_assert_eq!(is_big(len), is_big(end));
+        let block = self.to.as_ptr();
+        // SAFETY: as in `write_in_place`; the block has room for `end` bytes.
+        unsafe {
+            write_at((block as *mut u8).add(HEADER), len, offset, patch);
+            std::ptr::addr_of_mut!((*block).len).write(end as u32);
+        }
+    }
+
+    /// `old` in a new block, with `patch` written from `offset` as
+    /// [`write_at`] does: the old bytes copied once.
+    pub(crate) fn written_at(old: &[u8], offset: usize, patch: &[u8]) -> Self {
+        // Too long for `layout`, rather than wrapped, if the end overflows.
+        let len = old.len().max(offset.saturating_add(patch.len()));
+        // SAFETY: `old` and `write_at` initialize all `len` bytes.
+        unsafe {
+            Self::make(len, |at| {
+                std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len());
+                write_at(at, old.len(), offset, patch);
+            })
+        }
+    }
+
     /// The bytes this takes on the heap, header and all.
     #[inline]
     pub fn heap_size(&self) -> usize {
-        HEADER + self.len()
+        let len = self.len();
+        if is_big(len) {
+            self.big_size()
+        } else {
+            HEADER + len
+        }
+    }
+
+    /// The size of a block of the system allocator's, its size word
+    /// included: what it was allocated with.
+    #[inline]
+    fn big_size(&self) -> usize {
+        debug_assert!(is_big(self.len()));
+        // SAFETY: such a block has its size in the word before the header.
+        unsafe {
+            (self.to.as_ptr() as *const u8)
+                .sub(SIZE_WORD)
+                .cast::<usize>()
+                .read()
+        }
+    }
+
+    /// How many more bytes than its length the block has room for, kept
+    /// for appends ([`room_for_append`]): 0 for a slab's block (whose class
+    /// is what its length says) and for a block made for a value of a known
+    /// length.
+    #[inline]
+    pub fn spare(&self) -> usize {
+        let len = self.len();
+        if is_big(len) {
+            self.big_size() - SIZE_WORD - HEADER - len
+        } else {
+            0
+        }
+    }
+
+    /// Whether the bytes can grow to `len` in this block: in the same slab
+    /// class, or within the room of a block of the system allocator's.
+    #[inline]
+    pub fn has_room(&self, len: usize) -> bool {
+        let now = self.len();
+        match crate::value_slab::class_of(HEADER + now) {
+            Some(class) => crate::value_slab::class_of(HEADER + len) == Some(class),
+            None => len >= now && SIZE_WORD + HEADER + len <= self.big_size(),
+        }
+    }
+
+    /// The bytes of `old`, `gap` zero bytes and then `extra`, in a new
+    /// block, with the room an append leaves ([`room_for_append`]) if the
+    /// block is the system allocator's.
+    pub fn appended(old: &[u8], gap: usize, extra: &[u8]) -> Self {
+        // Past `MAX_LEN` (`layout` refuses it) rather than wrapped.
+        let len = old.len().saturating_add(gap).saturating_add(extra.len());
+        // SAFETY: `old`, the gap and `extra` are `len` bytes together, and
+        // `write_at` zeroes the gap and copies `extra`.
+        unsafe {
+            Self::make_with_room(len, room_for_append(len), |at| {
+                std::ptr::copy_nonoverlapping(old.as_ptr(), at, old.len());
+                write_at(at, old.len(), old.len() + gap, extra);
+            })
+        }
+    }
+
+    /// `gap` zero bytes and then `extra` added to the end of the bytes. In
+    /// this block when it has room ([`has_room`](Self::has_room)); else a
+    /// block of the system allocator's is grown with `realloc` to the room
+    /// an append leaves ([`room_for_append`]), which the allocator may do
+    /// where the block is or by moving it, and a slab's block is replaced
+    /// by a new one ([`appended`](Self::appended)), the old one freed.
+    /// Returns whether the bytes stayed where they were.
+    ///
+    /// # Safety
+    /// This is the bytes' only holder ([`is_unique`](Self::is_unique)),
+    /// nothing can get to them but through it until this returns (the
+    /// caller holds what it is kept in for writing), and nothing keeps
+    /// their address across it: the block may move. `extra` is not in the
+    /// block, and the length after it is at most [`MAX_LEN`].
+    pub(crate) unsafe fn append(&mut self, gap: usize, extra: &[u8]) -> bool {
+        debug_assert!(self.is_unique());
+        let len = self.len();
+        let new = len.saturating_add(gap).saturating_add(extra.len());
+        assert!(new <= MAX_LEN, "a value of {new} bytes");
+        let mut stays = true;
+        if !self.has_room(new) {
+            if !is_big(len) {
+                *self = Self::appended(self.as_slice(), gap, extra);
+                return false;
+            }
+            let size = self.big_size();
+            let grown = SIZE_WORD + HEADER + room_for_append(new);
+            // SAFETY: the word is the block's first.
+            let was = unsafe { (self.to.as_ptr() as *mut u8).sub(SIZE_WORD) };
+            // SAFETY: the block was allocated with this layout, and
+            // nothing but `self` knows where it is.
+            let base = unsafe { realloc(was, big_layout(size), grown) };
+            stays = base == was;
+            if base.is_null() {
+                // The old block is as it was, and still `self`'s.
+                handle_alloc_error(big_layout(grown))
+            }
+            // SAFETY: the block is `grown` bytes now, its first `size` as
+            // they were: the word, the header and the bytes.
+            unsafe {
+                base.cast::<usize>().write(grown);
+                self.to = NonNull::new_unchecked(base.add(SIZE_WORD)).cast();
+            }
+        }
+        let block = self.to.as_ptr();
+        // SAFETY: the block has room for `new` bytes, and as the caller
+        // says, nothing reads the bytes or the length while they change.
+        unsafe {
+            write_at((block as *mut u8).add(HEADER), len, len + gap, extra);
+            std::ptr::addr_of_mut!((*block).len).write(new as u32);
+        }
+        stays
+    }
+}
+
+/// `patch` written at `offset` of the `len` bytes at `to`. Bytes between
+/// `len` and `offset` become zero, as Redis grows a string.
+///
+/// # Safety
+/// `to` is writable for `max(len, offset + patch.len())` bytes, its first
+/// `len` initialized, and `patch` is not among them.
+pub(crate) unsafe fn write_at(to: *mut u8, len: usize, offset: usize, patch: &[u8]) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        if offset > len {
+            std::ptr::write_bytes(to.add(len), 0, offset - len);
+        }
+        std::ptr::copy_nonoverlapping(patch.as_ptr(), to.add(offset), patch.len());
     }
 }
 
@@ -254,8 +492,14 @@ impl Drop for SharedBytes {
             // came from this class.
             Some(class) => unsafe { crate::value_slab::free(self.to.cast(), class) },
             // SAFETY: this was the last holder, and the block was allocated
-            // with this layout.
-            None => unsafe { dealloc(self.to.as_ptr() as *mut u8, layout) },
+            // with the size its word says, from the word on.
+            None => unsafe {
+                let size = self.big_size();
+                dealloc(
+                    (self.to.as_ptr() as *mut u8).sub(SIZE_WORD),
+                    big_layout(size),
+                )
+            },
         }
     }
 }
@@ -404,10 +648,140 @@ mod tests {
             let shared = SharedBytes::from(&bytes[..]);
             assert_eq!(shared.len(), len);
             assert_eq!(&shared[..], &bytes[..]);
-            assert_eq!(shared.heap_size(), len + 8);
+            // A block of the system allocator's has its size word too.
+            let word = if len > 26_000 { 8 } else { 0 };
+            assert_eq!(shared.heap_size(), len + 8 + word);
+            assert_eq!(shared.spare(), 0);
         }
         assert_eq!(&SharedBytes::concat(&[b"ab", b"", b"cde"])[..], b"abcde");
         assert_eq!(&SharedBytes::from("text")[..], b"text");
+    }
+
+    #[test]
+    fn an_append_leaves_a_quarter_more_room_up_to_16_mib_and_none_past_512_mib() {
+        assert_eq!(room_for_append(0), 0);
+        assert_eq!(room_for_append(100_000), 125_000);
+        assert_eq!(room_for_append(64 << 20), 80 << 20);
+        assert_eq!(room_for_append(100 << 20), 116 << 20);
+        assert_eq!(room_for_append(505 << 20), 512 << 20);
+        assert_eq!(room_for_append(512 << 20), 512 << 20);
+        assert_eq!(room_for_append(600 << 20), 600 << 20);
+    }
+
+    /// What this thread's counter moved by while `f` ran, if it has one.
+    fn counted(f: impl FnOnce()) -> Option<isize> {
+        let before = crate::memory_use::allocated_by_this_thread();
+        f();
+        let after = crate::memory_use::allocated_by_this_thread();
+        Some(after? - before?)
+    }
+
+    /// Appends onto bytes of every size, some after a gap of zeros: in
+    /// their block while it has room, else a slab's block replaced and a
+    /// large one grown by a quarter.
+    /// The allocator counts each block at its whole size, room included,
+    /// and a block is freed with the size it was allocated with.
+    ///
+    /// Each start is run twice and only the second run's counts are held to
+    /// the blocks' sizes: the first slab of a class, or a new region, a
+    /// process takes grows the slabs' own lists (`value_slab`'s `Vec`s of
+    /// slabs and regions), which the allocator counts too, on the thread
+    /// that took it. In a process of its own (nextest) that is this test's
+    /// first run; the steps where it happened are printed.
+    #[test]
+    fn appends_write_in_the_room_and_grow_a_large_block_by_a_quarter() {
+        let slab = crate::value_slab::MAX_BLOCK - HEADER;
+        let largest = crate::value_slab::class_of(crate::value_slab::MAX_BLOCK);
+        for (run, start) in [0, 100, 4000, 20_000, slab + 1, 1 << 20]
+            .into_iter()
+            .flat_map(|start| [(0, start), (1, start)])
+        {
+            let mut model: Vec<u8> = (0..start).map(|i| (i % 251) as u8).collect();
+            model.reserve(4 << 20);
+            // Some after a gap of zeros, over room the allocator may have
+            // left with other bytes in it.
+            let extras: Vec<(usize, Vec<u8>)> = (0..400)
+                .map(|i| {
+                    (
+                        [0, 0, 1500, 0, 7][i % 5],
+                        vec![(i % 7) as u8 + 1; [3, 1000, 9000][i % 3]],
+                    )
+                })
+                .collect();
+            let regions_before = crate::value_slab::regions();
+            let made = counted(|| {
+                let mut bytes = SharedBytes::from(&model[..]);
+                assert_eq!(bytes.spare(), 0);
+                let mut grown = 0;
+                for (gap, extra) in &extras {
+                    let len = bytes.len() + gap + extra.len();
+                    // The largest slab class is a `value_slab` test's alone.
+                    if crate::value_slab::class_of(HEADER + len) == largest {
+                        continue;
+                    }
+                    let (room, spare, heap) =
+                        (bytes.has_room(len), bytes.spare(), bytes.heap_size());
+                    let at = bytes.as_ptr();
+                    let mut stayed = false;
+                    // SAFETY: the only holder, kept by this test alone.
+                    let delta = counted(|| stayed = unsafe { bytes.append(*gap, extra) });
+                    model.resize(model.len() + gap, 0);
+                    model.extend_from_slice(extra);
+                    assert!(bytes[..] == model[..], "{start}: {len}");
+                    if room {
+                        assert!(stayed && bytes.as_ptr() == at, "{start}: {len}");
+                        if is_big(len) {
+                            assert_eq!(bytes.heap_size(), heap, "{start}: {len}");
+                        }
+                    } else {
+                        grown += 1;
+                    }
+                    if is_big(len) {
+                        let want = if room {
+                            spare - gap - extra.len()
+                        } else {
+                            len / 4
+                        };
+                        assert_eq!(bytes.spare(), want, "{start}: {len}");
+                        assert_eq!(bytes.heap_size(), SIZE_WORD + HEADER + len + want);
+                    } else {
+                        assert_eq!(bytes.spare(), 0);
+                    }
+                    // What the allocator counted is what the block's size
+                    // moved by, a slab's block at its class's size.
+                    let counted_as = |size: usize| {
+                        crate::value_slab::class_of(size)
+                            .map_or(size, crate::value_slab::block_size)
+                            as isize
+                    };
+                    if let Some(delta) = delta {
+                        let want = counted_as(bytes.heap_size()) - counted_as(heap);
+                        if run == 1 {
+                            assert_eq!(delta, want, "{start}: {len}");
+                        } else if delta != want {
+                            let regions = crate::value_slab::regions() - regions_before;
+                            eprintln!(
+                                "first run, start {start}: {len} bytes counted {delta}, \
+                                 the blocks {want} ({} more; {regions} regions so far)",
+                                delta - want
+                            );
+                        }
+                    }
+                }
+                // About 2 MiB in quarters from a few KiB: a few dozen growths.
+                assert!(grown < 60, "{start}: grown {grown} times");
+                drop(bytes);
+            });
+            if let Some(made) = made {
+                eprintln!("run {run}, start {start}: {made} bytes still counted after the drop");
+                if run == 1 {
+                    assert_eq!(
+                        made, 0,
+                        "{start}: freed with another size than it was allocated with"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

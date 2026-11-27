@@ -370,7 +370,15 @@ fn expire_ordered(
             crate::vector::unmark_leaving(id, db, key);
         }
     } else {
-        crate::vector::reindex_key(index_store, store, db, key, crate::vector::Write::Refresh);
+        let named: Vec<&[u8]> = fields.iter().map(|field| &field[..]).collect();
+        crate::vector::reindex_key_naming(
+            index_store,
+            store,
+            db,
+            key,
+            crate::vector::Write::Refresh,
+            &named,
+        );
     }
     // Freed outside the shard's lock.
     drop(taken);
@@ -749,7 +757,7 @@ mod tests {
                         let three: Arc<[u8]> = Arc::from(&b"3"[..]);
                         hash_at(&store, KEY).write().fields.insert("n", &three);
                         def.postings
-                            .write_fields(KEY, &[("n".into(), three)], false, None);
+                            .write_fields(KEY, &[("n".into(), three)], false, true, None);
                     }));
                 });
             }

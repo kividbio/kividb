@@ -322,6 +322,9 @@ pub mod scripts {
         out.push_str(&format!(
             "scripts_alone_runs:{closes}\r\nscripts_in_alone_runs:{scripts}\r\n"
         ));
+        // Whether keys without a hash tag are locked, and how often that was
+        // switched (`tag_locks::lock_untagged_keys_for`).
+        crate::tag_locks::key_locks_info(out);
     }
 }
 
@@ -402,6 +405,17 @@ pub fn record_hit() {
 #[inline(always)]
 pub fn record_miss() {
     tl_bump!(TL_MISSES);
+}
+
+/// One read of a key, as Redis's `lookupKeyRead` counts it: a hit when the
+/// key is there, whatever its type, a miss when it is not.
+#[inline(always)]
+pub fn record_lookup(found: bool) {
+    if found {
+        record_hit();
+    } else {
+        record_miss();
+    }
 }
 
 /// One read from a client's connection.

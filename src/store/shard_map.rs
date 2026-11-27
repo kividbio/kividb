@@ -35,10 +35,11 @@
 //! **Writes in place.** A string written over a string kept inline goes
 //! into the same block when the table alone holds the entry, the key is not
 //! past its time, and the new length keeps the block in its slab class
-//! ([`ShardMap::set_str`], `append_in_place`, `set_range_in_place`): nothing
-//! is allocated or freed, and the entry stays where it is. Anything else,
-//! and every entry somebody else holds (a snapshot being written), gets a
-//! new entry, as before.
+//! ([`ShardMap::set_str`], `append_str`, `edit_str_in_place`): nothing is
+//! allocated or freed, and the entry stays where it is. A string of its own
+//! is written in its block the same way when the entry is also its bytes'
+//! only holder. Anything else, and every entry somebody else holds (a
+//! snapshot being written), gets a new entry.
 
 use std::sync::Arc;
 
@@ -99,6 +100,13 @@ impl<'a> StrRef<'a> {
             Bytes::Inline(_) => None,
             Bytes::Shared(shared) => Some(shared),
         }
+    }
+
+    /// The room the bytes' block keeps past their length for appends
+    /// (`SharedBytes::spare`): 0 for bytes in the entry.
+    #[inline]
+    pub fn spare(self) -> usize {
+        self.shared().map_or(0, SharedBytes::spare)
     }
 
     /// Whether `other` is this very value, not merely equal bytes. Bytes
@@ -272,6 +280,15 @@ pub enum Written {
     /// The key has a new entry; this is the old one, best dropped once the
     /// shard is unlocked.
     Replaced(Taken),
+}
+
+/// Why [`ShardMap::append_str`] wrote nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AppendRefused {
+    /// The key holds another type.
+    WrongType,
+    /// The string would pass the longest allowed.
+    TooLong,
 }
 
 /// What [`ShardMap::remove_if`] did with a key.
@@ -1030,51 +1047,142 @@ impl ShardMap {
         )
     }
 
-    /// `extra` added to the end of `key`'s string, in its own entry, if that
-    /// can be done (see the module). Returns the string's new length if it
-    /// was; `None` leaves everything as it was, for the caller to write a
-    /// new value.
-    pub fn append_in_place(
+    /// Redis's `APPEND`: `extra` added to the end of `key`'s string, the key
+    /// made if it is not there (or is past its time). Returns the string's
+    /// new length, and what was written: [`Written::Replaced`]'s entry is
+    /// best dropped once the shard is unlocked. Refused, with nothing
+    /// written, if the key holds another type, or its string would pass
+    /// `max_len`.
+    ///
+    /// Written in place when the table alone holds the entry and, for a
+    /// string with a block of its own, the entry alone its bytes (both
+    /// counted under this write lock): an inline string that stays in its
+    /// slab class, or bytes of their own, in their block if it has room,
+    /// else in the block `SharedBytes::append` grows or makes for them,
+    /// with room to spare (`shared_bytes::room_for_append`); the entry
+    /// stays. Anything else is copied once into a new entry, with the same
+    /// room, and the key's time to live kept. An empty `extra` writes
+    /// nothing.
+    pub fn append_str(
         &mut self,
         key: &(impl AsRef<[u8]> + ?Sized),
         extra: &[u8],
-    ) -> Option<usize> {
-        let key = key.as_ref();
-        let hash = self.hash_of(key);
-        let map = self.id();
-        let entry = self.find_live(hash, key)?.entry();
-        let len = entry.inline_len()? + extra.len();
-        if !entry.fits_in_place(len) {
-            return None;
+        max_len: usize,
+    ) -> Result<(usize, Written), AppendRefused> {
+        self.append_after(key.as_ref(), 0, extra, max_len)
+    }
+
+    /// [`append_str`](Self::append_str) of `n` zero bytes: the string grown
+    /// as an `APPEND` grows it, in place or copied once with room to spare.
+    /// Refused as `append_str` refuses, and also when the key is not there
+    /// and `n` passes `max_len`.
+    pub fn append_zeros(
+        &mut self,
+        key: &(impl AsRef<[u8]> + ?Sized),
+        n: usize,
+        max_len: usize,
+    ) -> Result<(usize, Written), AppendRefused> {
+        if n > max_len.min(crate::shared_bytes::MAX_LEN) {
+            return Err(AppendRefused::TooLong);
         }
-        // SAFETY: locked for writing, held by the table alone, and in class.
-        unsafe { entry.write_at_in_place(len - extra.len(), extra) };
-        used(entry, hash, map);
-        Some(len)
+        self.append_after(key.as_ref(), n, &[], max_len)
+    }
+
+    /// `gap` zero bytes and then `extra` added to `key`'s string, as
+    /// [`append_str`](Self::append_str) adds `extra` alone.
+    pub(crate) fn append_after(
+        &mut self,
+        key: &[u8],
+        gap: usize,
+        extra: &[u8],
+        max_len: usize,
+    ) -> Result<(usize, Written), AppendRefused> {
+        let hash = self.hash_of(key);
+        let found = self.find_live(hash, key).map(|slot| slot.entry());
+        let old: &[u8] = match found.map(Entry::value) {
+            Some(ValueRef::String(bytes)) => bytes.as_bytes(),
+            Some(_) => return Err(AppendRefused::WrongType),
+            None => &[],
+        };
+        let len = old.len().saturating_add(gap).saturating_add(extra.len());
+        if let Some(entry) = found {
+            if len > max_len.min(crate::shared_bytes::MAX_LEN) {
+                return Err(AppendRefused::TooLong);
+            }
+            let in_place = if len == old.len() {
+                true
+            } else if entry.inline_len().is_some() {
+                let fits = entry.fits_in_place(len);
+                if fits {
+                    // SAFETY: locked for writing, held by the table alone,
+                    // and in class.
+                    unsafe { entry.write_at_in_place(old.len() + gap, extra) };
+                }
+                fits
+            } else {
+                // SAFETY: locked for writing (`&mut self`), the table holds
+                // the entry, and the length is in bounds. `old` is not used
+                // again: the bytes may move.
+                unsafe { entry.append_own(gap, extra) }.is_some()
+            };
+            if in_place {
+                used(entry, hash, self.id());
+                return Ok((len, Written::InPlace));
+            }
+        }
+        // `old` is in the entry `put` replaces, which lives until the
+        // caller drops what it gives back.
+        let written = self.put(key, Ttl::Keep, None, |key, expires| {
+            Entry::string_appended(key, old, gap, extra, expires)
+        });
+        Ok((len, written))
     }
 
     /// `patch` written over `key`'s string from `offset`, the string grown
-    /// with zero bytes to reach it, in its own entry if that can be done
-    /// (see the module). Returns the string's new length if it was; `None`
-    /// leaves everything as it was.
-    pub fn set_range_in_place(
+    /// with zero bytes to reach it. In place only when the table alone holds
+    /// both the entry and, for a string with a block of its own, its bytes,
+    /// and the new length keeps their block (`Entry::fits_in_place`). Else
+    /// a new string, the old bytes copied once, with the key's time to live
+    /// kept. A key not there, or past its time, is an empty string. `None`
+    /// leaves everything as it was: the key holds another type, or the
+    /// string would pass `MAX_LEN`.
+    ///
+    /// Nothing but byte copies runs between the first byte written in
+    /// place and the last: no allocation, and nothing that can fail.
+    pub fn edit_str_in_place(
         &mut self,
         key: &(impl AsRef<[u8]> + ?Sized),
         offset: usize,
         patch: &[u8],
-    ) -> Option<usize> {
+    ) -> Option<Written> {
         let key = key.as_ref();
+        let end = offset
+            .checked_add(patch.len())
+            .filter(|&end| end <= crate::shared_bytes::MAX_LEN)?;
         let hash = self.hash_of(key);
-        let map = self.id();
-        let entry = self.find_live(hash, key)?.entry();
-        let len = entry.inline_len()?.max(offset.checked_add(patch.len())?);
-        if !entry.fits_in_place(len) {
-            return None;
+        let found = self.find_live(hash, key).map(|slot| slot.entry());
+        let old: &[u8] = match found.map(Entry::value) {
+            Some(ValueRef::String(bytes)) => bytes.as_bytes(),
+            Some(_) => return None,
+            None => &[],
+        };
+        // Both holds are counted under this write lock, and a new one
+        // needs the lock or an existing hold: none can start before the
+        // write ends.
+        if let Some(entry) = found
+            && entry.fits_in_place(old.len().max(end))
+        {
+            // SAFETY: locked for writing, held by the table alone, any bytes
+            // of its own by the entry alone, and in class.
+            unsafe { entry.write_at_in_place(offset, patch) };
+            used(entry, hash, self.id());
+            return Some(Written::InPlace);
         }
-        // SAFETY: as in `append_in_place`.
-        unsafe { entry.write_at_in_place(offset, patch) };
-        used(entry, hash, map);
-        Some(len)
+        // `old` is in the entry `put` replaces, which lives until the
+        // caller drops what it gives back.
+        Some(self.put(key, Ttl::Keep, None, |key, expires| {
+            Entry::string_written_at(key, old, offset, patch, expires)
+        }))
     }
 
     /// [`ShardMap::insert_str`], the key's time to live set to `expires`, or
@@ -1474,6 +1582,43 @@ impl ShardMap {
                 _map: std::marker::PhantomData,
             });
         }
+    }
+
+    /// Every entry in buckets `from..to` of [`ShardMap::buckets`], given to
+    /// `visit` in bucket order: a walk over a shard in parts, the lock let
+    /// go of between parts if a writer waits (`KEYS`, #1018).
+    ///
+    /// Each entry is somewhere else in memory: visited one after the other
+    /// as the walk finds them, a `KEYS` over 500,000 keys of 2 KB waited
+    /// for memory at nearly every entry. As [`ShardMap::scan`] does for a
+    /// page (#884), the lines of an entry's header and key are asked for as
+    /// the walk finds it, and the entries of a full batch are visited
+    /// together, by then on their way.
+    #[inline(always)]
+    pub fn visit_buckets(&self, from: usize, to: usize, visit: &mut impl FnMut(EntryView<'_>)) {
+        let mut batch = [Slot::NONE; SCAN_BATCH];
+        let mut held = 0usize;
+        let new = self.table.num_buckets();
+        let to = to.min(self.buckets());
+        let parts = [
+            (&self.table, from.min(new), to.min(new)),
+            (&self.old, from.max(new) - new, to.max(new) - new),
+        ];
+        for (table, start, end) in parts {
+            for index in start..end {
+                let Some(&slot) = table.get_bucket(index) else {
+                    continue;
+                };
+                slot.prefetch_key();
+                batch[held] = slot;
+                held += 1;
+                if held == SCAN_BATCH {
+                    Self::visit_batch(&batch, false, visit);
+                    held = 0;
+                }
+            }
+        }
+        Self::visit_batch(&batch[..held], false, visit);
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &[u8]> {
@@ -2206,6 +2351,108 @@ mod tests {
         assert!(map.is_empty());
     }
 
+    /// As `moving_a_sets_entry_leaves_its_array_in_place`, for a large
+    /// sorted set (#875): its key's entry, which holds the set's `Arc`,
+    /// moves; the set, its members' entries in the entry pool and the
+    /// index's references to them stay where they are.
+    #[test]
+    fn moving_a_sorted_sets_entry_leaves_its_members_in_place() {
+        use crate::sorted_set::SortedSetInner;
+        use crate::value_slab;
+        // Slab evacuation state is shared across the whole process.
+        // Serialize tests that plan or finish evacuation so they
+        // cannot take each other's slabs or affect global counts.
+        let _one = value_slab::EVACUATION_TESTS.lock();
+        // A length no other test's keys have: a slab class of its own.
+        let key = |i: usize| format!("{i:0>2800}");
+        // Members too long for a block, so the large form; runs of equal
+        // scores, ordered by the members' bytes.
+        let members: Vec<(Vec<u8>, f64)> = (0..200)
+            .map(|i| (format!("{i:0>80}").into_bytes(), (i % 7) as f64))
+            .collect();
+        // Made on a thread that ends, so that its slabs are nobody's.
+        let setup = members.clone();
+        let mut map = crate::cpus::spawn(move || {
+            let mut map = ShardMap::new();
+            for i in 0..64 {
+                let mut set = SortedSetInner::new();
+                for (member, score) in &setup {
+                    assert!(set.insert_bytes(member, *score));
+                }
+                map.insert(key(i), KiviDBValue::SortedSet(Arc::new(RwLock::new(set))));
+            }
+            map
+        })
+        .join()
+        .unwrap();
+        for i in 1..64 {
+            map.remove(&key(i));
+        }
+        let index = (0..map.buckets())
+            .find(|&i| map.table.get_bucket(i).is_some())
+            .unwrap();
+        let old = map.table.get_bucket(index).unwrap().entry();
+        let generation = value_slab::generation_of(old.base());
+        let zset_at = |map: &ShardMap| match map.get(&key(0)) {
+            Some(ValueRef::SortedSet(zset)) => Arc::as_ptr(zset),
+            _ => panic!("not a sorted set"),
+        };
+        // Each member's entry, and the index's references in its order.
+        let places = |map: &ShardMap| {
+            let Some(ValueRef::SortedSet(zset)) = map.get(&key(0)) else {
+                panic!("not a sorted set")
+            };
+            let set = zset.read();
+            let large = set.large().expect("the large form");
+            large.check();
+            let entries: Vec<usize> = members
+                .iter()
+                .map(|(member, _)| large.table().entry(member).expect("a member"))
+                .map(|entry| entry.as_ptr().addr())
+                .collect();
+            (entries, large.index_addrs())
+        };
+        let before = zset_at(&map);
+        let placed = places(&map);
+
+        let evacuating = value_slab::evacuate_only(old.base()).expect("a slab nobody owns");
+        assert_eq!(evacuating.live(), 1, "the key's slab is shared");
+        let regions = value_slab::regions_snapshot();
+        assert!(map.evacuating_at(index, &regions));
+        match map.relocate_at(index, &regions) {
+            Relocated::Moved(left) => drop(left),
+            _ => panic!("not moved"),
+        }
+        drop(evacuating);
+        assert!(map.table.get_bucket(index).unwrap().entry() != old);
+        // The old block freed: its slab emptied, and the set did not need it.
+        assert_ne!(value_slab::generation_of(old.base()), generation);
+
+        // The same set, at the same address, held only by its key, its
+        // members where they were.
+        assert_eq!(zset_at(&map), before);
+        assert_eq!(places(&map), placed, "a member's entry moved");
+        let Some(ValueRef::SortedSet(zset)) = map.get(&key(0)) else {
+            panic!("not a sorted set")
+        };
+        assert_eq!(Arc::strong_count(zset), 1);
+        let set = zset.read();
+        let mut want = members;
+        want.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let got: Vec<(Vec<u8>, f64)> = set
+            .iter()
+            .map(|(member, score)| (member.borrowed().to_vec(), score))
+            .collect();
+        assert_eq!(got, want);
+        for (rank, (member, score)) in want.iter().enumerate() {
+            assert_eq!(set.rank(member), Some((rank, *score)));
+        }
+        drop(set);
+        // Dropped once, from the copy.
+        drop(map.remove(&key(0)).expect("the key"));
+        assert!(map.is_empty());
+    }
+
     #[test]
     fn a_panic_moving_a_key_with_no_ttl_frees_only_the_copy() {
         relocation_unwinds_at(1, false, Then::Remove);
@@ -2533,7 +2780,7 @@ mod tests {
 
     /// A SET at a string's length while compaction empties the slab of its
     /// block (#240 review): written in place, in the slab being emptied,
-    /// then moved out of it whole, the new bytes.
+    /// then moved out of it whole, the new bytes. An edit does the same.
     #[test]
     fn a_string_written_in_place_while_its_slab_is_emptied_moves_whole() {
         // A class no other test allocates (21 KB: nothing else here is), on
@@ -2552,6 +2799,12 @@ mod tests {
         };
         let evacuating = crate::value_slab::evacuate_only(block).expect("a slab nobody owns");
         assert!(matches!(map.set_str("k", vec![2u8; len]), Written::InPlace));
+        let mut want = vec![2u8; len];
+        want[len - 1] = 7;
+        assert!(matches!(
+            map.edit_str_in_place("k", len - 1, &[7]),
+            Some(Written::InPlace)
+        ));
         let regions = crate::value_slab::regions_snapshot();
         let index = (0..map.buckets())
             .find(|&i| map.table.get_bucket(i).is_some())
@@ -2567,7 +2820,7 @@ mod tests {
             _ => panic!("no string"),
         };
         assert_ne!(moved, block, "still in the slab being emptied");
-        assert_eq!(text(map.get("k")), Some(vec![2u8; len]));
+        assert_eq!(text(map.get("k")), Some(want));
         // In place again where it is now.
         assert!(matches!(map.set_str("k", vec![3u8; len]), Written::InPlace));
         assert_eq!(text(map.get("k")), Some(vec![3u8; len]));
@@ -2605,25 +2858,867 @@ mod tests {
     #[test]
     fn a_key_past_its_time_is_not_written_in_place() {
         let mut map = ShardMap::new();
-        // SET k v KEEPTTL, INCR, SETRANGE's fallback: a new key, no time to live.
+        // SET k v KEEPTTL, INCR: a new key, no time to live.
         map.insert_str_expiring("set", "5", Some(1));
         assert!(matches!(map.set_str("set", "6"), Written::Replaced(_)));
         assert_eq!(text(map.get("set")), Some(b"6".to_vec()));
         assert_eq!(map.expires("set"), None);
-        // APPEND and SETRANGE leave it to the caller's write of a new value.
+        // APPEND and SETRANGE's edit write a new key over it, which is
+        // announced.
         map.insert_str_expiring("app", "5", Some(1));
-        assert_eq!(map.append_in_place("app", b"6"), None);
+        assert!(matches!(
+            map.append_str("app", b"6", usize::MAX),
+            Ok((1, Written::Replaced(_)))
+        ));
+        assert_eq!(text(map.get("app")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("app"), None);
         map.insert_str_expiring("rng", "5", Some(1));
-        assert_eq!(map.set_range_in_place("rng", 0, b"6"), None);
+        assert!(matches!(
+            map.edit_str_in_place("rng", 0, b"6"),
+            Some(Written::Replaced(_))
+        ));
+        assert_eq!(text(map.get("rng")), Some(b"6".to_vec()));
+        assert_eq!(map.expires("rng"), None);
         assert_eq!(
             map.take_left(),
-            vec![(ToSay::PastItsTime, crate::store::Key::from("set"))]
+            vec![
+                (ToSay::PastItsTime, crate::store::Key::from("set")),
+                (ToSay::PastItsTime, crate::store::Key::from("app")),
+                (ToSay::PastItsTime, crate::store::Key::from("rng")),
+            ]
         );
         // A live key is still written in place.
         map.insert_str_expiring("live", "5", Some(u64::MAX - 1));
         assert!(matches!(map.set_str("live", "6"), Written::InPlace));
-        assert_eq!(map.append_in_place("live", b"7"), Some(2));
+        assert!(matches!(
+            map.append_str("live", b"7", usize::MAX),
+            Ok((2, Written::InPlace))
+        ));
         assert_eq!(map.expires("live"), Some(u64::MAX - 1));
+    }
+
+    /// Where `key`'s string's bytes are.
+    fn bytes_at(map: &ShardMap, key: &str) -> usize {
+        match map.get(key) {
+            Some(ValueRef::String(s)) => s.as_bytes().as_ptr() as usize,
+            _ => panic!("no string"),
+        }
+    }
+
+    /// `len` bytes that differ from their neighbours.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// An edit of a string nothing else holds is written where it is, in
+    /// the entry, in a slab block or in the system allocator's block, its
+    /// time to live kept; only the byte written changes.
+    #[test]
+    fn an_edit_nothing_else_holds_is_written_where_it_is() {
+        for len in [100, 10_000, 64 << 10, 1 << 20] {
+            let mut map = ShardMap::new();
+            let mut want = pattern(len);
+            map.insert_str_expiring("k", &want, Some(u64::MAX - 1));
+            let at = bytes_at(&map, "k");
+            for offset in [0, len / 2, len - 1] {
+                let written = map.edit_str_in_place("k", offset, &[0xFF]);
+                assert!(matches!(written, Some(Written::InPlace)), "{len} {offset}");
+                want[offset] = 0xFF;
+            }
+            assert_eq!(text(map.get("k")), Some(want), "{len}");
+            assert_eq!(bytes_at(&map, "k"), at, "{len}");
+            assert_eq!(map.expires("k"), Some(u64::MAX - 1), "{len}");
+        }
+    }
+
+    /// Growth stays in place while the block keeps its class, zero-filled;
+    /// past it, or for the system allocator's block, it takes a new one.
+    #[test]
+    fn an_edit_grows_in_place_only_within_the_blocks_class() {
+        // In the entry: some of a byte at a time stay, one moves.
+        let mut map = ShardMap::new();
+        let mut want = pattern(100);
+        map.set_str("k", &want);
+        let (mut stayed, mut moved) = (0, 0);
+        for len in 101..=200 {
+            let at = bytes_at(&map, "k");
+            let in_place = match map.edit_str_in_place("k", len - 1, &[7]) {
+                Some(Written::InPlace) => true,
+                Some(Written::Replaced(_)) => false,
+                _ => panic!("not written"),
+            };
+            assert_eq!(bytes_at(&map, "k") == at, in_place, "{len}");
+            if in_place {
+                stayed += 1;
+            } else {
+                moved += 1;
+            }
+            want.push(7);
+        }
+        assert!(stayed > 0 && moved > 0, "{stayed} in place, {moved} moved");
+        assert_eq!(text(map.get("k")), Some(want));
+        // A slab block grown to its class's top, zeros between, then past it.
+        let top = crate::value_slab::block_size(crate::value_slab::class_of(10_008).unwrap()) - 8;
+        assert!(top > 10_001, "no room in the class of 10,000 bytes");
+        let mut want = pattern(10_000);
+        map.set_str("s", &want);
+        let at = bytes_at(&map, "s");
+        let written = map.edit_str_in_place("s", top - 1, &[7]);
+        assert!(matches!(written, Some(Written::InPlace)), "{top}");
+        want.resize(top - 1, 0);
+        want.push(7);
+        assert_eq!(
+            (text(map.get("s")), bytes_at(&map, "s")),
+            (Some(want.clone()), at)
+        );
+        let written = map.edit_str_in_place("s", top, &[8]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_ne!(bytes_at(&map, "s"), at);
+        want.push(8);
+        assert_eq!(text(map.get("s")), Some(want));
+        // The system allocator's block keeps its length to stay.
+        let mut want = pattern(64 << 10);
+        map.set_str("b", &want);
+        let at = bytes_at(&map, "b");
+        let written = map.edit_str_in_place("b", want.len() + 2, &[9]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_ne!(bytes_at(&map, "b"), at);
+        want.extend([0, 0, 9]);
+        assert_eq!(text(map.get("b")), Some(want));
+    }
+
+    /// A hold on the entry (a snapshot's) or on its bytes (a reply's) makes
+    /// an edit copy the string once; the holder keeps reading what it held,
+    /// and once it lets go, edits are in place again.
+    #[test]
+    fn an_edit_of_a_held_string_copies_it_and_the_holder_keeps_its_bytes() {
+        for len in [100, 10_000, 64 << 10] {
+            let mut map = ShardMap::new();
+            let old = pattern(len);
+            map.set_str("k", &old);
+            let mut want = old.clone();
+            want[len / 2] ^= 1;
+            // A snapshot holds the entry.
+            let snapshot = map.entries().next().expect("one entry").hold();
+            let at = bytes_at(&map, "k");
+            let written = map.edit_str_in_place("k", len / 2, &want[len / 2..len / 2 + 1]);
+            assert!(matches!(written, Some(Written::Replaced(_))), "{len}");
+            drop(written);
+            match snapshot.value() {
+                ValueRef::String(s) => assert_eq!(s.as_bytes(), &old[..], "{len}"),
+                _ => panic!("not a string"),
+            }
+            assert_eq!(text(map.get("k")), Some(want.clone()), "{len}");
+            assert_ne!(bytes_at(&map, "k"), at, "{len}");
+            drop(snapshot);
+            // A reply holds the bytes: a copy of them, when in the entry.
+            let reply = match map.get("k") {
+                Some(ValueRef::String(s)) => s.to_shared(),
+                _ => panic!("no string"),
+            };
+            let in_entry = reply.as_ptr() as usize != bytes_at(&map, "k");
+            let written = map.edit_str_in_place("k", 0, &[!want[0]]);
+            assert_eq!(matches!(written, Some(Written::InPlace)), in_entry, "{len}");
+            assert_eq!(&reply[..], &want[..], "{len}");
+            want[0] = !want[0];
+            assert_eq!(text(map.get("k")), Some(want.clone()), "{len}");
+            drop((written, reply));
+            // Nothing holds it now.
+            assert!(matches!(
+                map.edit_str_in_place("k", 1, &[0]),
+                Some(Written::InPlace)
+            ));
+        }
+    }
+
+    /// Entries each held by the table alone can share their bytes (`COPY`,
+    /// or a time to live given while a snapshot holds the entry): an edit
+    /// of either copies them, and the other keeps them as they were.
+    #[test]
+    fn an_edit_of_bytes_two_entries_share_copies_them() {
+        let mut map = ShardMap::new();
+        let old = pattern(10_000);
+        map.set_str("a", &old);
+        let value = map.get("a").expect("a").to_value();
+        map.insert("b", value);
+        let written = map.edit_str_in_place("a", 0, &[0xFF]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        drop(written);
+        assert_eq!(text(map.get("b")), Some(old.clone()));
+        // Each has bytes of its own now.
+        for key in ["a", "b"] {
+            let written = map.edit_str_in_place(key, 1, &[0xFF]);
+            assert!(matches!(written, Some(Written::InPlace)), "{key}");
+        }
+        // A time to live given while a snapshot holds the entry remakes it,
+        // the bytes shared with the held one.
+        let snapshot = map.get_ref("b").expect("b");
+        assert!(map.set_expires("b", u64::MAX - 1));
+        assert!(!map.holds("b", &snapshot));
+        let written = map.edit_str_in_place("b", 2, &[0xFF]);
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        match snapshot.value() {
+            ValueRef::String(s) => assert_eq!(s[2], old[2]),
+            _ => panic!("not a string"),
+        }
+        assert_eq!(map.expires("b"), Some(u64::MAX - 1));
+    }
+
+    /// A key not there, or past its time, is an empty string; another type,
+    /// or a length past `MAX_LEN`, leaves everything as it was.
+    #[test]
+    fn an_edit_of_a_missing_expired_or_other_key() {
+        let mut map = ShardMap::new();
+        assert!(matches!(
+            map.edit_str_in_place("new", 2, b"x"),
+            Some(Written::New)
+        ));
+        assert_eq!(text(map.get("new")), Some(b"\0\0x".to_vec()));
+        map.insert_str_expiring("past", "abc", Some(1));
+        let written = map.edit_str_in_place("past", 1, b"z");
+        assert!(matches!(written, Some(Written::Replaced(_))));
+        assert_eq!(text(map.get("past")), Some(b"\0z".to_vec()));
+        assert_eq!(map.expires("past"), None);
+        assert_eq!(
+            map.take_left(),
+            vec![(ToSay::PastItsTime, crate::store::Key::from("past"))]
+        );
+        let set = crate::member_set::MemberSet::new();
+        map.insert("set", KiviDBValue::Set(Arc::new(RwLock::new(set))));
+        assert!(map.edit_str_in_place("set", 0, b"x").is_none());
+        assert!(matches!(map.get("set"), Some(ValueRef::Set(_))));
+        map.set_str("k", "abc");
+        let max = crate::shared_bytes::MAX_LEN;
+        for (offset, patch) in [(max, &b"x"[..]), (usize::MAX, b"x"), (max - 1, b"xy")] {
+            assert!(map.edit_str_in_place("k", offset, patch).is_none());
+        }
+        assert_eq!(text(map.get("k")), Some(b"abc".to_vec()));
+    }
+
+    /// Seeded random edits, each made on two maps: on one nothing else holds
+    /// the string, on the other a holder may make the edit copy it. Both
+    /// end as a model says; in place exactly when the block has room;
+    /// each holder and each neighbouring string keeps its bytes.
+    #[test]
+    fn edits_in_place_and_copied_agree_with_a_model() {
+        use rand::{Rng, SeedableRng};
+        const SEED: u64 = 0x5e7_b175;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        // The slab class of bytes of their own, after their 8-byte header.
+        let class = |len: usize| crate::value_slab::class_of(len + 8);
+        let top = |len: usize| class(len).map(|c| crate::value_slab::block_size(c) - 8);
+        let inline = crate::store::entry::INLINE_MAX;
+        let slab = crate::value_slab::MAX_BLOCK - 8;
+        // The largest class is a `value_slab` test's alone: kept out of it.
+        let below = crate::value_slab::block_size(class(slab).unwrap() - 1) - 8;
+        let largest = |len: usize| len > below && len <= slab;
+        assert!(class(below) != class(slab) && class(below + 1) == class(slab));
+        // Bytes of their own: a second hold shares them, not a copy.
+        let own = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.to_shared().as_ptr() == s.as_bytes().as_ptr(),
+            _ => panic!("no string"),
+        };
+        let random = |rng: &mut rand::rngs::StdRng, len: usize| {
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes[..]);
+            bytes
+        };
+        // Each form of string the cases wrote in place, and copied.
+        let mut reached = std::collections::BTreeSet::new();
+        for case in 0..400 {
+            let len = match rng.gen_range(0..6) {
+                0 => rng.gen_range(0..=64),
+                1 => rng.gen_range(inline - 64..=inline + 64),
+                2 => rng.gen_range(inline + 1..=below),
+                3 => top(rng.gen_range(inline + 1..=below)).unwrap(),
+                4 => [below - rng.gen_range(0..=32), slab + rng.gen_range(1..=32)]
+                    [rng.gen_range(0..2)],
+                _ => rng.gen_range(slab + 1..=96 << 10),
+            };
+            let mut model = random(&mut rng, len);
+            let ttl = rng.gen_bool(0.5).then_some(u64::MAX - 1);
+            let neighbours: Vec<Vec<u8>> = (0..3).map(|_| random(&mut rng, len)).collect();
+            let mut maps = [ShardMap::new(), ShardMap::new()];
+            for map in &mut maps {
+                // Strings of the same length, in blocks beside the edited one.
+                map.set_str("n0", &neighbours[0]);
+                map.set_str("n1", &neighbours[1]);
+                map.insert_str_expiring("k", &model, ttl);
+                map.set_str("n2", &neighbours[2]);
+            }
+            for step in 0..8 {
+                let len = model.len();
+                let patch_len = match rng.gen_range(0..8) {
+                    0 => 0,
+                    1..=5 => rng.gen_range(1..=8),
+                    6 => rng.gen_range(9..=300),
+                    _ => rng.gen_range(301..=5000),
+                };
+                let patch = random(&mut rng, patch_len);
+                // Where the patch ends: in the string, past it, or at a limit
+                // of the block, the entry or the slabs, and one byte past.
+                let end = match rng.gen_range(0..5) {
+                    0 if len > 0 => rng.gen_range(1..=len),
+                    0 | 1 => len + rng.gen_range(0..=64),
+                    2 => top(len).filter(|_| own(&maps[0])).unwrap_or(len),
+                    3 => [inline, below][rng.gen_range(0..2)],
+                    _ => len + 1,
+                } + rng.gen_range(0..=1);
+                // Past the largest class instead, to the system allocator.
+                let end = if largest(len.max(end)) { slab + 1 } else { end };
+                let offset = end.saturating_sub(patch.len());
+                let end = offset + patch.len();
+                let grown = len.max(end);
+                assert!(!largest(grown), "{grown}");
+                let at = maps.each_ref().map(|map| bytes_at(map, "k"));
+                let owns = maps.each_ref().map(own);
+                // 0: nothing; 1: the entry (a snapshot); 2: its bytes (a
+                // reply); 3: a second entry sharing them; 4: let go before.
+                let holder = rng.gen_range(0..5);
+                let entry = (holder == 1).then(|| maps[1].get_ref("k").expect("k"));
+                let bytes = (holder == 2).then(|| match maps[1].get("k") {
+                    Some(ValueRef::String(s)) => s.to_shared(),
+                    _ => panic!("no string"),
+                });
+                if holder == 3 {
+                    let value = maps[1].get("k").expect("k").to_value();
+                    drop(maps[1].insert("twin", value));
+                }
+                if holder == 4 {
+                    drop(maps[1].get_ref("k"));
+                }
+                // Whether the bytes are shared, not copied for the holder.
+                let shared = match holder {
+                    2 => bytes.as_ref().is_some_and(|b| b.as_ptr() as usize == at[1]),
+                    3 => bytes_at(&maps[1], "twin") == at[1],
+                    _ => false,
+                };
+                let written = [
+                    maps[0].edit_str_in_place("k", offset, &patch),
+                    maps[1].edit_str_in_place("k", offset, &patch),
+                ];
+                let old = model.clone();
+                model.resize(grown, 0);
+                model[offset..end].copy_from_slice(&patch);
+                let what = format!(
+                    "seed {SEED:#x}, case {case}, step {step}: {len} bytes, own {owns:?}, \
+                     {} written at {offset}, holder {holder}",
+                    patch.len()
+                );
+                if holder == 2 {
+                    // A reply shares bytes of their own, and copies an entry's.
+                    assert_eq!(shared, owns[1], "{what}");
+                }
+                for (i, map) in maps.iter().enumerate() {
+                    let in_place = match &written[i] {
+                        Some(Written::InPlace) => true,
+                        Some(Written::Replaced(_)) => false,
+                        _ => panic!("{what}: map {i} not written"),
+                    };
+                    assert_eq!(bytes_at(map, "k") == at[i], in_place, "{what}: map {i}");
+                    if i == 0 {
+                        reached.insert((owns[0], class(len).is_some(), in_place));
+                    }
+                    assert!(text(map.get("k")) == Some(model.clone()), "{what}: map {i}");
+                    assert_eq!(map.expires("k"), ttl, "{what}: map {i}");
+                    // Only bytes of their own can tell: an entry's room
+                    // depends on its key and header too.
+                    if i == 1 && (holder == 1 || shared) {
+                        assert!(!in_place, "{what}: map {i} held");
+                    } else if owns[i] {
+                        let room = match class(len) {
+                            Some(c) => class(grown) == Some(c),
+                            None => grown == len,
+                        };
+                        assert_eq!(in_place, room, "{what}: map {i}");
+                    }
+                }
+                if let Some(entry) = entry {
+                    match entry.value() {
+                        ValueRef::String(s) => assert!(s.as_bytes() == old, "{what}: entry"),
+                        _ => panic!("{what}: not a string"),
+                    }
+                }
+                if let Some(bytes) = bytes {
+                    assert!(bytes[..] == old[..], "{what}: bytes");
+                }
+                if holder == 3 {
+                    assert!(text(maps[1].get("twin")) == Some(old), "{what}: twin");
+                    drop(maps[1].remove("twin"));
+                }
+            }
+            for map in &maps {
+                for (n, want) in neighbours.iter().enumerate() {
+                    let key = format!("n{n}");
+                    let got = text(map.get(&key));
+                    assert!(
+                        got.as_ref() == Some(want),
+                        "seed {SEED:#x}, case {case}: {key}"
+                    );
+                }
+            }
+        }
+        // In the entry, a slab block and a block of its own: each both ways.
+        assert_eq!(reached.len(), 6, "{reached:?}");
+    }
+
+    /// How `append_str` wrote, as the appends model test tells the cases
+    /// apart.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum Appended {
+        /// In the entry's own block.
+        Inline,
+        /// In the block the bytes were in, which had room.
+        InRoom,
+        /// The entry stayed; its bytes were grown or moved to a new block.
+        Grown,
+        /// A new entry: a copy.
+        Copied,
+    }
+
+    /// Seeded random appends, of nothing to a few MiB, made on two maps: on
+    /// one nothing else holds the string, on the other a holder may make the
+    /// append copy it (a snapshot's hold on the entry, a reply's or a
+    /// `GETEX`'s on the bytes, a second key sharing them since a `COPY`, a
+    /// hold let go before). Both end as a model says, with the time to live
+    /// kept; in the bytes' block, with nothing allocated, exactly when it has
+    /// room; a block grown or made by an append has the room
+    /// `room_for_append` says; each holder and each neighbouring string keeps
+    /// its bytes.
+    ///
+    /// Strings step through the largest slab class too, which a
+    /// `value_slab` test owns: the run holds that test's lock, on a thread
+    /// that ends before the lock goes, so no slab of the class is left
+    /// owned by it.
+    #[test]
+    fn appends_in_place_and_copied_agree_with_a_model() {
+        let _one = crate::value_slab::EVACUATION_TESTS.lock();
+        std::thread::spawn(appends_model_run).join().unwrap();
+    }
+
+    fn appends_model_run() {
+        use crate::shared_bytes::room_for_append;
+        use rand::{Rng, SeedableRng};
+        const SEED: u64 = 0x0a99_e4d0;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+        let class = |len: usize| crate::value_slab::class_of(len + 8);
+        let inline = crate::store::entry::INLINE_MAX;
+        let slab = crate::value_slab::MAX_BLOCK - 8;
+        // The largest slab class: lengths past `below`, up to `slab`.
+        let below = crate::value_slab::block_size(class(slab).unwrap() - 1) - 8;
+        let largest = |len: usize| len > below && len <= slab;
+        let shared = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => (s.shared().is_some(), s.spare()),
+            _ => panic!("no string"),
+        };
+        let random = |rng: &mut rand::rngs::StdRng, len: usize| {
+            let mut bytes = vec![0u8; len];
+            rng.fill(&mut bytes[..]);
+            bytes
+        };
+        let mut reached = std::collections::BTreeSet::new();
+        // How appends took bytes in the largest class to the system allocator.
+        let mut top_to_system = std::collections::BTreeSet::new();
+        for case in 0..300 {
+            let len = match rng.gen_range(0..7) {
+                0 => rng.gen_range(0..=64),
+                1 => rng.gen_range(inline - 64..=inline + 64),
+                2 => rng.gen_range(inline + 1..=below),
+                3 => rng.gen_range(slab + 1..=96 << 10),
+                4 => rng.gen_range(1 << 20..=3 << 20),
+                5 => rng.gen_range(below - 2000..=below),
+                _ => rng.gen_range(below + 1..=slab),
+            };
+            let mut model = random(&mut rng, len);
+            let ttl = rng.gen_bool(0.5).then_some(u64::MAX - 1);
+            let neighbours: Vec<Vec<u8>> = (0..3)
+                .map(|_| random(&mut rng, len.min(64 << 10)))
+                .collect();
+            let mut maps = [ShardMap::new(), ShardMap::new()];
+            for map in &mut maps {
+                map.set_str("n0", &neighbours[0]);
+                map.set_str("n1", &neighbours[1]);
+                map.insert_str_expiring("k", &model, ttl);
+                map.set_str("n2", &neighbours[2]);
+            }
+            for step in 0..10 {
+                let len = model.len();
+                let mut extra_len = match rng.gen_range(0..10) {
+                    0 => 0,
+                    1..=4 => rng.gen_range(1..=8),
+                    5 | 6 => rng.gen_range(9..=300),
+                    7 | 8 => rng.gen_range(301..=5000),
+                    _ if len < 6 << 20 => rng.gen_range(5001..=2 << 20),
+                    _ => 100,
+                };
+                if largest(len + extra_len) && rng.gen_bool(0.5) {
+                    // Past the largest class instead, to the system allocator.
+                    extra_len = slab + 1 - len + rng.gen_range(0..64);
+                }
+                let extra = random(&mut rng, extra_len);
+                let grown = len + extra_len;
+                let at = maps.each_ref().map(|map| bytes_at(map, "k"));
+                let before = maps.each_ref().map(shared);
+                let holder = rng.gen_range(0..5);
+                let entry = (holder == 1).then(|| maps[1].get_ref("k").expect("k"));
+                let bytes = (holder == 2).then(|| match maps[1].get("k") {
+                    Some(ValueRef::String(s)) => s.to_shared(),
+                    _ => panic!("no string"),
+                });
+                if holder == 3 {
+                    let value = maps[1].get("k").expect("k").to_value();
+                    drop(maps[1].insert("twin", value));
+                }
+                if holder == 4 {
+                    drop(maps[1].get_ref("k"));
+                }
+                // Whether the bytes are shared, not copied, by the holder.
+                let held = match holder {
+                    1 => true,
+                    2 => bytes.as_ref().is_some_and(|b| b.as_ptr() as usize == at[1]),
+                    3 => bytes_at(&maps[1], "twin") == at[1],
+                    _ => false,
+                };
+                let mut counted = [None, None];
+                let mut written = Vec::new();
+                for (i, map) in maps.iter_mut().enumerate() {
+                    let start = crate::memory_use::allocated_by_this_thread();
+                    let done = map.append_str("k", &extra, usize::MAX);
+                    counted[i] = start.zip(crate::memory_use::allocated_by_this_thread());
+                    written.push(done);
+                }
+                let old = model.clone();
+                model.extend_from_slice(&extra);
+                let what = format!(
+                    "seed {SEED:#x}, case {case}, step {step}: {len} bytes, {before:?}, \
+                     {extra_len} appended, holder {holder}"
+                );
+                for (i, map) in maps.iter().enumerate() {
+                    let after = shared(map);
+                    let room = before[i].0
+                        && match class(len) {
+                            Some(c) => class(grown) == Some(c),
+                            None => grown <= len + before[i].1,
+                        };
+                    let how = match &written[i] {
+                        Ok((n, _)) if *n != grown => panic!("{what}: map {i} said {n}"),
+                        Ok((_, Written::Replaced(_))) => Appended::Copied,
+                        Ok((_, Written::InPlace)) if !before[i].0 => Appended::Inline,
+                        Ok((_, Written::InPlace)) if room || extra_len == 0 => Appended::InRoom,
+                        Ok((_, Written::InPlace)) => Appended::Grown,
+                        other => panic!("{what}: map {i}: {:?}", other.as_ref().err()),
+                    };
+                    reached.insert((before[i].0, class(len).is_some(), how));
+                    if before[i].0 && largest(len) && class(grown).is_none() {
+                        top_to_system.insert(how);
+                    }
+                    assert!(text(map.get("k")) == Some(model.clone()), "{what}: map {i}");
+                    assert_eq!(map.expires("k"), ttl, "{what}: map {i}");
+                    if i == 1 && held && extra_len > 0 {
+                        assert_eq!(how, Appended::Copied, "{what}: map {i} held");
+                    } else if before[i].0 {
+                        // Bytes of their own, nothing else holding them.
+                        assert_ne!(how, Appended::Copied, "{what}: map {i}");
+                    }
+                    if how == Appended::InRoom {
+                        assert_eq!(bytes_at(map, "k"), at[i], "{what}: map {i}");
+                        if let Some((a, b)) = counted[i] {
+                            assert_eq!(a, b, "{what}: map {i} allocated in place");
+                        }
+                    }
+                    // The room: what was left, or what an append leaves.
+                    let spare = match how {
+                        _ if !after.0 || class(grown).is_some() => 0,
+                        Appended::InRoom => before[i].1 - extra_len,
+                        _ => room_for_append(grown) - grown,
+                    };
+                    assert_eq!(after.1, spare, "{what}: map {i} room");
+                }
+                drop(written);
+                if let Some(entry) = entry {
+                    match entry.value() {
+                        ValueRef::String(s) => assert!(s.as_bytes() == old, "{what}: entry"),
+                        _ => panic!("{what}: not a string"),
+                    }
+                }
+                if let Some(bytes) = bytes {
+                    assert!(bytes[..] == old[..], "{what}: bytes");
+                }
+                if holder == 3 {
+                    assert!(text(maps[1].get("twin")) == Some(old), "{what}: twin");
+                    drop(maps[1].remove("twin"));
+                }
+            }
+            for map in &maps {
+                for (n, want) in neighbours.iter().enumerate() {
+                    let key = format!("n{n}");
+                    let got = text(map.get(&key));
+                    assert!(
+                        got.as_ref() == Some(want),
+                        "seed {SEED:#x}, case {case}: {key}"
+                    );
+                }
+            }
+        }
+        // Inline, in place and copied; a slab's bytes and a large block's,
+        // each in their room, grown and copied.
+        for want in [
+            (false, true, Appended::Inline),
+            (false, true, Appended::Copied),
+            (true, true, Appended::InRoom),
+            (true, true, Appended::Grown),
+            (true, true, Appended::Copied),
+            (true, false, Appended::InRoom),
+            (true, false, Appended::Grown),
+            (true, false, Appended::Copied),
+        ] {
+            assert!(
+                reached.contains(&want),
+                "{want:?} never reached: {reached:?}"
+            );
+        }
+        // From the largest slab class to a block of the system allocator's:
+        // the entry kept (and the room set), and copied when held.
+        for want in [Appended::Grown, Appended::Copied] {
+            assert!(
+                top_to_system.contains(&want),
+                "the largest class to a system block {want:?}: {top_to_system:?}"
+            );
+        }
+    }
+
+    /// A `SET` onto a string an `APPEND` grew: the same length is written in
+    /// place and keeps the room; any other length, large or across 26,208
+    /// bytes either way, is a new block of exactly its length.
+    #[test]
+    fn a_set_onto_a_block_an_append_grew() {
+        use crate::shared_bytes::room_for_append;
+        let spare = |map: &ShardMap| match map.get("k") {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let slab = crate::value_slab::MAX_BLOCK - 8;
+        let mut map = ShardMap::new();
+        let grow = |map: &mut ShardMap, extra: usize| {
+            let (n, written) = map.append_str("k", &vec![5u8; extra], usize::MAX).unwrap();
+            assert!(matches!(written, Written::InPlace), "{n}");
+            assert_eq!(spare(map), room_for_append(n) - n, "{n}");
+            n
+        };
+        map.set_str("k", pattern(100_000));
+        let grown = grow(&mut map, 4);
+        let at = bytes_at(&map, "k");
+        assert!(matches!(
+            map.set_str("k", vec![7u8; grown]),
+            Written::InPlace
+        ));
+        assert_eq!(bytes_at(&map, "k"), at);
+        assert_eq!(spare(&map), room_for_append(grown) - grown);
+        assert_eq!(text(map.get("k")), Some(vec![7u8; grown]));
+        // Shorter, longer, and just past the slabs: large, no room.
+        for (n, fill) in [(grown - 1, 1u8), (grown + 1, 2), (slab + 1, 3)] {
+            assert!(
+                matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)),
+                "{n}"
+            );
+            assert_eq!(spare(&map), 0, "{n}");
+            assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
+        }
+        // Down across 26,208 bytes to a slab's block (not the largest
+        // class, a `value_slab` test's), and up again.
+        grow(&mut map, 1000);
+        for (n, fill) in [(20_000, 4u8), (50_000, 6), (10_000, 8)] {
+            assert!(
+                matches!(map.set_str("k", vec![fill; n]), Written::Replaced(_)),
+                "{n}"
+            );
+            assert_eq!(spare(&map), 0, "{n}");
+            assert_eq!(text(map.get("k")), Some(vec![fill; n]), "{n}");
+            if n == 50_000 {
+                grow(&mut map, 10);
+            }
+        }
+    }
+
+    /// An append onto a string a `COPY` shares copies it once, with room;
+    /// the next ones are in that room. The other key keeps its bytes, and
+    /// appends onto it are then in place too.
+    #[test]
+    fn an_append_after_a_copy_copies_once_then_writes_in_place() {
+        let mut map = ShardMap::new();
+        let len = 1 << 20;
+        map.set_str("a", pattern(len));
+        let value = map.get("a").expect("a").to_value();
+        drop(map.insert("b", value));
+        assert_eq!(bytes_at(&map, "a"), bytes_at(&map, "b"));
+        let (n, written) = map.append_str("a", b"xyz", usize::MAX).unwrap();
+        assert_eq!(n, len + 3);
+        assert!(matches!(written, Written::Replaced(_)));
+        drop(written);
+        let at = bytes_at(&map, "a");
+        for i in 1..=100 {
+            let (n, written) = map.append_str("a", b"xyz", usize::MAX).unwrap();
+            assert_eq!(n, len + 3 * (i + 1));
+            assert!(matches!(written, Written::InPlace));
+            assert_eq!(bytes_at(&map, "a"), at, "append {i}");
+        }
+        assert_eq!(text(map.get("b")), Some(pattern(len)));
+        let (_, written) = map.append_str("b", b"!", usize::MAX).unwrap();
+        assert!(matches!(written, Written::InPlace));
+        let mut want = pattern(len);
+        want.push(b'!');
+        assert_eq!(text(map.get("b")), Some(want));
+        // A COPY of a string with room shares the block, room and all; a
+        // write other than an APPEND to either copies it at its length.
+        let spare = |map: &ShardMap, key: &str| match map.get(key) {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let room = spare(&map, "a");
+        assert!(room > 0);
+        let value = map.get("a").expect("a").to_value();
+        drop(map.insert("c", value));
+        assert_eq!(bytes_at(&map, "c"), bytes_at(&map, "a"));
+        assert_eq!(spare(&map, "c"), room);
+        assert!(matches!(
+            map.edit_str_in_place("c", 0, b"Z"),
+            Some(Written::Replaced(_))
+        ));
+        assert_eq!(spare(&map, "c"), 0);
+        assert_eq!(spare(&map, "a"), room);
+        assert_eq!(text(map.get("a")).unwrap()[0], pattern(1)[0]);
+        assert_eq!(text(map.get("c")).unwrap()[0], b'Z');
+    }
+
+    /// `append_zeros` grows a string as an append does, the new bytes zero
+    /// whatever its block held past the old length: in place when the
+    /// table alone holds the entry and the entry alone its bytes, else in a
+    /// copy with room, the holder keeping what it had; its time to live
+    /// kept. A key not there is made of the zeros; past `max_len` nothing
+    /// is.
+    #[test]
+    fn append_zeros_grows_a_string_with_zeros_as_an_append_grows_it() {
+        use crate::shared_bytes::room_for_append;
+        let spare = |map: &ShardMap, key: &str| match map.get(key) {
+            Some(ValueRef::String(s)) => s.spare(),
+            _ => panic!("no string"),
+        };
+        let mut map = ShardMap::new();
+        // Inline, in a slab's block, in the system allocator's: each set
+        // shorter where it is, over longer bytes, and grown in place over
+        // them. The large block has no room until an append leaves it.
+        for (key, long, short, n) in [
+            ("i", 40, 36, 2),
+            ("s", 20_000, 19_990, 5),
+            ("b", 1 << 20, 1 << 20, 1000),
+        ] {
+            map.insert_str_expiring(key, vec![0xFFu8; long], Some(u64::MAX));
+            map.set_str(key, vec![1u8; short]);
+            let mut want = vec![1u8; short];
+            want.resize(short + n, 0);
+            let (len, written) = map.append_zeros(key, n, usize::MAX).unwrap();
+            assert_eq!(len, short + n, "{key}");
+            assert_eq!(text(map.get(key)), Some(want.clone()), "{key}");
+            assert_eq!(map.expires(key), Some(u64::MAX), "{key}");
+            if key == "b" {
+                // No room yet: grown to the room an append leaves.
+                assert_eq!(spare(&map, key), room_for_append(len) - len);
+                let at = bytes_at(&map, key);
+                assert!(matches!(
+                    map.append_zeros(key, 7, usize::MAX),
+                    Ok((_, Written::InPlace))
+                ));
+                assert_eq!(bytes_at(&map, key), at);
+                want.resize(len + 7, 0);
+                assert_eq!(text(map.get(key)), Some(want), "{key}");
+            } else {
+                assert!(matches!(written, Written::InPlace), "{key}");
+            }
+        }
+        // Held, entry or bytes: copied with room, the holder unchanged.
+        let len = 1 << 20;
+        map.set_str("h", pattern(len));
+        let entry = map.get_ref("h").unwrap();
+        let (n, written) = map.append_zeros("h", 10, usize::MAX).unwrap();
+        assert!(matches!(written, Written::Replaced(_)));
+        assert_eq!(spare(&map, "h"), room_for_append(n) - n);
+        assert!(matches!(entry.value(), ValueRef::String(b) if b[..] == pattern(len)[..]));
+        drop(entry);
+        let bytes = match map.get("h") {
+            Some(ValueRef::String(b)) => b.to_shared(),
+            _ => panic!("no string"),
+        };
+        let (n, written) = map.append_zeros("h", 10, usize::MAX).unwrap();
+        assert!(matches!(written, Written::Replaced(_)));
+        assert_eq!(bytes.len(), len + 10);
+        let mut want = pattern(len);
+        want.resize(n, 0);
+        assert_eq!(text(map.get("h")), Some(want));
+        // Nothing to add; a key not there; refusals.
+        assert!(matches!(
+            map.append_zeros("h", 0, usize::MAX),
+            Ok((_, Written::InPlace))
+        ));
+        assert!(matches!(
+            map.append_zeros("new", 3, 3),
+            Ok((3, Written::New))
+        ));
+        assert_eq!(text(map.get("new")), Some(vec![0; 3]));
+        assert_eq!(
+            map.append_zeros("none", 4, 3).err(),
+            Some(AppendRefused::TooLong)
+        );
+        assert!(map.get("none").is_none());
+        assert_eq!(
+            map.append_zeros("new", 1, 3).err(),
+            Some(AppendRefused::TooLong)
+        );
+        assert_eq!(text(map.get("new")), Some(vec![0; 3]));
+        map.insert("list", KiviDBValue::List(Default::default()));
+        assert_eq!(
+            map.append_zeros("list", 1, usize::MAX).err(),
+            Some(AppendRefused::WrongType)
+        );
+    }
+
+    /// `APPEND`'s refusals write nothing; a key not there is made, an empty
+    /// append onto one that is changes nothing.
+    #[test]
+    fn append_str_refuses_and_makes_as_redis() {
+        let mut map = ShardMap::new();
+        map.insert("list", KiviDBValue::List(Default::default()));
+        assert_eq!(
+            map.append_str("list", b"x", usize::MAX).err(),
+            Some(AppendRefused::WrongType)
+        );
+        map.set_str("k", b"abc");
+        assert_eq!(
+            map.append_str("k", b"de", 4).err(),
+            Some(AppendRefused::TooLong)
+        );
+        assert_eq!(text(map.get("k")), Some(b"abc".to_vec()));
+        // Inline, its entry a block of 16 bytes: a fourth byte takes the next.
+        assert!(matches!(
+            map.append_str("k", b"d", 4),
+            Ok((4, Written::Replaced(_)))
+        ));
+        assert!(matches!(
+            map.append_str("k", b"", 4),
+            Ok((4, Written::InPlace))
+        ));
+        assert!(matches!(
+            map.append_str("new", b"", 4),
+            Ok((0, Written::New))
+        ));
+        assert_eq!(text(map.get("new")), Some(Vec::new()));
+        // A key past its time is not there.
+        map.insert_str_expiring("old", b"gone", Some(1));
+        assert!(matches!(
+            map.append_str("old", b"new", usize::MAX),
+            Ok((3, Written::Replaced(_)))
+        ));
+        assert_eq!(text(map.get("old")), Some(b"new".to_vec()));
+        assert_eq!(map.expires("old"), None);
     }
 
     #[test]

@@ -337,6 +337,44 @@ fn load_shapes(c: &mut Conn) -> Vec<Shape> {
         model: odd.into(),
         encoding: "listpack",
     });
+    // Elements of 1 to 200 bytes, pushed at both ends: chunks in blocks of
+    // every size, the system allocator's among them.
+    let sized: Vec<Vec<u8>> = (0..400)
+        .map(|i| {
+            let mut e = format!("{i}:").into_bytes();
+            e.resize(1 + (i * 37) % 200, b'a' + (i % 26) as u8);
+            e
+        })
+        .collect();
+    let mut sizes = Model::new();
+    for (i, e) in sized.iter().enumerate() {
+        if i % 3 == 0 {
+            c.push("LPUSH", "sizes", std::slice::from_ref(e));
+            sizes.push_front(e.clone());
+        } else {
+            c.push("RPUSH", "sizes", std::slice::from_ref(e));
+            sizes.push_back(e.clone());
+        }
+    }
+    shapes.push(Shape {
+        key: "sizes",
+        model: sizes,
+        encoding: "quicklist",
+    });
+    // A timeline: pushed at the front, trimmed to 300 at the back.
+    c.push("RPUSH", "timeline", &els(0..300));
+    let mut timeline: Model = els(0..300).into();
+    for e in els(5000..5200) {
+        c.push("LPUSH", "timeline", std::slice::from_ref(&e));
+        c.cmd(&["LTRIM", "timeline", "0", "299"]);
+        timeline.push_front(e);
+        timeline.truncate(300);
+    }
+    shapes.push(Shape {
+        key: "timeline",
+        model: timeline,
+        encoding: "quicklist",
+    });
     for shape in &shapes {
         check_shape(c, shape.key, shape, "loaded");
     }

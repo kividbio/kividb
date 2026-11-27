@@ -15,6 +15,160 @@ use crate::{read_lock, write_lock};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// How many buckets of a shard's table `KEYS` goes through before it looks
+/// whether a write waits for the shard ([`keys_of_shard`]): about 2,000 to
+/// 3,500 keys, a few hundred microseconds with keys of 2 KB.
+const KEYS_PART: usize = 4096;
+
+/// What a `KEYS` has found so far ([`keys_of_shard`]).
+#[derive(Default)]
+pub(crate) struct KeysFound {
+    /// The keys that match, each written as a bulk string of the reply.
+    pub(crate) reply: Vec<u8>,
+    /// How many are in `reply`.
+    pub(crate) returned: usize,
+    /// Keys that match but are past their time: not listed, expired once
+    /// the walk is over.
+    pub(crate) past: Vec<store::Key>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Called by the walk, with the shard held, just before it looks whether
+    /// a writer waits for the shard (tests).
+    static BEFORE_LOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The keys of one shard that match `glob`, added to `found`: `KEYS`'s walk.
+///
+/// The shard is gone through [`KEYS_PART`] buckets at a time. Between two
+/// parts the walk looks whether a writer waits for the shard (the lock
+/// cannot be taken again for reading at once); if one does, the walk lets
+/// go, and takes the lock again after it. Held for the whole shard, every
+/// write to it waited for the walk of the shard: 5 ms a shard for 500,000
+/// keys of 2 KB over 32 shards, and ten times that for ten times the keys.
+/// With nobody waiting the walk keeps the lock, and costs one look a part.
+///
+/// A key moves between buckets only when the table grows, rehashes in
+/// place, shrinks or takes a step of a growth, and each of those changes
+/// `ShardMap::layout`: found changed once the lock is back, the shard is
+/// gone through again from its start, what it had found taken back (after
+/// two such tries, in one hold). While a table grows, every write changes the
+/// layout, so the walk starts that shard again, and after two retries holds
+/// it for one pass. Otherwise a key there, unchanged, the whole
+/// time is found once, in its bucket. A key deleted and written again
+/// while the lock was let go of can come back in a bucket not yet gone
+/// through, so a shard whose walk let go of the lock is listed with each
+/// key once ([`dedupe_keys`]).
+///
+/// `always_let_go` lets go between every two parts, and `between` is
+/// called with no lock held each time (for tests).
+pub(crate) fn keys_of_shard(
+    shard: &store::Shard,
+    glob: &super::glob_redis::Glob,
+    found: &mut KeysFound,
+    always_let_go: bool,
+    between: &mut dyn FnMut(),
+) {
+    let (reply_at, returned_at, past_at) = (found.reply.len(), found.returned, found.past.len());
+    let mut tries = 0;
+    'shard: loop {
+        let mut let_go = false;
+        let mut map = read_lock!(shard);
+        let layout = (map.buckets(), map.layout());
+        let part = if tries < 2 { KEYS_PART } else { usize::MAX };
+        let mut at = 0usize;
+        loop {
+            let end = layout.0.min(at.saturating_add(part));
+            map.visit_buckets(at, end, &mut |entry| {
+                let key = entry.key();
+                if !glob.matches(key) {
+                    return;
+                }
+                if entry
+                    .expires()
+                    .is_some_and(crate::commands::helpers::is_past)
+                {
+                    found.past.push(store::Key::new(key));
+                    return;
+                }
+                write_bulk(&mut found.reply, key);
+                found.returned += 1;
+            });
+            at = end;
+            if at >= layout.0 {
+                break;
+            }
+            #[cfg(test)]
+            BEFORE_LOOK.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook();
+                }
+            });
+            if always_let_go || shard.try_read().is_none() {
+                drop(map);
+                between();
+                let_go = true;
+                map = read_lock!(shard);
+                if (map.buckets(), map.layout()) != layout {
+                    drop(map);
+                    found.reply.truncate(reply_at);
+                    found.returned = returned_at;
+                    found.past.truncate(past_at);
+                    tries += 1;
+                    continue 'shard;
+                }
+            }
+        }
+        drop(map);
+        if let_go {
+            dedupe_keys(found, reply_at, returned_at);
+        }
+        return;
+    }
+}
+
+/// The keys `found` has listed since `reply_at` (`returned_at` of them
+/// before), each once: in the order first listed.
+#[cold]
+#[inline(never)]
+fn dedupe_keys(found: &mut KeysFound, reply_at: usize, returned_at: usize) {
+    // Each is `$<len>\r\n<key>\r\n`, as `write_bulk` wrote it.
+    let mut keys: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut at = reply_at;
+    let reply = &found.reply;
+    while at < reply.len() {
+        let digits = at + 1;
+        let mut end = digits;
+        while reply[end] != b'\r' {
+            end += 1;
+        }
+        let len: usize = std::str::from_utf8(&reply[digits..end])
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(0);
+        keys.push(end + 2..end + 2 + len);
+        at = end + 2 + len + 2;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+    if keys.iter().all(|key| seen.insert(&reply[key.clone()])) {
+        return;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(keys.len());
+    let mut once = Vec::with_capacity(reply.len() - reply_at);
+    let mut returned = returned_at;
+    for key in &keys {
+        if seen.insert(&reply[key.clone()]) {
+            write_bulk(&mut once, &reply[key.clone()]);
+            returned += 1;
+        }
+    }
+    found.reply.truncate(reply_at);
+    found.reply.extend_from_slice(&once);
+    found.returned = returned;
+}
+
 /// What `OBJECT ENCODING` says of a value.
 ///
 /// Redis keeps a small value in a compact form and a large one in a general
@@ -240,7 +394,12 @@ fn sort_pattern_value(ctx: &Ctx, pat: &[u8], elem: &[u8]) -> Option<Vec<u8>> {
     let mut tried = false;
     loop {
         let map = read_lock!(shard);
-        return match (map.peek(&key), field) {
+        let found = map.peek(&key);
+        if !tried {
+            // A key a pattern names is a read, counted as Redis counts it.
+            crate::stats::record_lookup(found.is_some());
+        }
+        return match (found, field) {
             (Some(ValueRef::String(s)), None) => Some(s.to_vec()),
             (Some(ValueRef::Hash(h)), Some(field)) => h.read().get_bytes(field).map(|v| v.to_vec()),
             // A field past its deadline is what a hash command makes of it
@@ -420,51 +579,33 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 return Some(crate::pause::HELD_IN_GATE.to_vec());
             }
             let db = &ctx.store[*ctx.selected_db];
-            // A shard at a time, each let go of before the next is taken:
-            // nothing waits for the whole walk, only for the shard it is
-            // looking at (#754). Unlike Redis's, which runs alone, the
-            // answer is not the keyspace at one instant: a key written,
-            // meanwhile, to a shard already gone through is not in it. Only
-            // the keys that match are copied. Copying every key, and
-            // matching the copies, was most of what a `KEYS` over millions
-            // of keys cost.
+            // A shard at a time, and within a shard a part at a time
+            // (`keys_of_shard`): nothing waits for the whole walk (#754),
+            // and a write waits for no more than a part of a shard's
+            // (#1018). Unlike Redis's, which runs alone, the answer is not
+            // the keyspace at one instant: a key written or deleted
+            // meanwhile may be in it or not. A key there, unchanged, for
+            // the whole walk is in it, and no key is in it twice. Only the
+            // keys that match are copied.
             //
             // As `SCAN` does: the pattern is made ready once (`schedule:*`
-            // is a comparison of bytes, not the matcher's walk through the
-            // pattern for each key), a key that matches is told whether it
-            // is past its time from its own entry, and is written straight
-            // into the reply (#789).
+            // is a comparison of bytes, `*/api/*` a search for them, not the
+            // matcher's walk through the pattern for each key), a key that
+            // matches is told whether it is past its time from its own
+            // entry, and is written straight into the reply (#789).
             let glob = super::glob_redis::Glob::new(pattern);
             let walk = || {
-                let mut found = Vec::new();
-                let mut returned = 0usize;
-                // Keys past their time: expired once the shard is let go of.
-                let mut past: Vec<crate::store::Key> = Vec::new();
+                let mut found = KeysFound::default();
                 for shard in db.iter() {
-                    let map = read_lock!(shard);
-                    for entry in map.entries() {
-                        let key = entry.key();
-                        if !glob.matches(key) {
-                            continue;
-                        }
-                        if entry
-                            .expires()
-                            .is_some_and(crate::commands::helpers::is_past)
-                        {
-                            past.push(crate::store::Key::new(key));
-                            continue;
-                        }
-                        write_bulk(&mut found, key);
-                        returned += 1;
-                    }
+                    keys_of_shard(shard, &glob, &mut found, false, &mut || {});
                 }
                 // A key past its time is not listed, and goes. (A key
                 // written again since its shard was let go of is not: it was
                 // not there all along.)
-                for key in &past {
+                for key in &found.past {
                     lazy_expire_on_read(ctx.store, *ctx.selected_db, key);
                 }
-                (found, returned)
+                (found.reply, found.returned)
             };
             let (found, returned) = crate::commands::helpers::long_work(units, walk);
 
@@ -497,8 +638,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let gone = lazy_expire_on_read(ctx.store, db, key);
                     let map = read_lock!(store::get_shard(&ctx.store[db], key));
                     Some(match map.get(key).filter(|_| !gone) {
-                        Some(value) => resp_bulk_str(encoding_of(value)),
-                        None => resp_null_bulk(),
+                        Some(value) => {
+                            crate::stats::record_hit();
+                            resp_bulk_str(encoding_of(value))
+                        }
+                        None => {
+                            crate::stats::record_miss();
+                            resp_null_bulk()
+                        }
                     })
                 }
                 // What is known of a key's use is known while an eviction
@@ -521,8 +668,10 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                         read_lock!(store::get_shard(&ctx.store[db], key)).access(key)
                     };
                     let Some(word) = word else {
+                        crate::stats::record_miss();
                         return Some(resp_null_bulk());
                     };
+                    crate::stats::record_hit();
                     let lfu = crate::eviction::policy().is_lfu();
                     let recording = crate::eviction::recording();
                     Some(match (subcommand.as_str(), lfu) {
@@ -579,12 +728,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                     let key: &[u8] = cmd[2];
                     if is_expired(ctx.store, *ctx.selected_db, key) {
                         expire_on_read(ctx.store, *ctx.selected_db, key);
+                        crate::stats::record_miss();
                         return Some(resp_null_bulk());
                     }
                     let db = &ctx.store[*ctx.selected_db];
                     let shard = store::get_shard(db, key);
                     let map = read_lock!(shard);
-                    if map.contains_key(key) {
+                    let found = map.contains_key(key);
+                    crate::stats::record_lookup(found);
+                    if found {
                         Some(resp_integer(1))
                     } else {
                         Some(resp_null_bulk())
@@ -604,14 +756,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db_ref = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db_ref, key);
             let expires = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)), // key does not exist
-                Some((_, expires)) => expires,
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2)); // key does not exist
+                }
+                Some((_, expires)) => {
+                    crate::stats::record_hit();
+                    expires
+                }
             };
             match expires {
                 None => Some(resp_integer(-1)), // key exists but no TTL
@@ -646,6 +805,7 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Expired keys are invisible — report as "none"
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_simple("none"));
             }
 
@@ -653,8 +813,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             match map.get(key) {
-                Some(v) => Some(resp_simple(v.type_name())),
-                None => Some(resp_simple("none")),
+                Some(v) => {
+                    crate::stats::record_hit();
+                    Some(resp_simple(v.type_name()))
+                }
+                None => {
+                    crate::stats::record_miss();
+                    Some(resp_simple("none"))
+                }
             }
         }
 
@@ -765,14 +931,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let expires = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, expires)) => expires,
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, expires)) => {
+                    crate::stats::record_hit();
+                    expires
+                }
             };
             match expires {
                 None => Some(resp_integer(-1)),
@@ -806,6 +979,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 });
             }
 
+            // The number src's document has in each index, for dst's to
+            // keep its place (`vector::renamed`).
+            crate::vector::renaming(ctx.index_store, db, &src);
             // Read + remove from src, with its time to live
             let (value, expiry) = {
                 let shard = store::get_shard(db_ref, &src);
@@ -866,7 +1042,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
-            // Remove src, write dst
+            // Remove src, write dst; the number src's document has in each
+            // index goes to dst's (`vector::renamed`).
+            crate::vector::renaming(ctx.index_store, db, &src);
             {
                 let shard = store::get_shard(db_ref, &src);
                 write_lock!(shard).remove(src.as_slice());
@@ -943,8 +1121,14 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 match map.get_expiring(src_key.as_slice()) {
                     // A copy of its own, not another name for the same
                     // value. See `deep_clone`.
-                    Some((v, expiry)) => (v.deep_clone(), expiry),
-                    None => return Some(resp_integer(0)),
+                    Some((v, expiry)) => {
+                        crate::stats::record_hit();
+                        (v.deep_clone(), expiry)
+                    }
+                    None => {
+                        crate::stats::record_miss();
+                        return Some(resp_integer(0));
+                    }
                 }
             };
 
@@ -1215,11 +1399,15 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 let key: &[u8] = raw_key;
                 if is_expired(ctx.store, *ctx.selected_db, key) {
                     expire_on_read(ctx.store, *ctx.selected_db, key);
+                    crate::stats::record_miss();
                     continue;
                 }
                 let shard = store::get_shard(db, key);
                 if read_lock!(shard).contains_key(key) {
+                    crate::stats::record_hit();
                     count += 1;
+                } else {
+                    crate::stats::record_miss();
                 }
             }
             Some(resp_integer(count))
@@ -1238,14 +1426,21 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             let key: &[u8] = cmd[1];
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_null_bulk());
             }
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let map = read_lock!(shard);
             let value = match map.get(key) {
-                Some(v) => v.to_value(),
-                None => return Some(resp_null_bulk()),
+                Some(v) => {
+                    crate::stats::record_hit();
+                    v.to_value()
+                }
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_null_bulk());
+                }
             };
             drop(map);
 
@@ -1547,6 +1742,9 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
                 }
             }
 
+            // Counted here, after the move to a thread of its own, which runs
+            // the command again.
+            crate::stats::record_lookup(!missing);
             let mut elements: Vec<Arc<[u8]>> = match map.get(key) {
                 None => vec![], // ← don't return, just give empty vec
                 Some(ValueRef::List(l)) => l.read().iter().map(|e| e.to_shared()).collect(),
@@ -1776,15 +1974,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
             // Lazy-evict expired keys, same as TTL/PTTL do.
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let exp = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, None)) => return Some(resp_integer(-1)),
-                Some((_, Some(at))) => from_unix_ms(at),
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, None)) => {
+                    crate::stats::record_hit();
+                    return Some(resp_integer(-1));
+                }
+                Some((_, Some(at))) => {
+                    crate::stats::record_hit();
+                    from_unix_ms(at)
+                }
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Secs)))
@@ -1802,15 +2010,25 @@ pub fn handle(ctx: &mut Ctx, name: &str) -> Option<Vec<u8>> {
 
             if is_expired(ctx.store, *ctx.selected_db, key) {
                 expire_on_read(ctx.store, *ctx.selected_db, key);
+                crate::stats::record_miss();
                 return Some(resp_integer(-2));
             }
 
             let db = &ctx.store[*ctx.selected_db];
             let shard = store::get_shard(db, key);
             let exp = match read_lock!(shard).get_expiring(key) {
-                None => return Some(resp_integer(-2)),
-                Some((_, None)) => return Some(resp_integer(-1)),
-                Some((_, Some(at))) => from_unix_ms(at),
+                None => {
+                    crate::stats::record_miss();
+                    return Some(resp_integer(-2));
+                }
+                Some((_, None)) => {
+                    crate::stats::record_hit();
+                    return Some(resp_integer(-1));
+                }
+                Some((_, Some(at))) => {
+                    crate::stats::record_hit();
+                    from_unix_ms(at)
+                }
             };
 
             Some(resp_integer(system_time_to_unix(exp, TimeUnit::Millis)))
@@ -1940,5 +2158,222 @@ mod sort_gate_tests {
             ]),
             "o*"
         );
+    }
+}
+
+#[cfg(test)]
+mod keys_walk_tests {
+    use super::{BEFORE_LOOK, KEYS_PART, KeysFound, keys_of_shard};
+    use crate::commands::glob_redis::Glob;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn shard_of(keys: impl Iterator<Item = String>) -> crate::store::Shard {
+        let shard: crate::store::Shard = Arc::new(crate::store::ShardLock::default());
+        {
+            let mut map = shard.write();
+            for key in keys {
+                let _ = map.set_str(key, "v");
+            }
+        }
+        shard
+    }
+
+    /// The keys a reply lists, each with how many times.
+    fn listed(found: &KeysFound) -> HashMap<String, usize> {
+        let mut out = HashMap::new();
+        let mut at = 0;
+        let reply = &found.reply;
+        while at < reply.len() {
+            let end = at + reply[at..].iter().position(|&b| b == b'\r').unwrap();
+            let len: usize = std::str::from_utf8(&reply[at + 1..end])
+                .unwrap()
+                .parse()
+                .unwrap();
+            let key = String::from_utf8(reply[end + 2..end + 2 + len].to_vec()).unwrap();
+            *out.entry(key).or_insert(0) += 1;
+            at = end + 2 + len + 2;
+        }
+        assert_eq!(out.values().sum::<usize>(), found.returned);
+        out
+    }
+
+    fn walk(shard: &crate::store::Shard, pattern: &str, between: &mut dyn FnMut()) -> KeysFound {
+        let mut found = KeysFound::default();
+        keys_of_shard(
+            shard,
+            &Glob::new(pattern.as_bytes()),
+            &mut found,
+            true,
+            between,
+        );
+        found
+    }
+
+    /// In parts, with nothing written between them: what one hold finds.
+    #[test]
+    fn the_walk_in_parts_finds_what_one_hold_finds() {
+        let shard = shard_of((0..20_000).map(|i| format!("k:{i}:{}", i % 7)));
+        assert!(shard.read().buckets() > 2 * KEYS_PART);
+        let mut parts = 0;
+        let found = walk(&shard, "*:3", &mut || parts += 1);
+        assert!(parts >= 2);
+        let mut one = KeysFound::default();
+        keys_of_shard(&shard, &Glob::new(b"*:3"), &mut one, false, &mut || {});
+        assert_eq!(found.reply, one.reply, "the same keys in the same order");
+        let keys = listed(&found);
+        let want = (0..20_000).filter(|i| i % 7 == 3).count();
+        assert_eq!(keys.len(), want);
+        let map = shard.read();
+        let mut all = Vec::new();
+        map.visit_buckets(0, usize::MAX, &mut |e| all.push(e.key().to_vec()));
+        let mut entries: Vec<Vec<u8>> = map.entries().map(|e| e.key().to_vec()).collect();
+        assert_eq!(all, entries, "the buckets in the order of the table's walk");
+        entries.sort();
+        assert_eq!(entries.len(), 20_000);
+    }
+
+    /// Keys written and deleted between the parts, with room in the table,
+    /// and every key that was deleted written again at once: each key
+    /// there all along is listed once, and no key twice.
+    #[test]
+    fn keys_there_all_along_are_listed_once_under_writes() {
+        let shard = shard_of(
+            (0..8_000)
+                .map(|i| format!("stay{i}"))
+                .chain((0..400).map(|i| format!("back{i}"))),
+        );
+        let (buckets, room) = {
+            let map = shard.read();
+            (map.buckets(), map.capacity() - map.len())
+        };
+        let parts = buckets.div_ceil(KEYS_PART);
+        let per_part = (room / parts).min(50);
+        assert!(parts >= 2 && per_part > 0);
+        let mut call = 0;
+        let found = walk(&shard, "*", &mut || {
+            let mut map = shard.write();
+            for i in 0..per_part {
+                let _ = map.set_str(format!("new{call}-{i}"), "x");
+            }
+            // Out and in again: it may come back in a bucket not yet
+            // gone through.
+            for i in 0..400 {
+                drop(map.remove(&format!("back{i}")));
+                let _ = map.set_str(format!("back{i}"), "again");
+            }
+            call += 1;
+        });
+        assert_eq!(
+            shard.read().buckets(),
+            buckets,
+            "no resize: the case under test"
+        );
+        let keys = listed(&found);
+        assert!(keys.values().all(|&n| n == 1), "a key listed twice");
+        assert!((0..8_000).all(|i| keys.contains_key(&format!("stay{i}"))));
+    }
+
+    /// The table grown between two parts: the shard is gone through again,
+    /// and what it lists is the shard as it is.
+    #[test]
+    fn a_shard_resized_between_parts_is_gone_through_again() {
+        let shard = shard_of((0..8_000).map(|i| format!("stay{i}")));
+        let before = shard.read().buckets();
+        let mut calls = 0;
+        let found = walk(&shard, "*", &mut || {
+            calls += 1;
+            if calls == 1 {
+                let mut map = shard.write();
+                for i in 0..40_000 {
+                    let _ = map.set_str(format!("new{i}"), "x");
+                }
+            }
+        });
+        assert!(shard.read().buckets() > before);
+        let keys = listed(&found);
+        assert!(keys.values().all(|&n| n == 1));
+        assert_eq!(keys.len(), 48_000);
+    }
+
+    /// Heavy churn between every two parts, which can resize or rehash the
+    /// table each time: the walk ends (in one hold after two tries), and
+    /// lists each key at most once and every key there all along.
+    #[test]
+    fn the_walk_ends_under_churn() {
+        let shard = shard_of((0..8_000).map(|i| format!("stay{i}")));
+        let mut call = 0;
+        let found = walk(&shard, "stay*", &mut || {
+            let mut map = shard.write();
+            for i in 0..6_000 {
+                let _ = map.set_str(format!("churn{call}-{i}"), "x");
+            }
+            for i in 0..6_000 {
+                drop(map.remove(&format!("churn{call}-{i}")));
+            }
+            call += 1;
+        });
+        let keys = listed(&found);
+        assert_eq!(keys.len(), 8_000);
+        assert!(keys.values().all(|&n| n == 1));
+    }
+
+    /// A writer that comes while the walk holds the shard gets it between
+    /// two parts. The walk is held between the first two parts, with the
+    /// shard, until the writer waits for it: then it lets go, and the writer
+    /// writes before the walk ends.
+    #[test]
+    fn a_waiting_writer_gets_the_shard_between_parts() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let shard = shard_of((0..200_000).map(|i| format!("k{i}")));
+        let walking = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let (held, flag) = (Arc::clone(&shard), Arc::clone(&walking));
+        let mut first = true;
+        BEFORE_LOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if !std::mem::take(&mut first) {
+                    return;
+                }
+                flag.store(true, SeqCst);
+                // A reader is refused once a writer waits.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while held.try_read().is_some() {
+                    assert!(std::time::Instant::now() < until, "the writer never waited");
+                    std::thread::yield_now();
+                }
+            }));
+        });
+        let mut let_go = 0;
+        let mut found = KeysFound::default();
+        std::thread::scope(|s| {
+            let writer = s.spawn(|| {
+                while !walking.load(SeqCst) {
+                    std::hint::spin_loop();
+                }
+                let _ = shard.write().set_str("late", "x");
+                wrote.store(true, SeqCst);
+            });
+            keys_of_shard(&shard, &Glob::new(b"k*"), &mut found, false, &mut || {
+                let_go += 1;
+                // With no lock held: the writer, which was waiting, has the
+                // shard and writes before the walk goes on.
+                let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !wrote.load(SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "the writer was not served"
+                    );
+                    std::thread::yield_now();
+                }
+            });
+            writer.join().unwrap();
+        });
+        BEFORE_LOOK.with(|hook| *hook.borrow_mut() = None);
+        assert!(let_go > 0);
+        assert!(shard.read().contains_key("late"));
+        let keys = listed(&found);
+        assert!(keys.values().all(|&n| n == 1));
+        assert!((0..200_000).all(|i| keys.contains_key(&format!("k{i}"))));
     }
 }

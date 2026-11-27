@@ -622,6 +622,10 @@ pub fn skips(name: &str, cmd: &[&[u8]]) -> bool {
     let sub = |word: &[u8]| cmd.get(1).is_some_and(|s| s.eq_ignore_ascii_case(word));
     let arg = |at: usize, word: &[u8]| cmd.get(at).is_some_and(|s| s.eq_ignore_ascii_case(word));
     match name {
+        // `DEBUG` too, `OBJECT` and `DIGEST-VALUE` among it: they take
+        // neither the gate nor a key's lock, so they may see a script that
+        // runs beside others part way through. Left so on purpose: they are
+        // for looking at a server, and must answer while it is busy.
         "WAIT" | "WAITAOF" | "MIGRATE" | "SHUTDOWN" | "DEBUG" => true,
         "CLUSTER" => {
             sub(b"ADDSLOTS")

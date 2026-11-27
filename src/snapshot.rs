@@ -47,6 +47,10 @@ pub struct LoadedSnapshot {
     /// image that holds none, or one written before they were kept. Loaded
     /// with [`restore_functions`].
     pub functions: Option<Vec<u8>>,
+    /// The order of each index's documents: the index, and its documents'
+    /// keys, first written first. Empty for an image written before it was
+    /// kept. Given to the indexes with `vector::restore_document_orders`.
+    pub document_orders: Vec<(String, crate::vector::postings::KeyList)>,
 }
 
 /// Per-database key expiries as absolute Unix milliseconds.
@@ -86,6 +90,12 @@ const KDB_SCORE_MAGIC: &[u8; 8] = b"KIVISR1\0";
 /// the same reason as the score: an older release reads everything else, and
 /// stops here.
 const KDB_NOFREQS_MAGIC: &[u8; 8] = b"KIVINF1\0";
+/// The order of each index's documents, which `SORTBY` gives documents it
+/// finds level in, and a query without it (see `vector::postings`): a count,
+/// then each index's name, a count, and its documents' keys, first written
+/// first. Last, for the same reason as `NOFREQS`: an older release reads
+/// everything else, and stops here.
+const KDB_ORDER_MAGIC: &[u8; 8] = b"KIVIDO1\0";
 
 // Field-type tags used inside the index schema section.
 const SCHEMA_FIELD_TEXT: u8 = 0;
@@ -335,6 +345,22 @@ impl Write for PacedFile {
 fn write_bytes(w: &mut impl Write, data: &[u8]) -> io::Result<()> {
     w.write_all(&(data.len() as u32).to_le_bytes())?;
     w.write_all(data)
+}
+
+/// A hash's field count, then each field's saved name and its value, in
+/// [`crate::types::HashFields::iter`]'s order: what a KDB entry and a
+/// `DUMP` payload of a hash hold. One walk of the hash, which reads no
+/// field's TTL ([`crate::types::HashFields::for_each`]).
+fn write_hash_fields(w: &mut impl Write, fields: &crate::types::HashFields) -> io::Result<()> {
+    w.write_all(&(fields.len() as u32).to_le_bytes())?;
+    let mut written = Ok(());
+    fields.for_each(|field, value| {
+        if written.is_ok() {
+            written = write_bytes(w, &crate::hash_fields::saved_name(field))
+                .and_then(|()| write_bytes(w, &value));
+        }
+    });
+    written
 }
 
 /// `buf` is reused across vectors to avoid one allocation per vector.
@@ -714,12 +740,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
 
         ValueRef::Hash(arc) => {
             w.write_all(&[TAG_HASH])?;
-            let inner = arc.read();
-            w.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.iter() {
-                write_bytes(w, &crate::hash_fields::saved_name(field))?;
-                write_bytes(w, &val)?;
-            }
+            write_hash_fields(w, &arc.read())?;
         }
 
         ValueRef::Set(arc) => {
@@ -925,11 +946,7 @@ pub fn write_kdb_value(w: &mut impl Write, value: crate::store::ValueRef<'_>) ->
         ValueRef::HashEx(arc) => {
             w.write_all(&[TAG_HASH_EX])?;
             let inner = arc.read();
-            w.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.fields.iter() {
-                write_bytes(w, &crate::hash_fields::saved_name(field))?;
-                write_bytes(w, &val)?;
-            }
+            write_hash_fields(w, &inner.fields)?;
             // Expiries: u32 count followed by (field, unix_ms) pairs, the
             // deadlines as they are kept (#594).
             w.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
@@ -1092,7 +1109,8 @@ pub fn write_kdb_image<K: AsRef<[u8]>>(
     write_kdb_alias_section(w, index_store)?;
     write_kdb_language_section(w, index_store)?;
     write_kdb_score_section(w, index_store)?;
-    write_kdb_nofreqs_section(w, index_store)
+    write_kdb_nofreqs_section(w, index_store)?;
+    write_kdb_order_section(w, index_store)
 }
 
 /// The language section: `index`, its language, its language field (empty
@@ -1191,6 +1209,181 @@ fn write_kdb_nofreqs_section(
         write_bytes(w, name.as_bytes())?;
     }
     Ok(())
+}
+
+/// The document order section: the order of the documents of each index
+/// that numbers them, as its postings keep it. Absent when no index holds a
+/// document.
+fn write_kdb_order_section(
+    w: &mut impl Write,
+    index_store: Option<&crate::vector::IndexStore>,
+) -> io::Result<()> {
+    let mut held = crate::memory_use::NotCounted::default();
+    let written = OrderCapture::take(index_store).write(w, &mut held);
+    let bytes = held.bytes();
+    held.release(bytes);
+    written
+}
+
+/// What the document order section is made of, as [`OrderCapture::take`]
+/// copied it: by index, each id's number and key. Copied while writes are
+/// held (a copy of the numbers and of the pointers to the keys), put in
+/// order and written after.
+#[derive(Default)]
+struct OrderCapture {
+    indexes: Vec<IndexOrder>,
+}
+
+/// Keys [`OrderCapture::write`] reads under one hold of an index's postings.
+const KEYS_A_PART: usize = 1 << 14;
+
+/// One index's part of an [`OrderCapture`]: its name, each id's number, the
+/// ids in use, its postings, which the keys are read from after, and the
+/// keys of the documents that left since (`Postings::order_capture`).
+type IndexOrder = (
+    String,
+    Vec<u64>,
+    crate::vector::postings::Bits,
+    crate::vector::postings::SharedPostings,
+    crate::vector::postings::CaptureLog,
+);
+
+impl OrderCapture {
+    /// The order of every index's documents as it is now. An index whose
+    /// documents a walk is putting in (`FT.CREATE` over keys already there,
+    /// a rebuild) is left out: some of them have no place yet, and the
+    /// snapshot's documents load by key.
+    fn take(index_store: Option<&crate::vector::IndexStore>) -> Self {
+        let mut capture = Self::default();
+        let Some(store) = index_store else {
+            return capture;
+        };
+        let guard = store.read();
+        for (name, def) in guard.iter() {
+            if crate::vector::is_alias(name, def) || !def.gives_ids() {
+                continue;
+            }
+            let mut postings = def.postings.write();
+            if postings.is_empty() || postings.walking() {
+                continue;
+            }
+            let (written, live, left) = postings.order_capture();
+            drop(postings);
+            capture.indexes.push((
+                def.name.clone(),
+                written,
+                live,
+                std::sync::Arc::clone(&def.postings),
+                left,
+            ));
+        }
+        capture
+    }
+
+    /// Bytes the copy holds.
+    fn bytes(&self) -> usize {
+        self.indexes
+            .iter()
+            .map(|(_, written, live, _, _)| written.capacity() * 8 + live.bytes())
+            .sum()
+    }
+
+    /// The section: each index's documents as the capture found them, first
+    /// written first (by key where they share a number). What it lays out
+    /// is counted in `held` while it is, and let go of after each index.
+    fn write(
+        mut self,
+        w: &mut impl Write,
+        held: &mut crate::memory_use::NotCounted,
+    ) -> io::Result<()> {
+        if self.indexes.is_empty() {
+            return Ok(());
+        }
+        self.indexes.sort_by(|a, b| a.0.cmp(&b.0));
+        w.write_all(KDB_ORDER_MAGIC)?;
+        w.write_all(&(self.indexes.len() as u32).to_le_bytes())?;
+        for (name, written, live, postings, left) in self.indexes {
+            // The keys, read from the postings a part at a time: writes go
+            // on meanwhile, and wait for no more than one part. A document
+            // that left since the capture goes by the key it had (`left`),
+            // whatever its id is given to.
+            let mut keyed: Vec<(u64, std::sync::Arc<str>)> = Vec::with_capacity(live.count());
+            let laid_out = keyed.capacity() * std::mem::size_of::<(u64, std::sync::Arc<str>)>();
+            held.add(laid_out);
+            let number = |id: u32| written.get(id as usize).copied().unwrap_or(u64::MAX);
+            let mut ids = live.iter().peekable();
+            while ids.peek().is_some() {
+                let p = postings.peek();
+                let gone = left.lock();
+                for id in ids.by_ref().take(KEYS_A_PART) {
+                    let key = gone.get(&id).or_else(|| p.key(id));
+                    if let Some(key) = key {
+                        keyed.push((number(id), std::sync::Arc::clone(key)));
+                    }
+                }
+            }
+            // The keys of the documents that left are held here, not by the
+            // index: counted too.
+            let gone: usize = {
+                let gone = left.lock();
+                gone.len() * 48 + gone.values().map(|key| key.len()).sum::<usize>()
+            };
+            held.add(gone);
+            keyed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            crate::aof::failpoint("snapshot-order-section");
+            write_bytes(w, name.as_bytes())?;
+            w.write_all(&(keyed.len() as u64).to_le_bytes())?;
+            for (_, key) in &keyed {
+                write_bytes(w, key.as_bytes())?;
+            }
+            drop(keyed);
+            drop(left);
+            held.release(laid_out + gone);
+        }
+        Ok(())
+    }
+}
+
+/// Body of the document order section; the magic has already been
+/// consumed. With `keep` unset nothing of it is kept.
+fn read_order_section(
+    r: &mut impl Read,
+    keep: bool,
+) -> io::Result<Vec<(String, crate::vector::postings::KeyList)>> {
+    let not_text = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("a document order {what} that is not UTF-8"),
+        )
+    };
+    let mut orders = Vec::new();
+    for _ in 0..read_u32_le(r)? {
+        let index = String::from_utf8(read_bytes(r)?).map_err(|_| not_text("index name"))?;
+        let count = read_u64_le(r)?;
+        let mut keys = crate::vector::postings::KeyList::default();
+        for _ in 0..count {
+            if !keep {
+                skip_bytes(r)?;
+                continue;
+            }
+            // Into the one buffer; a length past a key's is read as it
+            // comes (see `read_exactly`), not made room for at once.
+            let len = read_u32_le(r)? as usize;
+            if len <= 1 << 16 {
+                r.read_exact(keys.room(len))?;
+                keys.seal();
+            } else {
+                keys.push(&read_exactly(r, len)?);
+            }
+            if std::str::from_utf8(keys.get(keys.len() - 1)).is_err() {
+                return Err(not_text("key"));
+            }
+        }
+        if keep {
+            orders.push((index, keys));
+        }
+    }
+    Ok(orders)
 }
 
 /// Body of the `NOFREQS` section; the magic has already been consumed.
@@ -2947,6 +3140,7 @@ fn read_image_body(
     let mut dictionaries = Vec::new();
     let mut expiries: ExpiryMaps = (0..result.len()).map(|_| HashMap::new()).collect();
     let mut functions = None;
+    let mut document_orders = Vec::new();
     loop {
         let mut magic = [0u8; 8];
         let from = match next_byte.take() {
@@ -3017,6 +3211,8 @@ fn read_image_body(
             whole_section("score", read_score_section(&mut r, &mut index_schemas))?;
         } else if &magic == KDB_NOFREQS_MAGIC {
             whole_section("NOFREQS", read_nofreqs_section(&mut r, &mut index_schemas))?;
+        } else if &magic == KDB_ORDER_MAGIC {
+            document_orders = whole_section("document order", read_order_section(&mut r, keep))?;
         } else if strict {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3074,6 +3270,7 @@ fn read_image_body(
             hnsw_graphs,
             expiries,
             functions,
+            document_orders,
         },
         keys_read,
     ))
@@ -5332,6 +5529,9 @@ pub struct FrozenDataset {
     score_section: Vec<u8>,
     /// The indexes made with `NOFREQS` (see [`write_kdb_nofreqs_section`]).
     nofreqs_section: Vec<u8>,
+    /// The order of each index's documents, put in order and written after
+    /// the capture (see [`write_kdb_order_section`]).
+    order_section: OrderCapture,
     /// What all of the above takes, which is no key's and which deleting
     /// keys does not give back: not counted against `maxmemory` while the
     /// capture lives (#284). Counted as it is laid out, not at the end
@@ -6190,6 +6390,10 @@ fn freeze(
     let mut nofreqs_section = CapturedBuf::default();
     write_kdb_score_section(&mut score_section, index_store)?;
     write_kdb_nofreqs_section(&mut nofreqs_section, index_store)?;
+    // A copy of the numbers and of the pointers to the keys: the sorting
+    // and the writing come after writes go on.
+    let order_section = OrderCapture::take(index_store);
+    not_counted.add(order_section.bytes());
     not_counted.add(functions.as_ref().map_or(0, |f| f.len()));
     let mut settle = |section: CapturedBuf| {
         let (bytes, counted) = section.finish();
@@ -6212,6 +6416,7 @@ fn freeze(
         language_section,
         score_section,
         nofreqs_section,
+        order_section,
         not_counted,
         spills,
     })
@@ -6458,7 +6663,11 @@ impl FrozenDataset {
         out.write_all(&self.alias_section)?;
         out.write_all(&self.language_section)?;
         out.write_all(&self.score_section)?;
-        out.write_all(&self.nofreqs_section)
+        out.write_all(&self.nofreqs_section)?;
+        let held = self.order_section.bytes();
+        std::mem::take(&mut self.order_section).write(out, &mut self.not_counted)?;
+        self.not_counted.release(held);
+        Ok(())
     }
 }
 
@@ -6770,12 +6979,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         }
         KiviDBValue::Hash(arc) => {
             out.write_all(&[TAG_HASH])?;
-            let inner = arc.read();
-            out.write_all(&(inner.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.iter() {
-                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
-                write_bytes_vec(out, &val)?;
-            }
+            write_hash_fields(out, &arc.read())?;
         }
         KiviDBValue::Set(arc) => {
             out.write_all(&[TAG_SET])?;
@@ -6836,11 +7040,7 @@ pub fn serialize_value(value: &KiviDBValue, out: &mut Vec<u8>) -> std::io::Resul
         KiviDBValue::HashEx(arc) => {
             out.write_all(&[TAG_HASH_EX])?;
             let inner = arc.read();
-            out.write_all(&(inner.fields.len() as u32).to_le_bytes())?;
-            for (field, val) in inner.fields.iter() {
-                write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
-                write_bytes_vec(out, &val)?;
-            }
+            write_hash_fields(out, &inner.fields)?;
             out.write_all(&(inner.expiries.len() as u32).to_le_bytes())?;
             for (field, at) in inner.expiries.iter() {
                 write_bytes_vec(out, &crate::hash_fields::saved_name(field))?;
@@ -8294,7 +8494,7 @@ mod field_option_tests {
     }
 
     /// The magic of every section an image can carry, and its name.
-    const EVERY_SECTION: [(&str, &[u8; 8]); 11] = [
+    const EVERY_SECTION: [(&str, &[u8; 8]); 12] = [
         ("index", KDB_INDEX_MAGIC),
         ("HNSW", KDB_HNSW_MAGIC),
         ("expiry", KDB_EXPIRY_MAGIC),
@@ -8306,11 +8506,13 @@ mod field_option_tests {
         ("language", KDB_LANGUAGE_MAGIC),
         ("score", KDB_SCORE_MAGIC),
         ("NOFREQS", KDB_NOFREQS_MAGIC),
+        ("document order", KDB_ORDER_MAGIC),
     ];
 
     /// An image that holds every section an image can carry: one key with a
     /// time to live, indexes with an HNSW field, an alias, field options,
-    /// synonyms, a language and a score, and function libraries.
+    /// synonyms, a language and a score, function libraries, and documents
+    /// in an index.
     fn image_with_every_section() -> Vec<u8> {
         let index = score_index;
         let mut synonyms = crate::vector::SynonymGroups::new();
@@ -8360,6 +8562,11 @@ mod field_option_tests {
             store.insert("scored-alias".into(), scored);
             store.insert("plain".into(), index("plain", 1.0, None));
             store.insert("empty".into(), index("empty", 1.0, Some("")));
+            let fields = [("t".to_string(), std::sync::Arc::from(&b"words"[..]))];
+            let mut postings = store.get("plain").unwrap().postings.write();
+            for key in ["plain:b", "plain:a"] {
+                postings.write(key, &fields, true);
+            }
         }
 
         let db = crate::store::new_store(1);
@@ -8385,7 +8592,7 @@ mod field_option_tests {
             .windows(8)
             .position(|w| w == KDB_SCORE_MAGIC)
             .expect("score section");
-        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 2] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 3] {
             let at = image
                 .windows(8)
                 .position(|w| w == magic)
@@ -8395,18 +8602,29 @@ mod field_option_tests {
                 "{name} section comes after the score section"
             );
         }
-        // The `NOFREQS` section is the last: a release that does not know it
-        // stops there and reads everything before it.
         let nofreqs_at = image
             .windows(8)
             .position(|w| w == KDB_NOFREQS_MAGIC)
             .expect("NOFREQS section");
         assert!(score_at < nofreqs_at);
-        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 2] {
             let at = image.windows(8).position(|w| w == magic).unwrap();
             assert!(
                 at < nofreqs_at,
                 "{name} section comes after the NOFREQS section"
+            );
+        }
+        // The document order section is the last: a release that does not
+        // know it stops there and reads everything before it.
+        let order_at = image
+            .windows(8)
+            .position(|w| w == KDB_ORDER_MAGIC)
+            .expect("document order section");
+        for &(name, magic) in &EVERY_SECTION[..EVERY_SECTION.len() - 1] {
+            let at = image.windows(8).position(|w| w == magic).unwrap();
+            assert!(
+                at < order_at,
+                "{name} section comes after the document order section"
             );
         }
 
@@ -8426,6 +8644,17 @@ mod field_option_tests {
         assert_eq!(of("empty").score_field.as_deref(), Some(""));
         assert!(of("scored").nofreqs);
         assert!(!of("plain").nofreqs && !of("empty").nofreqs);
+        let plain: Vec<&str> = loaded
+            .document_orders
+            .iter()
+            .find(|(name, _)| name == "plain")
+            .map(|(_, keys)| {
+                keys.iter()
+                    .map(|key| std::str::from_utf8(key).unwrap())
+                    .collect()
+            })
+            .unwrap();
+        assert_eq!(plain, ["plain:b", "plain:a"], "first written first");
 
         // Without the section (an image of an older release), the defaults.
         let mut bare = Vec::new();
@@ -8441,6 +8670,98 @@ mod field_option_tests {
         .unwrap();
         assert!(!bare.windows(8).any(|w| w == KDB_SCORE_MAGIC));
         assert!(!bare.windows(8).any(|w| w == KDB_NOFREQS_MAGIC));
+        // No index holds a document: no order to keep.
+        assert!(!bare.windows(8).any(|w| w == KDB_ORDER_MAGIC));
+    }
+
+    /// An image of no keys with `section` after it.
+    fn image_with_order_section(section: &[u8]) -> Vec<u8> {
+        let mut image = Vec::new();
+        write_kdb_image(&mut image, &[HashMap::<Key, KiviDBValue>::new()], None).unwrap();
+        image.extend_from_slice(section);
+        image
+    }
+
+    /// A document order section of one index, `name`, claiming `count` keys
+    /// and holding `keys`.
+    fn order_section(name: &[u8], count: u64, keys: &[&[u8]]) -> Vec<u8> {
+        let mut section = KDB_ORDER_MAGIC.to_vec();
+        section.extend_from_slice(&1u32.to_le_bytes());
+        write_bytes(&mut section, name).unwrap();
+        section.extend_from_slice(&count.to_le_bytes());
+        for key in keys {
+            write_bytes(&mut section, key).unwrap();
+        }
+        section
+    }
+
+    #[test]
+    fn a_document_order_section_that_cannot_be_read_is_refused() {
+        // Whole, of an index the image does not hold: read, and of no use.
+        let image = image_with_order_section(&order_section(b"nope", 2, &[b"a", b"b"]));
+        let loaded = load_snapshot_bytes(&image).unwrap();
+        assert_eq!(loaded.document_orders.len(), 1);
+        let store = crate::vector::new_index_store();
+        crate::vector::restore_document_orders(&store, loaded.document_orders);
+        assert!(store.read().is_empty());
+        assert!(verify_snapshot(&image).is_ok());
+
+        // A key that is not text: refused, not loaded.
+        let image = image_with_order_section(&order_section(b"ix", 1, &[b"\xff\xfe"]));
+        let err = load_snapshot_bytes(&image)
+            .err()
+            .expect("a key that is not text loaded");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        // More keys claimed than there are: cut short.
+        let image = image_with_order_section(&order_section(b"ix", 5, &[b"a"]));
+        let err = load_snapshot_bytes(&image)
+            .err()
+            .expect("a short section loaded");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "{err}");
+        assert!(verify_snapshot(&image).is_err());
+    }
+
+    #[test]
+    fn an_index_a_walk_is_filling_has_no_order_in_the_snapshot() {
+        let store = crate::vector::new_index_store();
+        store
+            .write()
+            .insert("plain".into(), score_index("plain", 1.0, None));
+        let fields = [("t".to_string(), std::sync::Arc::from(&b"words"[..]))];
+        let image = |store: &crate::vector::IndexStore| {
+            let mut image = Vec::new();
+            write_kdb_image(
+                &mut image,
+                &[HashMap::<Key, KiviDBValue>::new()],
+                Some(store),
+            )
+            .unwrap();
+            load_snapshot_bytes(&image).unwrap().document_orders
+        };
+        {
+            let guard = store.read();
+            let mut postings = guard.get("plain").unwrap().postings.write();
+            postings.begin_walk();
+            postings.write_doc("plain:b", &crate::types::HashFields::default());
+            postings.write("plain:a", &fields, true);
+        }
+        // Some of its documents have no place yet: none is written.
+        assert!(image(&store).is_empty());
+        store
+            .read()
+            .get("plain")
+            .unwrap()
+            .postings
+            .write()
+            .end_walk();
+        let orders = image(&store);
+        let keys: Vec<&str> = orders[0]
+            .1
+            .iter()
+            .map(|k| std::str::from_utf8(k).unwrap())
+            .collect();
+        assert_eq!(keys, ["plain:b", "plain:a"]);
     }
 
     /// An image cut anywhere inside a section after its databases, in its

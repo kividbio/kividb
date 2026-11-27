@@ -317,11 +317,14 @@ fn look_cost(cf: &Cuckoo) -> u64 {
 /// key, `Err(())` if it holds another type.
 fn with_filter<T>(ctx: &Ctx, key: &[u8], f: impl FnOnce(&Cuckoo) -> T) -> Result<Option<T>, ()> {
     if crate::commands::helpers::lazy_expire_on_read(ctx.store, *ctx.selected_db, key) {
+        crate::stats::record_miss();
         return Ok(None);
     }
     let shard = store::get_shard(&ctx.store[*ctx.selected_db], key);
     let map = read_lock!(shard);
-    match map.get(key) {
+    let found = map.get(key);
+    crate::stats::record_lookup(found.is_some());
+    match found {
         None => Ok(None),
         Some(ValueRef::Sketch(sketch)) => match &*sketch.read() {
             Sketch::Cuckoo(cf) => Ok(Some(f(cf))),

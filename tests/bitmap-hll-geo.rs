@@ -355,6 +355,72 @@ fn test_bitpos_find_clear_bit() {
     assert_eq!(c.cmds(&["BITPOS", "nosuch", "1"]).as_int(), -1);
 }
 
+#[test]
+fn test_bitpos_empty_and_outside_range() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SET", "empty", ""]);
+    assert_eq!(c.cmds(&["BITPOS", "empty", "0"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "empty", "1", "0", "0"]).as_int(), -1);
+    assert_eq!(
+        c.cmds(&["BITPOS", "empty", "0", "0", "0", "BIT"]).as_int(),
+        -1
+    );
+
+    for i in 0..8 {
+        c.cmds(&["SETBIT", "bm", &i.to_string(), "1"]);
+    }
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "0"]).as_int(), 8);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "0", "0"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "0", "1"]).as_int(), -1);
+    assert_eq!(c.cmds(&["BITPOS", "bm", "1", "1"]).as_int(), -1);
+}
+
+#[test]
+fn test_bitmap_numbers_use_redis_integer_form() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    c.cmds(&["SETBIT", "bm", "0", "1"]);
+
+    let bit_offset = "ERR bit offset is not an integer or out of range";
+    for args in [
+        &["GETBIT", "bm", "01"][..],
+        &["GETBIT", "bm", "+1"][..],
+        &["SETBIT", "bm", "01", "1"][..],
+        &["BITFIELD", "bm", "GET", "u8", "01"][..],
+        &["BITFIELD", "bm", "GET", "u8", "#01"][..],
+        &["GETBIT", "bm", "4294967296"][..],
+    ] {
+        assert_eq!(c.cmds(args).error_str(), bit_offset, "{args:?}");
+    }
+    assert_eq!(c.cmds(&["GETBIT", "bm", "4294967295"]).as_int(), 0);
+
+    assert_eq!(
+        c.cmds(&["SETBIT", "bm", "0", "00"]).error_str(),
+        "ERR bit is not an integer or out of range"
+    );
+    assert_eq!(
+        c.cmds(&["BITFIELD", "bm", "GET", "u08", "0"]).error_str(),
+        "ERR Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is."
+    );
+
+    let value = "ERR value is not an integer or out of range";
+    for args in [
+        &["BITCOUNT", "bm", "0", "01"][..],
+        &["BITPOS", "bm", "1", "01"][..],
+        &["BITPOS", "bm", "-0"][..],
+        &["BITFIELD", "bm", "SET", "u8", "0", "01"][..],
+        &["BITFIELD", "bm", "SET", "u8", "0", "x"][..],
+        &["BITFIELD", "bm", "INCRBY", "u8", "0", "+1"][..],
+    ] {
+        assert_eq!(c.cmds(args).error_str(), value, "{args:?}");
+    }
+}
+
 // BITOP AND / OR / XOR / NOT
 #[test]
 fn test_bitop_and_or_xor() {
@@ -552,6 +618,114 @@ fn test_bitmap_wrongtype() {
     assert!(c.cmds(&["SETBIT", "mylist", "0", "1"]).is_error());
     assert!(c.cmds(&["BITCOUNT", "mylist"]).is_error());
     assert!(c.cmds(&["BITPOS", "mylist", "1"]).is_error());
+    for cmd in [
+        &["SETBIT", "mylist", "0", "0"][..],
+        &["BITFIELD", "mylist", "GET", "u8", "0"],
+        &[
+            "BITFIELD", "mylist", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "1",
+        ],
+        &["BITFIELD_RO", "mylist", "GET", "u8", "0"],
+    ] {
+        assert!(c.cmds(cmd).error_str().starts_with("WRONGTYPE"), "{cmd:?}");
+    }
+    assert_eq!(c.cmds(&["LRANGE", "mylist", "0", "-1"]).as_array().len(), 1);
+}
+
+// A watched key is left alone by the bitmap commands that write nothing, on
+// strings in an entry, in a slab and on their own, and is changed by the ones
+// that write.
+#[test]
+fn test_bitmap_watch_breaks_only_on_a_write() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+    let mut other = Conn::connect(port);
+
+    for len in [100usize, 16 << 10, 64 << 10] {
+        // 0x55: the first bit of each byte clear, the second set.
+        let value = vec![0x55u8; len];
+        assert!(c.cmd(&[b"SET", b"bm", &value]).is_ok());
+        let last = ((len - 1) * 8).to_string();
+        let second = ((len - 1) * 8 + 1).to_string();
+        let watched = |c: &mut Conn, other: &mut Conn, cmd: &[&str]| {
+            assert!(c.cmds(&["WATCH", "bm"]).is_ok());
+            let reply = other.cmds(cmd);
+            assert!(c.cmds(&["MULTI"]).is_ok());
+            c.cmds(&["PING"]);
+            (reply, !c.cmds(&["EXEC"]).is_nil())
+        };
+        let nothing: [&[&str]; 6] = [
+            &["SETBIT", "bm", &last, "0"],
+            &["SETBIT", "bm", &second, "1"],
+            &["BITFIELD", "bm", "GET", "u8", "0", "GET", "u8", &last],
+            &["BITFIELD_RO", "bm", "GET", "u8", &last],
+            &[
+                "BITFIELD", "bm", "OVERFLOW", "FAIL", "INCRBY", "u8", &last, "200",
+            ],
+            &["BITFIELD", "bm", "SET", "u8", "0", "1", "GET"],
+        ];
+        for cmd in nothing {
+            let (_, kept) = watched(&mut c, &mut other, cmd);
+            assert!(kept, "{len}: {cmd:?} broke the watch");
+        }
+        assert_eq!(c.cmds(&["GET", "bm"]), RespValue::Bulk(value), "{len}");
+
+        let writes: [&[&str]; 3] = [
+            &["SETBIT", "bm", &last, "1"],
+            &[
+                "BITFIELD", "bm", "SET", "u8", "0", "1", "OVERFLOW", "FAIL", "INCRBY", "u8", "0",
+                "255",
+            ],
+            &[
+                "BITFIELD", "bm", "OVERFLOW", "FAIL", "INCRBY", "u8", "8", "255", "SET", "u8", "8",
+                "2",
+            ],
+        ];
+        for cmd in writes {
+            let (reply, kept) = watched(&mut c, &mut other, cmd);
+            assert!(!reply.is_error(), "{len}: {cmd:?}");
+            assert!(!kept, "{len}: {cmd:?} kept the watch");
+        }
+        let RespValue::Bulk(now) = c.cmds(&["GET", "bm"]) else {
+            panic!("GET bm");
+        };
+        assert_eq!((now[0], now[1], now[len - 1]), (1, 2, 0xD5), "{len}");
+    }
+}
+
+// Bitmap commands that write nothing, queued in a transaction, answer as
+// they do outside one.
+#[test]
+fn test_bitmap_reads_in_a_transaction() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert!(c.cmd(&[b"SET", b"bm", &vec![0x55u8; 64 << 10]]).is_ok());
+    assert!(c.cmds(&["MULTI"]).is_ok());
+    for cmd in [
+        &["SETBIT", "bm", "1", "1"][..],
+        &["BITFIELD", "bm", "GET", "u8", "0"],
+        &["BITFIELD_RO", "bm", "GET", "u4", "4"],
+        &[
+            "BITFIELD", "bm", "OVERFLOW", "FAIL", "INCRBY", "u8", "0", "200",
+        ],
+        &["BITFIELD", "bm", "SET", "u8", "0", "1", "GET", "u8", "0"],
+    ] {
+        assert_eq!(
+            c.cmds(cmd),
+            RespValue::SimpleStr("QUEUED".into()),
+            "{cmd:?}"
+        );
+    }
+    let reply = c.cmds(&["EXEC"]);
+    let replies = reply.as_array();
+    assert_eq!(replies[0].as_int(), 1);
+    assert_eq!(replies[1].as_array()[0].as_int(), 0x55);
+    assert_eq!(replies[2].as_array()[0].as_int(), 5);
+    assert!(replies[3].as_array()[0].is_nil());
+    let last: Vec<i64> = replies[4].as_array().iter().map(|r| r.as_int()).collect();
+    assert_eq!(last, [0x55, 1]);
 }
 
 // Real-world scenario: daily active user tracking with bitmaps

@@ -23,6 +23,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `GEOFILTER` is an error (that master refuses its part), not a partial
     reply.
 
+- **Cluster: masters vote on when the slots a replica claims came to its
+  master.** Asked for its vote, a master refuses it to a replica that claims
+  a slot of its master at an older epoch than the slot came to the master
+  at; the replica stands again without that slot. Each master keeps
+  `<cluster-config-file>.came-at` beside `nodes.conf`; one that starts
+  without it takes each slot to have come at its owner's config epoch. `CLUSTER FAILOVER TAKEOVER` takes the master's
+  slots without asking the other masters, whatever the replica holds of
+  them: use `FORCE` where the vote should decide.
+
 - **A query that names no `DIALECT` is read in dialect 1 (#247).** It is
   read in the default dialect, as in Redis: 1, which `search-default-dialect`
   (`CONFIG SET`, the configuration file) or `FT.CONFIG SET DEFAULT_DIALECT`
@@ -172,6 +181,86 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   counted in FT.INFO's `hash_indexing_failures`, with the last error and key
   under `Index Errors`. `SORTBY` on a `GEO` field and `GEOSHAPE` fields are
   still refused.
+
+- **`CONFIG REWRITE` writes the ACL users when no `aclfile` is set, as
+  Redis does; the config file takes `user` lines.** A `user <name>
+  <rule>...` line in the config file is read as a line of an ACL file is,
+  and defines that user at startup; a `user default` line wins over
+  `requirepass`, as in Redis. `CONFIG REWRITE` writes one `user` line for
+  each user, `default` first, the passwords as `#<sha256>` hashes; the
+  default user has a line only when it is not the user `requirepass`
+  gives by itself. With an
+  `aclfile`, the users stay in it (`ACL SAVE`), and a config file with
+  `user` lines and `aclfile` both is refused at startup, as Redis refuses
+  it. `CONFIG GET` lists no users.
+
+- **Prometheus and Grafana: a check of redis_exporter, a dashboard, and
+  `docs/MONITORING.md`.** The compat workflow runs redis_exporter v1.66.0
+  (the KiviDB operator's metrics sidecar) against KiviDB and Redis 8.10.3
+  on each release (`benchmarks/redis-exporter-compat`). It checks the
+  scrape, 11 metrics against the workload's exact numbers and four more
+  for a value, and which of Redis's metrics it also reports for KiviDB.
+  The exporter reports 113 of the 164 metrics it reports for Redis 8.10.3.
+  The other 51 have no `INFO` field in KiviDB yet and are listed in
+  `known-gaps.txt`. The check fails once KiviDB reports one of them, or
+  when a name there isn't one the exporter reports for Redis. `examples/monitoring` has a Grafana dashboard for
+  these metrics and a Compose file that runs it with a master, a replica,
+  the exporters and Prometheus. `compat_junit.py` writes a `SKIP` row as
+  `<skipped>`.
+
+- **Redis Sentinel, tested (`scripts/sentinel/run.sh`, the Sentinel
+  workflow).** Three KiviDB nodes run under three Redis 8.10.3 Sentinels,
+  each with a password. The master is killed (with each of redis-py,
+  ioredis and Lettuce), failed over with `SENTINEL FAILOVER`, and paused
+  until a replica is promoted. Each time a replica takes over, the client
+  goes on writing to it, the old master comes back as its replica, and the
+  config files name the new master. The workflow runs on each release and
+  by hand, never on pull requests. `docs/SENTINEL.md` covers setting it up.
+
+- **Cluster: a master refuses its vote for slots that came to the
+  candidate's master after the claim the candidate read.** A replica claims
+  its master's slots, when it stands for election (automatic, or `CLUSTER
+  FAILOVER [FORCE]`), at the epoch of the newest claim of its master it read
+  in its replication stream (`TAKEN`), or of an import whose data it read
+  (`ARRIVED`) at a newer one; that epoch is written down with the slots it
+  does not hold (`<cluster-config-file>.not-held`) and read back at
+  start-up. Each master keeps, per slot, the epoch of the claim that gave
+  the slot to its owner (`<cluster-config-file>.came-at`, with each slot's
+  owner, written, synced, before the saves of `nodes.conf`; a slot it does
+  not have with that owner is taken to have come at the owner's config
+  epoch). Asked for its vote, a master refuses it to a replica that claims
+  a slot of its master at an older epoch than the slot came to the master
+  at, and says when each such slot came (`UPDATE`, with one field more, or
+  two), and whether it knows that from a claim it took in or a slot it gave
+  to its owner, or takes it from the owner's config epoch. The replica gives
+  a slot up at a refusal of the first kind, and at refusals of the second
+  kind once they leave too few masters, of those not marked failing, for a
+  quorum; it then holds the slot only through a `TAKEN` at that epoch or
+  later that lists it, or an `ARRIVED` at that very epoch, and asks again
+  for the others.
+
+- **`search-flat-int8`: an int8 first pass for FLAT KNN over many candidates (#1033).**
+  Off by default; `CONFIG SET search-flat-int8 yes` turns it on. A FLAT field of 256
+  dimensions or more gets an int8 copy of its vectors (rotated, one scale a vector, made off
+  the write path by one thread), and a scan of 1,024 candidates or more measures a candidate
+  exactly only when its bound could beat the k-th held: the reply is the exact scan's. The
+  copy adds about a quarter of the FLOAT32 vectors' memory. `FT.INFO` shows it under
+  `flat_int8_indexes`. x86_64 only.
+
+- **`search-resp3-reply`: the shape of the search commands' RESP3 replies (#1021).**
+  `auto` (the default) answers `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`,
+  `FT.INFO` and `FT._LIST` over RESP3 as Redis 8 does, a map, and a valkey-glide client
+  (`CLIENT SETINFO LIB-NAME` begins with `Glide`) as valkey-search does: the RESP2 layout on a
+  RESP3 connection for `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`, `FT._LIST` and `FT.INFO`, and
+  for `FT.HYBRID` the count, then each row as a flat array (no `warnings`, no `execution_time`).
+  That is the reply GLIDE converts. The `ON_TIMEOUT` warning is not in it, and a KNN `WITHSCORES`
+  gives the distance where valkey-search gives 0. `FT.PROFILE` has its own layout there (see
+  #1039 below), and the other search commands keep the Redis shape in every mode. `redis` and
+  `valkey` give every connection one or the other. It is set in the configuration file, on the
+  command line, and with `CONFIG SET`, which acts on
+  connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
+  replies, a script's, and what the masters of a cluster tell one another are the same in each.
+
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in
   Redis: a clause's own fields are narrowed too (`@title:x` with `INFIELDS 1
@@ -598,6 +687,371 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **A script's error reply begins `ERR`, as in Redis (#1054).** Redis
+  makes `ERR` and the message of whatever a script raises with `error`.
+  `error('MYERR bad')` replied `-MYERR bad`, and now replies
+  `-ERR user_script:1: MYERR bad script: <sha>, on @user_script:1.`;
+  `error('MYERR bad', 0)` replies `-ERR MYERR bad script: …`, and a
+  `redis.call` error caught and raised again with `error(e, 0)` replies
+  `-ERR ERR value is not an integer or out of range script: …`. A client
+  that reads such a reply's code reads `ERR` now. `redis.error_reply` and
+  `error({err = ...})` keep the code they give.
+
+- **A script's error counts in `errorstat_ERR` and `total_error_replies`,
+  once, as in Redis (#1054).** A runtime error such as `attempt to perform
+  arithmetic on a nil value` was not counted at all.
+
+- **`error` reads a number as Lua 5.1 does (#1054).** Raised with a level,
+  a number gets the place before it, as a string does, and is written
+  `%.14g`, as Redis's Lua writes it: `error(42)` on line 2 is
+  `user_script:2: 42`, and `error(10/2)` is `user_script:2: 5`, not `5.0`;
+  `error(10/2, 0)` replies `ERR 5`. A number a table raises as its `err`
+  is written so too: `error({err = -0.0})` replies `-0`, and
+  `error({err = 1e15})` replies `1e+15`. What a script catches is what it
+  would catch in Redis: `pcall(error, 42)` gives the string `"42"`, where
+  it gave the number; `pcall(error, 42, 0)` still gives the number.
+
+- **`error` of a value that is not a string replies it with no place of its
+  own (#1054).** `error(nil)`, `error(true)`, `error(false)`, `error()` and
+  `error(42, 0)` reply `ERR nil`, `ERR true`, `ERR false`, `ERR nil` and
+  `ERR 42`, then `script: <sha>, on @user_script:N.` with the line they
+  were raised on, as in Redis; they replied `ERR user_script:1: nil …`
+  whatever the line. Inside `coroutine.wrap`, `N` is the line in the
+  coroutine, where Redis names the line of the call: Lua 5.4's `wrap`
+  places a string only and raises anything else as it is (Redis's, Lua
+  5.1's, places a number too, so that `error(42, 0)` there replies
+  `ERR user_script:4: 42 …`).
+
+- **A nil index error reads `attempt to index a nil value` however it is
+  raised (#1054).** Caught and raised again with `error(e, 0)`, it replied
+  the whole of Lua 5.4's message (`attempt to index a nil value (local
+  't')`); it is cut now as the one raised where it happened is. Only
+  Lua's own note is cut: a message a script wrote itself, as
+  `attempt to index a nil value: bad key x`, is replied whole.
+
+- **A function library's lines are counted from its `#!lua` line, under
+  Redis's name `user_function` (#1054).** A `FUNCTION LOAD` error says
+  `user_function:4:` where it said `library:3:`.
+
+- **Rows with equal `SORTBY` values come in the order their documents were
+  written, as in Redis (#1043).** `SORTBY … ASC` gives documents with the
+  same value first written first, and `DESC` the reverse; documents without
+  the value come last, in the same order. A query without `SORTBY` gives the
+  matches that score the same in the order they were written, and a KNN
+  query the vectors it returns that are as near (in an index with TAG,
+  NUMERIC or TEXT fields). `FT.AGGREGATE` rows come in that order (but for
+  rows that go into a `GROUPBY` of `COUNT`, `MIN`, `MAX` or `COUNT_DISTINCT`
+  only, which are read in any; groups come in the order of their first
+  documents written), and rows
+  level on every `SORTBY` key keep it, or its reverse where the last key is
+  `DESC`. A write that names a field of the index (`HSET`,
+  `HINCRBY`, `HDEL` of an indexed field, a field of it that expires), a JSON
+  write, or a value put under the key whole makes the document the last
+  written; a write of other fields of the hash leaves it where it is, and a
+  `RENAME` keeps its place. The
+  documents an `FT.CREATE` finds already written come before those written
+  after it, by key. The order is kept in snapshots (a last section,
+  `KIVIDO1`, which 1.2 passes over), replayed from the AOF, and sent to
+  replicas; documents loaded from a snapshot without it go by key. In a
+  cluster each master's order is kept, and level rows of different masters
+  come by their place in their master's order, then by key. Each document
+  of an index with TAG, NUMERIC or TEXT fields takes 8 bytes more.
+
+- **`INFO server` has `valkey_version` (#1039).** It is `9.0.1`, after `redis_version`, which stays
+  `8.10.0`. Clients that take a server for Valkey read it: Open WebUI's Valkey vector store asks for
+  9.0.1 or later before it uses valkey-search's commands. It is the lowest release it accepts, not
+  valkey-bundle 9.2.0's:
+  the hash field commands of Valkey 9 and valkey-search 1.2's search commands are answered, not every
+  command of 9.x (`COMMANDLOG`, `DELIFEQ`, `CLUSTER MIGRATESLOTS`). `HELLO` still says `server redis`,
+  version `8.10.0`.
+
+- **An index that does not exist is named in valkey-search's words for a valkey-glide client (#1039).**
+  `FT.INFO`, `FT.SEARCH`, `FT.AGGREGATE`, `FT.HYBRID`, `FT.DROPINDEX`, `FT.CURSOR` and every other
+  `FT.*` command that takes an index name answers `Index with name '<name>' not found in database <n>`
+  to a connection that takes valkey-search's shape (`search-resp3-reply`: a client that named itself
+  GLIDE under `auto`, or every client under `valkey`), on RESP2 and RESP3. Every other connection gets
+  `SEARCH_INDEX_NOT_FOUND Index not found: <name>`, as Redis 8.10 does. valkey-glide's callers look for
+  `not found in database` to know an index is not there (Open WebUI's Valkey vector store creates its
+  index on that answer). `FT.HYBRID` on an index that does not exist says so whatever follows the name,
+  as Redis 8.10 does. A node answering a coordinator of its cluster, and a script, always get
+  Redis's words.
+
+- **`FT.INFO` and `FT.PROFILE` in valkey-search's shape (#1039).** In the shape a valkey-glide client is
+  answered in (`search-resp3-reply`), `FT.INFO` lists a vector field's dimensions, metric, data type and
+  algorithm in an `index` list, as valkey-search does, where the Redis shape lists them one after
+  another (Open WebUI reads the dimensions of an index from there). `FT.PROFILE` is an array of the
+  search's reply in that shape and a flat list of names and numbers (`parse.time`, `total.time`,
+  `all.count`), which is the layout valkey-glide converts; valkey-search 1.2 has no `FT.PROFILE`, so
+  there is no reply of its own to match. The Redis shape of both is unchanged.
+
+- **A FLAT vector index keeps its vectors in fixed blocks by slot, and a
+  filtered KNN goes from each matching document id to its vector (#1020).**
+  The vectors of a FLAT index are in blocks of slots that never move, each
+  on a cache line, in huge pages where the kernel gives them (the blocks an
+  HNSW graph keeps, without links), with the slot of each key and, in an
+  index with TAG, NUMERIC or TEXT fields, the slot of each document id. A
+  KNN of the whole index reads the blocks in order; one whose filter the
+  postings answer goes from each id the filter matched to its slot and
+  measures the vector there, and copies a key only for a vector among the
+  nearest so far. Each vector was a separate allocation found by its key: a
+  key, a hash and a jump to a 6 KB block (at 1536 dimensions) for each
+  matching document. An `HSET` of an indexed document writes its vector over
+  the one in its slot (decoded there, with no allocation), a delete gives
+  the slot back to the next document, and a scan lets the index's lock go
+  to a waiting writer every 256 vectors, as the filtered KNN let it go
+  every 256 keys. A KNN finds the same hits at the same distances; of
+  vectors at the same distance, a KNN of the whole index keeps and lists
+  them in slot order. A hit of a filtered KNN is tried against the filter
+  on its own document when the postings gave an id back while the query
+  ran (an id given back is given to the next document). A FLAT index
+  keeps its blocks while it lives: after many deletes its memory stays at
+  its peak, the slots given back taken by the next documents, until the
+  index is dropped. Nothing changes on disk or on the replication stream:
+  the index is built from the documents at load, as before. On an Azure
+  `Standard_D8s_v5` (Xeon 8370C), the server on vCPUs 0-3 (`--threads 4`;
+  Redis 8.12 `--io-threads 4 --search-workers 4`), a closed-loop client on
+  4-7, 100,000 HASH documents with a 1536-dimension FLOAT32 COSINE vector,
+  `KNN 5` with #1020's TAG filter of about 10,090 documents: 798 lookups a
+  second at 8 connections and 806 at 64 (p99 11.5 / 90 ms), against 502 /
+  510 for master before it, 486 / 482 for v1.2.2 and 488 / 500 for Redis
+  (p99 29 / 232 ms). A filter of 100 documents: 27,480 / 30,555 (median of
+  5; master 24,893 / 26,384, v1.2.2 25,076 / 27,003, Redis 12,168 /
+  14,556). No filter: 77 / 76 (master 58 / 50, v1.2.2 57 / 58, Redis 46 /
+  124). `HSET`s of a vector into the index (`redis-benchmark`, 16
+  connections, pipeline 16): 389,900 a second (master 380,600); the index
+  built again at load from 100,000 documents in 0.97 s (master 0.95 s,
+  median of 6 starts, which spread over 6 %). `used_memory` for the index,
+  a vector: 6,321 bytes at 100,000 x 1536 with a TAG field (master 6,325),
+  384 at 1,000 x 64 (443); a small index starts with blocks of 8 slots,
+  doubling, and at 100 x 64 takes 466 (425). Suite `51-filtered-flat-knn`
+  of `benchmarks/1.3.0/regressions` measures it; see docs/PERFORMANCE.md,
+  "Filtered KNN on a FLAT index".
+- **`KEYS` reads its entries ahead and lets writes in between parts of a
+  shard (#1018).** `KEYS` goes through a shard's buckets in parts of 4,096
+  and asks for the lines of each entry's header and key as it finds the
+  entry, visiting the entries 16 at a time, as a `SCAN` page does (#884):
+  the walk waited for memory at nearly every key. Between two parts it
+  looks whether a write waits for the shard and, if one does, lets it in;
+  with nobody waiting it keeps the lock. A key there, unchanged, for the
+  whole `KEYS` is in the reply, no key is in it twice, and a key written or
+  deleted meanwhile may be in it or not (a shard whose table is resized
+  between two parts is gone through again). Plane invalidates its cache
+  with `KEYS *<path>*`: over 500,000 keys of 2 KB with 5 that match, on an
+  Azure `Standard_D8s_v5` with the server on vCPUs 0-3 (`--threads 4`,
+  Redis 8.10.3 and Valkey 9.2.0 `--io-threads 4`) and the clients on 4-7,
+  `KEYS` alone takes 17.7 ms (master before it 43-46 ms, v1.2.2 202 ms,
+  Redis 183 ms, Valkey 128 ms), 35 ns a key. memtier_benchmark `GET`s from
+  500 connections with a `KEYS` every 250 ms: p99.9 6.5 ms (master 6.0,
+  v1.2.2 340, Redis 189, Valkey 158), 338k a second (master 339k, v1.2.2
+  329k, Redis 85k, Valkey 112k; 341k with no `KEYS`). With `SET`:`GET` 1:4
+  of 2 KB values beside the scans, the `SET` p99.9 is 5.3 ms against
+  master's 10.3, and 335k commands a second against 300k. On v1.2.2 the
+  `KEYS` runs on the io_uring worker that read it and only that worker's
+  connections wait (24 of 64 probe connections saw 249-514 ms, the others
+  under 2 ms); since #762 it runs on a thread of its own, and no probe
+  connection saw more than 4.3 ms. Suite `50-keys-wildcard` of
+  `benchmarks/1.3.0` measures it.
+- **`keyspace_hits` and `keyspace_misses` count a key a read command looks
+  up as Redis does (#1022).** A hit when the key is there, whatever its
+  type and whether or not the member, field or index asked for is in it
+  (`HGET`, `SISMEMBER`, `ZSCORE`, `LINDEX` of a key that is there are
+  hits; `WRONGTYPE` replies count a hit), a miss when it is not there.
+  `LRANGE`, `STRLEN`, `SCARD`, `EXISTS`, `TYPE`, `TTL`, `PTTL`,
+  `EXPIRETIME`, `TOUCH`, `DUMP`, `OBJECT ENCODING`, `COPY`, `SET ... GET`,
+  the sorted-set reads (`ZRANGE` and its relatives, `ZCARD`, `ZCOUNT`,
+  `ZLEXCOUNT`, `ZMSCORE`, `ZREVRANK`, `ZRANDMEMBER`, `ZSCAN`), `HRANDFIELD`
+  and the sources of the set and sorted-set algebra commands (each key
+  named counts) are counted; `HMGET` and `MGET` count each key once;
+  commands that write (`LPOP`, `LMPOP`, `BLPOP`, `LPUSHX`, `HDEL`,
+  `HGETDEL`, `HGETEX`, `SREM`, `SPOP`, `SMOVE`) count nothing, as in Redis.
+  `ZINTER`, `ZINTERSTORE`, `ZINTERCARD`, `ZDIFF` and `ZDIFFSTORE` look every
+  key up, as Redis does, and stop only at a key of another type: `ZINTER 2
+  nokey s` with `s` a string answers `WRONGTYPE` (it answered an empty array),
+  and `ZDIFF` counts each key once.
+  The other read commands count too, each where it looks its key up:
+  `GETBIT`, `BITCOUNT`, `BITPOS`, `BITFIELD_RO` and `BITFIELD` with only
+  `GET`s, `BITOP`'s sources, `PFCOUNT`, `PFMERGE` (its destination and each
+  source, as Redis reads them), `LCS` (both keys, before either's type is
+  refused), `HTTL`, `HPTTL`, `HEXPIRETIME`, `HPEXPIRETIME`, `XLEN`,
+  `XRANGE`, `XREVRANGE`, `XINFO`, `XPENDING`, `XACK`, `XCLAIM`,
+  `XAUTOCLAIM`, `XREAD` and `XREADGROUP` (each stream twice, as Redis looks
+  it up once for the IDs and once for the entries; a `BLOCK` that times
+  out adds nothing, one a write ends counts again, as in Redis), `GEOPOS`, `GEODIST`,
+  `GEOHASH`, `GEOSEARCH`, `GEOSEARCHSTORE`, `GEORADIUS`,
+  `GEORADIUSBYMEMBER` and their `_RO` forms, `OBJECT REFCOUNT`, `SORT` and
+  `SORT_RO` (and each key a `BY` or `GET` pattern names: `SORT l BY w_* GET
+  o_*` of three elements with no `w_` or `o_` keys is 1 hit and 6 misses),
+  `DIGEST`, the JSON reads (`JSON.GET`, `JSON.MGET`, `JSON.TYPE`,
+  `JSON.STRLEN`, `JSON.OBJLEN`, `JSON.ARRLEN`, `JSON.OBJKEYS`,
+  `JSON.ARRINDEX`, `JSON.RESP`, `JSON.DEBUG MEMORY`), `TS.GET`, `TS.RANGE`,
+  `TS.REVRANGE`, the vector-set reads (`VCARD`, `VDIM`, `VEMB`, `VSIM`,
+  `VINFO`, `VISMEMBER`, `VRANDMEMBER`, `VLINKS`, `VGETATTR`, `VRANGE`), and
+  the reads of Bloom and cuckoo filters, count-min sketches, top-k and
+  t-digests (`BF.EXISTS`, `BF.MEXISTS`, `BF.INFO`, `BF.CARD`, `BF.SCANDUMP`,
+  `BF.DEBUG`, `CF.EXISTS`, `CF.MEXISTS`, `CF.COUNT`, `CF.INFO`,
+  `CF.SCANDUMP`, `CF.DEBUG`, `CMS.QUERY`, `CMS.INFO`, `TOPK.QUERY`,
+  `TOPK.COUNT`, `TOPK.LIST`, `TOPK.INFO`, and `TDIGEST`'s `MIN`, `MAX`,
+  `QUANTILE`, `CDF`, `RANK`, `REVRANK`, `BYRANK`, `BYREVRANK`,
+  `TRIMMED_MEAN` and `INFO`). The plain `GET` and `SET` code is unchanged.
+  `tests/stats_keyspace.rs` holds the counts Redis 8.12.0 gives for 159
+  commands, including the set and sorted-set algebra and STORE forms, a script, a
+  transaction, expired keys and a blocking pop served at once and later,
+  and for 332 more on fresh keys of every type (a key that is there, one
+  that is not, one of another type). A probe of 588 such rows against Redis
+  8.12 differs in `TS.MGET` and `TS.MRANGE` only, which count 2 hits for
+  each series a filter matches in Redis and nothing here. Redis also counts
+  a key looked up before an argument is found not to be a number (`LINDEX l
+  notanint`) or a `WEIGHTS`, `AGGREGATE` or `LIMIT` is found not to parse
+  (`ZUNION`, `ZINTER`, `ZINTERCARD`); those commands read their arguments
+  first and count nothing.
+
+- **io_uring workers finish a waiting socket read without interrupting the
+  worker (#1015).** Each worker's ring is made with
+  `IORING_SETUP_COOP_TASKRUN` (Linux 5.19 and later; on an older kernel the
+  ring is made without it): when the request for a read that waited
+  arrives, the kernel finishes the read at the worker's next system call,
+  which it makes on every turn of its loop, rather than interrupting a
+  running worker (an inter-processor interrupt, sent by the CPU that took
+  the request in, usually the client's); a sleeping worker is woken as
+  before. With one request in flight a connection, master sends 0.46 such
+  interrupts a command; with the flag, none. A client that waits for every reply, and is itself the limit,
+  gets more done: on an Azure `Standard_D8s_v5`, the server on vCPUs 0-3
+  (`--threads 4`; Redis 8.10.2 `--io-threads 4`), @keyv/redis's benchmark
+  shape (200,000 keys of 1 KB with a TTL, one `SET ... PX` then nine
+  `GET`s, each reply awaited) from 4 Node 24 threads on vCPUs 4-7, median of
+  5: 135.3k operations a second at 48 connections (master before it 129.5k,
+  v1.2.2 128.6k, Redis 136.3k), 137.6k at 16 (132.2k, 131.8k, Redis 133.1k);
+  the client's CPUs spend 4.3 µs a command in interrupts against 5.4 µs.
+  memtier_benchmark `SET`:`GET` 1:9 of 1 KB: 241.5k against 221.7k at
+  pipeline 1 and 50 connections, 1.64M against 1.45M at pipeline 16; every
+  pipelined row is level or ahead. The server's CPU at rest (0.003) and
+  under that load is unchanged: nothing spins. The tokio loop, which is
+  also what runs under Docker's default seccomp profile (it refuses
+  io_uring), is unchanged. See docs/PERFORMANCE.md, "Request-response from
+  many connections"; suite 49 of `benchmarks/1.3.0/regressions` measures it.
+- **A `SETBIT` that leaves the bit as it is, and a `BITFIELD` or
+  `BITFIELD_RO` that writes nothing, read a long string where it is kept
+  (part of #1016).** `SETBIT` reads the bit where the string is kept and
+  copies the string only when it writes. `BITFIELD` and `BITFIELD_RO` read
+  a string of 4 KiB or more where it is kept and copy it only for a write
+  that succeeds; a shorter one kept in its key's entry is copied once to
+  be read. The time these commands take is the same whatever the string's
+  length. Server time a call on a 64 MiB string: on an Azure
+  `Standard_D4s_v5` (Xeon 8473C), a `SETBIT` that changes nothing 1.52 µs
+  (master before this change: 63,313 µs), a `BITFIELD` with one `GET`
+  0.24 µs (132,208 µs), a `BITFIELD` whose `OVERFLOW FAIL` write fails
+  0.46 µs (132,012 µs); on an Apple M3 Pro (`--threads 4`, median of 3),
+  0.41 µs (1,785 µs) and 0.17 µs (2,849 µs) for the first two. Four
+  connections sending that `SETBIT` to one 64 MiB key: 141,627 calls/s
+  (16), with another connection's `SET` every millisecond at a p99 of
+  102 µs (267 ms).
+- **A `SETBIT` that changes a bit writes it where the string is kept
+  (part of #1016).** When nothing but its key holds the string, and the
+  string, grown or not, still fits where it is kept, the bit and any zero
+  bytes it grows by are written in place: the string is not copied. A
+  string held elsewhere (shared with another key since a `COPY`, being
+  read by a `DUMP`, or captured by a `BGSAVE`, an AOF rewrite or a
+  replica's full sync) is copied once and the copy written; the holder
+  keeps the bytes from before. Before this change every `SETBIT` that
+  changed a bit copied the string twice. Replies, time to live, `WATCH`, keyspace
+  events, the AOF and replication are as before. Counted in a test build,
+  the most a `SETBIT` that changes a bit of a 64 MiB string allocates
+  while it runs (not the memory the string itself takes) was 128 MiB, two
+  copies of the string; it is now 24 bytes, or one copy when the string
+  is held. Server time a call, from `INFO commandstats`, on that string on
+  an Apple M3 Pro (release build, tokio, `--threads 4`, one connection,
+  median of 3 runs; preliminary, from one machine): 0.64 µs (before this
+  change: 2,643 µs), 1,348 µs (2,626 µs) when a `COPY` shares its bytes,
+  and 1,286 µs (13,629 µs) when each call grows it by a byte. On an Azure
+  `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default threads, one
+  connection, a bit set and cleared by turns, 2,000 calls), server time a
+  call on a string of 64 KiB, 1 MiB and 64 MiB: 1.01, 1.13 and 1.01 µs
+  (master before this change: 4.08, 131 and 70,684 µs; Redis 8.12.0, run by
+  hand on the same machine: 0.33, 0.37 and 0.48 µs); the client's time a call, round trip included, 29.6,
+  31.0 and 28.3 µs (33.2, 175 and 70,802 µs; Redis 28.2, 28.2 and 32.1 µs).
+- **An `APPEND` writes where the string is kept, and a long string keeps
+  room for the next appends (part of #1016).** When nothing but its key
+  holds the string, `APPEND` writes the new bytes in place: in the key's
+  entry or its slab block while the string keeps its block size, and in a
+  string of more than 26,208 bytes (the system allocator's) into the room
+  its block keeps. A block an `APPEND` makes or grows has room for a
+  quarter of the string's length more, at most 16 MiB and none past
+  512 MiB; one with no room left is grown with `realloc` by a quarter again,
+  which the allocator can often do where the block is, or by remapping its
+  pages, rather than by copying it.
+  A run of appends then costs the same a call whatever the string's length.
+  Before this change an `APPEND` onto a string not kept in its key's entry
+  (about 4 KiB and longer) copied it whole. A string held elsewhere (shared
+  with another key since a `COPY`, being read by a `GETEX` or `DUMP`, or
+  captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) is copied
+  once, into a block with that room, and the holder keeps the bytes from
+  before. The room is allocated memory: `used_memory`, `maxmemory` and
+  `MEMORY USAGE` count it, at most a fifth of the block. Replies, `STRLEN`,
+  `DUMP`, `DEBUG DIGEST-VALUE`, snapshots, the AOF and replication use the
+  string's length, and a string loaded from a snapshot or a full sync has
+  no room. A `COPY` shares the block, room included, with the new key; the
+  next write to either key copies it, an `APPEND` into a block with room and
+  any other write at the string's exact length. A string that stops being appended to keeps its room
+  until a `SET` of another length writes it. Replies, time to live, `WATCH`,
+  keyspace events, the dirty count, the AOF and replication are as before,
+  an empty `APPEND` included (it counts as a write, as in Redis). Inline,
+  slab and entry layouts and the string header are unchanged: a block of
+  the system allocator's has a size word in front of its header. On an
+  Azure `Standard_D4s_v5` (Xeon 8370C, Linux, release build, default
+  threads, one connection; Redis 8.12.0 in this entry is a run made by hand
+  on the same machine, beside the suite's pinned Redis 8.10.2), server time a call (`INFO commandstats`) of an
+  `APPEND` of 3 bytes onto a string of 64 KiB, 1 MiB and 64 MiB: 0.88, 0.50
+  and 0.33 µs (master before this change: 2.83, 70.1 and 37,767 µs; Redis
+  8.12.0: 0.70, 0.34 and 0.50 µs); of 1 KiB: 1.00, 0.68 and 1.48 µs (86.0,
+  84.2 and 37,669 µs; Redis 0.98, 2.18 and 0.83 µs). A loop appending
+  100 bytes until the string is 256 MiB (2,684,355 calls): 0.16 µs a call,
+  no call over 1 ms (the slowest 0.68 ms at the client), a peak RSS of
+  275 MiB (Redis: 0.75 µs a call, the slowest 151 ms, a peak RSS of
+  538 MiB); to 8 MiB, 0.10 µs a call (master: 457 µs, 42 s in all against
+  2.4 s). After it the string holds 14.8 MB of room (5.5 % of its length;
+  Redis 67 MB, 25 %); a 1 MiB string after one append of 100 bytes holds
+  262,169 bytes (25 %). 10,000 strings each built by 100 appends of 100
+  bytes take 10,143 bytes of `used_memory` and 13,611 of RSS each (master:
+  10,143 and 13,897; Redis: 14,390 and 19,582). An `APPEND` onto a 64 MiB
+  string a `COPY` shares copies it once (34.9 ms), and the next ones are in
+  place (master: 37,467 µs every call). Suite 53 of
+  `benchmarks/1.3.0/regressions` gates these and the `SETBIT` and
+  `BITFIELD` rows at 64 MiB against v1.2.2 (38,110 µs an `APPEND` there).
+- **`SETRANGE` and `BITFIELD` write where the string is kept (part of
+  #1016).** Both go through the same in-place string edit as `SETBIT`:
+  when nothing but its key holds the string and the result still fits
+  where it is kept, the new bytes are written there and the string is not
+  copied. Otherwise (a `SETRANGE` that outgrows the string's block, or a
+  string shared with another key since a `COPY`, being read by a `DUMP`,
+  or captured by a `BGSAVE`, an AOF rewrite or a replica's full sync) it
+  is copied once, and a holder keeps the bytes from before. The time to
+  live is kept. A `SETRANGE` with an empty value writes nothing, does not
+  create a missing key, and is not a write: it is not logged, replicated
+  or counted, and fails no `WATCH`, as in Redis.
+  `BITFIELD` runs its operations in order on the stored bytes, with the
+  key's shard locked from the first to the last, each reading and writing
+  only its field's bytes. It grows a string as an `APPEND` does, in its
+  block when there is room, else into a block with room for more,
+  zero-filled to the field. An `OVERFLOW FAIL` write that is refused
+  writes nothing and grows nothing. A `BITFIELD` is a write when an
+  applied `SET` or `INCRBY` changes its field or grows the string, also
+  when a later one puts the bits back, as in Redis 8; one that changes
+  nothing is not logged, replicated or announced, and fails no `WATCH`.
+  A write counts one change, as any write command does. A signed
+  `INCRBY` that wraps past the field's largest value replies with the
+  value it stores (`127 + 1` on an `i8` is `-128`), as Redis does.
+- **A `SETRANGE` written from a string's end grows it as an `APPEND`
+  does (part of #1016).** When the key holds a string and the value is
+  written at or past its end, the string grows into the room its block
+  keeps; a block with no room left is grown with `realloc`, which the
+  allocator may do by moving it, and a string held elsewhere is copied
+  once, each into a block with room for a quarter more, at most 16 MiB.
+  Before this change such a `SETRANGE` copied a string of more than
+  26,208 bytes whole on every call. A missing key is made at its
+  length, and a value that starts inside the string is written as
+  before. The room is allocated memory: `used_memory`, `maxmemory` and
+  `MEMORY USAGE` count it. Replies, time to live, `WATCH`, keyspace
+  events, the dirty count, the AOF and replication are unchanged.
 - **A save keeps about 8 MiB of collections in memory a capture thread
   while the disk keeps up (#825).** A save lays out the values that are not strings when it
   captures the dataset, with writes held. For `dump.kdb` each capture thread
@@ -615,14 +1069,60 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   under a writer (regression suite 47, server on 2 CPUs): for 20,000 sorted
   sets of 800 members (a 480 MB dump), `Pss` grows by 12 MiB during the
   save (1.2.2: 461 MiB) and the slowest write meanwhile takes 358 ms (1.2.2:
-  384 ms); for 20,000 hashes of 800 fields (672 MB), 2.5 MiB (1.2.2: 642
-  MiB). On a disk that does not keep up the buffers wait in memory, and the
+  384 ms), on a Xeon Platinum 8370C; for 20,000 hashes of 800 fields (672
+  MB), 2.5 MiB (1.2.2: 642 MiB) and the slowest write 511 ms (1.2.2: 498
+  ms), on a Xeon Platinum 8473C (the same suite there gives the sorted sets
+  413.5 ms, 1.2.2: 448.8 ms: the two CPU models are not the same speed). The capture walks a
+  hash or set kept as a table asking for its entries a few groups ahead
+  of the one it reads, and writes a field name of ASCII bytes as it is.
+  On a disk that does not keep up the buffers wait in memory, and the
   save holds up to what 1.2.2 holds. The dump is the same, byte for byte.
   A save whose spill
   fails (a full disk, bytes read back otherwise than written) fails, writes
   go on, and the previous dump stays. A checkpoint whose capture fails
   removes the `appendonly.aof.rewrite.tmp` it prepared. A replica's full
   sync and an online backup make their image in memory.
+- **A script that keeps to its keys runs beside others when they have no
+  hash tag (#1049).** With `lua-parallel-scripts yes` (the default), a
+  script whose `KEYS` all lack a hash tag runs beside other commands, under
+  its keys' locks, when it is sent by `EVAL` or `EVALSHA` and its source
+  shows that it touches no other key: every `redis.call`/`redis.pcall` names
+  its command with a string literal, of a list of commands whose keys are
+  known (`GET`, `SET`, `DEL`, `INCR`, `EXPIRE`, `HSET`, ...), and gives each
+  key as `KEYS[n]`; `KEYS` and `redis` are only read, never assigned or
+  passed on; and nothing that reaches the globals another way (`_G`, `_ENV`,
+  `loadstring`, `setmetatable`, ...) is named. That is read from the text
+  once per thread and script, before it runs, and only chooses where the
+  script runs: while it runs, the server holds it to its keys. Any other
+  script with a key without a tag runs alone, as before, and may touch what
+  it likes (BullMQ's and Sidekiq's scripts are of that kind). From the first
+  run of such a script, which is alone, a command on a key without a tag
+  takes that key's lock, shared: it waits for a script on the key, not for
+  other commands. Every key a command names is then locked, tagged or not,
+  wherever it comes among them. Once no such script has run for a minute,
+  or with `lua-parallel-scripts tags` or `no`, those locks are let go of
+  again, at a moment the command gate can be held alone, tried for a few
+  milliseconds at a time;
+  `INFO stats` says whether they are taken (`untagged_key_locks`), how often
+  that was switched (`untagged_key_locks_on`, `untagged_key_locks_off`) and
+  how often the switch off waited for a later moment
+  (`untagged_key_locks_off_later`). Eviction and active expiry leave a key
+  whose lock a script running beside others holds until it is done;
+  eviction never leaves a key because a client's command is at it. See
+  "Scripts that keep to their keys" in
+  [docs/SCRIPTS.md](docs/SCRIPTS.md); regression suite 54 records
+  yii2-redis's `Mutex` cycle.
+- **`lua-parallel-scripts` takes `yes`, `tags` or `no` (#1049).** `tags`
+  runs beside others only scripts whose `KEYS` all carry a hash tag, as
+  1.2.2 does, and never locks keys without a tag; `yes` (the default) adds
+  the scripts that keep to keys without a tag; `no` runs every script
+  alone. `true` and `false` are taken for `yes` and `no`, on the command
+  line, in the config file and by `CONFIG SET`; `CONFIG REWRITE` writes the
+  value set at run time. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+- **In a build with Lua, a command takes the lock of each tagged key it
+  names whatever `lua-parallel-scripts` says (#1049).** The setting decides
+  whether scripts run beside others; a script that started under the other
+  setting finds its tags locked all the same.
 - **Plain commands are answered between scripts that run alone (#880).** A quick script that runs alone (its key has no hash tag, or
   `lua-parallel-scripts no`) and comes while another one is running is run
   right after it, by the thread running that one, in a run: the first
@@ -1413,6 +1913,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     its text), and `JSON.DEBUG MEMORY` reports the new sizes. The
     analysis of where the bytes went, and suite 45, are IIITManjeet's.
 
+- **Small hashes and sets whose elements are too long to stay packed take
+  less memory (#782).** A table that fits one group takes that group's
+  64 bytes from a slab class, without the 56 bytes previously reserved to
+  align it. A six-field hash with a JSON-encoded 1,800-byte payload and
+  five small values takes 2,176 bytes, down from 2,232, including its shared
+  allocation but not its key or keyspace table. Arrays above 8 KiB keep the padded
+  allocation that lets the system allocator use `calloc`. The
+  `small-table` case of regression suite `19-hash-memory` gates
+  `used_memory` and RSS a key for this shape.
+
 - **Small hashes take less than half the memory.** A hash of up to 512
   fields, no field or value longer than 64 bytes, is kept in one block, each
   field next to its value, where it was a table with two allocations for
@@ -1680,6 +2190,56 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     at a member's own score reads the member's bytes through its entry).
     Sorted sets in a block, and `GET`/`SET`, as before.
 
+- **A large sorted set's rank and range-by-rank commands walk one path of
+  its index (#875).** The index of a sorted set past the block's limits,
+  which holds each member as the address of its entry in the set's table
+  (`CollectionTable`), is a B+tree of up to 32 members a leaf whose
+  internal nodes keep the number of members under each child
+  (`src/counted_btree.rs`, built on @Parikalp-Bhardwaj's #998). A
+  member's rank (`ZRANK`, `ZREVRANK`), the members from a rank (`ZRANGE`
+  by index, `ZREMRANGEBYRANK`) and the number of members between two
+  scores (`ZCOUNT`) are found down one path of the tree. A score change
+  that keeps the member's rank is written in place; one that moves it
+  takes the entry out and puts it back, and if the new key is refused, or
+  a member read panics, the entry is back at its own score, in order.
+  Members that come in order, one `ZADD` at a time, leave every node but
+  the last two of each level 28 of 32 full. `MEMORY USAGE` counts the
+  index's nodes as allocated. Replies, snapshots, the AOF and replication
+  are as before.
+  - Instructions per command (callgrind, fat LTO, `CMP=plain`, whole
+    server, pipeline 16), master before this change / now, at 1,000,000
+    members: `ZRANK` of a member 1,318,622 / 4,399, `ZREVRANK` 2,985,870 /
+    4,224, `ZRANGE` of 10 from a random rank 1,096,589 / 7,150, `ZCOUNT`
+    over 10,000 scores 171,397 / 5,867, `ZRANGEBYSCORE -inf +inf LIMIT
+    <offset> 10` 3,792,743 / 9,054; at 100,000 members 611,304 / 3,970,
+    610,613 / 3,930, 574,912 / 6,700, 163,154 / 5,573 and 1,136,667 /
+    8,921. A `LIMIT` offset (`ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGE
+    ... BYSCORE`, `ZRANGESTORE`) is added to the rank of the range's first
+    member, and only the members it leaves are read. `ZRANGEBYLEX`,
+    `ZREVRANGEBYLEX`, `ZRANGE ... BYLEX` and `ZLEXCOUNT` on a set whose
+    members all have one score find both bounds by a walk down the index
+    (in a block, two binary searches): `ZRANGEBYLEX [<member> + LIMIT 0
+    10` 9,100,706 / 11,245 and `ZLEXCOUNT` over 10,000 members 8,375,684 /
+    9,527 at 1,000,000 members, 4,123,278 / 10,768 and 7,222,976 / 8,690
+    at 100,000, 108,645 / 9,291 and 254,912 / 6,949 at 1,000. On a set
+    with several scores each member is compared with the bounds, in the
+    set's order, as before: the replies are the same. Writes at 1,000,000
+    members, the instructions a command takes now against master before
+    this change (lower is fewer): `ZADD` that moves a member 1.03x, `ZREM`
+    0.99x, `ZINCRBY` 0.91x, a new member in order 0.92x, at random 1.01x,
+    `ZREM` + `ZADD` with every score equal 0.89x; at 1,000 members `ZADD`
+    that moves a member 1.06x and `ZINCRBY` 1.03x (the tree's walks; a set of up to 128
+    members is a block and has no tree). `ZSCORE`, `ZRANDMEMBER`,
+    `ZPOPMIN` within 1 %, `GEOSEARCH` 1.00-1.01x. `GET`/`SET` as before
+    (within 4 instructions a command).
+  - `used_memory` a member, one set of 1,000,000 14-byte members, v1.2.2 /
+    master before this change / now: added in order 133.4 / 75.8 / 61.8,
+    at random 123.3 / 68.6 / 67.5, built whole (`RESTORE`) 133.4 / 59.7 /
+    59.1, and once every other member of the set added in order is
+    removed 179.3 / 88.7 / 91.7 (a removal merges a node only once it is
+    below half full). The index alone, its nodes as allocated: 20.3
+    bytes a member added in order, 25.8 at random, 17.6 built whole.
+
 - **Lists take about half the memory, short elements a fifth (#297).** A
   list's elements are kept end to end in chunks of up to 64, each element
   between two copies of its length (one byte each for an element shorter
@@ -1700,6 +2260,48 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   to a tenth of its length gives back the room it kept for the rest.
 
   Suite `21-list-memory` of the 1.3.0 regression suite measures this again.
+
+  Misskey's home timelines (#1022), 10,000 lists of 300 ten-byte ids on a
+  `Standard_D4s_v5`, `--threads 4`, bytes of `used_memory` / of RSS an
+  element, default build: loaded with `RPUSH` one element a command, 59.7 /
+  76.1 in 1.2.2, 13.8 / 14.1 now, 13.9 / 14.3 in Redis 8.10.2; one `RPUSH`
+  of 300 a list, 48.4 / 64.5, 13.3 / 13.5, 13.9 / 14.4. After every list
+  has taken 3,000 `LPUSH` + `LTRIM key 0 299` pairs: 64.4 / 96.6 in 1.2.2,
+  13.8 / 16.7 now, 13.9 / 14.4 in Redis (16.9 on the `lua,tls` builds;
+  Redis 8.12: 13.9 / 14.5). 32-byte elements 35.2 / 35.6 (Redis 34.8 /
+  35.6), 64-byte 67.3 / 69.6 (69.0 / 70.6), and loaded one element a
+  command 68.6 / 71.2 (`lua,tls`: 71.4; Redis 8.12 69.0 / 70.7), lists of
+  30 ten-byte elements 17.3 / 18.2 (14.8 / 15.1). Suite
+  `52-small-lists-memory` measures these and fails a build that measures
+  above these numbers, or whose timeline holds more than 1.4x Redis's RSS.
+  - A chunk's bytes are a block of slabs of their own size classes
+    (`value_slab::chunk_class_of`: the entry pool's sizes up to 4 KiB, then
+    128 bytes apart up to 8 KiB; above that, a full chunk of elements of
+    127 bytes or more, the system allocator's). A slab takes back a block
+    freed on any thread, is handed to any thread once it has room and goes
+    back to the system once it is empty, so the chunks a timeline gives up
+    at its tail are what it takes at its head. In the system allocator the
+    timeline above held 27.0 bytes an element resident on the default build
+    (glibc: the arena of the thread that loaded the lists kept the chunks
+    the timeline gave up, in 19,915 pieces between the lists' other blocks,
+    and `malloc_trim` gave none of it back) and 18.4 to 19.7 on the `lua,tls`
+    builds (mimalloc); 64-byte elements loaded one a command held 72.0 and
+    90.4, the same timeline of 64-byte elements 98.4 to 106.1 (88.1 now;
+    Redis 8.12 77.8 to 88.9). The slabs are counted in INFO
+    `value_slab_pool_bytes`, and compaction leaves them alone, as the entry
+    pool's.
+  - A chunk opened at either end gets room for a quarter of the full chunk
+    beside it: a list of 200 ten-byte elements takes 2,948 bytes after one
+    `LPUSH` (3,596 with the whole chunk's room a chunk opened at the front
+    got, for lists of 192 elements or more, before the chunks were in
+    slabs). The worst room a list holds, its chunks' bytes over its frames'
+    (the deque of chunks included), over a load one element a command, a
+    load in one `RPUSH`, one `LPUSH`, and 192 `LPUSH` + `LTRIM` pairs, is
+    at a point of the pairs for each of these (in brackets: before this
+    change, the same measurement): 200 x 10 B 1,104 bytes, 31.5 % of the list's allocations
+    (1,744, 42.1 %); 300 x 10 B 1,056, 22.7 % (1,312, 26.7 %); 300 x 64 B
+    3,672, 15.6 % (3,686, 15.7 %); 300 x 100 B 5,480, 15.2 % (5,531,
+    15.3 %).
   - A push or a pop at either end moves nothing in its chunk: each chunk
     has room at both ends. Element `i` is found by arithmetic while the
     chunks between the ends are full; an `LINSERT` or `LREM` in the middle
@@ -2022,6 +2624,36 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   move (callgrind, 0.1%).
 
 ### Fixed
+
+- **A script's error says where in the script it happened, as in Redis
+  (#1054).** A runtime error keeps the `user_script:N:` Lua gives it, and
+  its reply ends `script: <sha>, on @user_script:N.`, `N` being the line
+  it left the script from (`=[C]:-1` when `error` was called by a C
+  function, as with `string.gsub(s, p, error)`, as Redis has it). An
+  `EVAL`'d script that does not compile is reported as `SCRIPT LOAD`
+  reports it, `Error compiling script (new function): user_script:N: …`,
+  where it said `user_script:1` whatever the line. `error(nil)`,
+  `error(true)`, `error(false)`, `error()` and `error(42, 0)` name the line
+  they were raised on.
+  `FCALL` names `user_function` and the function, a table error too.
+
+- **`CONFIG REWRITE` writes every setting the server runs with, and no
+  `replicaof` after `REPLICAOF NO ONE`.** It writes each setting
+  `CONFIG GET` lists, `dir`, `io-model`, `replica-announced-port`,
+  `preload-file`, the TLS settings, `maxclients`, `hz`, `rdbcompression`
+  and the search, stream and probabilistic settings among them, except the
+  ones `config::NOT_REWRITTEN` gives a reason for (older names, and file
+  names that cannot change); a setting KiviDB keeps without acting on only
+  when it is not at its default; and the certificate and key lines only
+  where they are set, so a build without TLS reads its own file back. A
+  server restarted from the file opens the same data directory, serves
+  TLS as it did and has the role it had: Redis Sentinel sends
+  `CONFIG REWRITE` after every `REPLICAOF` it gives. It writes the current
+  `requirepass`, `masterauth` and `masteruser`, quoted as Redis quotes
+  them, and every value is written quoted where it needs it. The new file
+  is synced before it replaces the old one, and the directory after; when
+  the new file cannot be made, the old one is left as it is and the command
+  replies with an error.
 
 - **Vectors written at once into an empty HNSW index all link into its
   graph.** Inserts that find the graph empty take turns: the first is the

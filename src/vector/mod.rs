@@ -2,6 +2,8 @@ pub mod backlog;
 pub mod doc_keys;
 pub mod filter;
 pub mod geo;
+pub mod flat;
+pub mod flat_int8;
 pub mod phonetic;
 pub mod postings;
 pub mod quant;
@@ -150,6 +152,43 @@ impl VectorType {
                 .map(|b| f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16))
                 .collect(),
         })
+    }
+
+    /// [`VectorType::decode`] of `blob` into `out`, the same floats, each
+    /// of `out` written, for a blob of `out.len()` elements (see
+    /// [`VectorType::fits`]): a FLAT index decodes a vector into its slot.
+    pub fn decode_into(self, blob: &[u8], out: &mut [std::mem::MaybeUninit<f32>]) {
+        assert!(self.fits(blob, out.len()), "a blob of another length");
+        match self {
+            Self::Float32 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<4>().0) {
+                    o.write(f32::from_le_bytes(*b));
+                }
+            }
+            Self::Float64 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<8>().0) {
+                    o.write(f64::from_le_bytes(*b) as f32);
+                }
+            }
+            Self::Float16 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<2>().0) {
+                    o.write(crate::commands::json_fpha::f16_bits_to_f32(
+                        u16::from_le_bytes(*b),
+                    ));
+                }
+            }
+            Self::BFloat16 => {
+                for (o, b) in out.iter_mut().zip(blob.as_chunks::<2>().0) {
+                    o.write(f32::from_bits(u32::from(u16::from_le_bytes(*b)) << 16));
+                }
+            }
+        }
+    }
+
+    /// Whether `blob` is `dim` elements: what [`VectorType::decode`] takes.
+    #[inline]
+    pub fn fits(self, blob: &[u8], dim: usize) -> bool {
+        blob.len() == dim * self.size()
     }
 
     /// One element as this type's little-endian bytes: a JSON document's
@@ -1317,7 +1356,7 @@ impl IndexSchema {
         for f in &self.fields {
             if let FieldType::Vector { algo, .. } = &f.field_type {
                 let live = match algo {
-                    VectorAlgo::Flat => LiveIndex::Flat(Arc::new(VectorIndex::new())),
+                    VectorAlgo::Flat => LiveIndex::Flat(VectorIndex::new_shared()),
                     VectorAlgo::Hnsw {
                         m, ef_construction, ..
                     } => LiveIndex::Hnsw(Arc::new(HnswIndex::new(*m, *ef_construction))),
@@ -1441,11 +1480,27 @@ pub fn backfill_postings(db: &crate::store::Db, def: &IndexDef, added: &[SchemaF
 pub fn walk_documents(
     db: &crate::store::Db,
     def: &IndexDef,
-    mut visit: impl FnMut(&str, DocFields<'_>),
+    visit: impl FnMut(&str, DocFields<'_>),
 ) {
     if indexing_deferred() {
         return;
     }
+    // The documents the walk puts in come after those written before it,
+    // in the order of their keys (see `postings::Postings::begin_walk`).
+    let numbered = def.gives_ids();
+    if numbered {
+        def.postings.write().begin_walk();
+    }
+    walk_keys(db, def, visit);
+    if numbered {
+        let mut postings = def.postings.write();
+        postings.end_walk();
+        def.postings.done(postings);
+    }
+}
+
+/// [`walk_documents`]'s walk.
+fn walk_keys(db: &crate::store::Db, def: &IndexDef, mut visit: impl FnMut(&str, DocFields<'_>)) {
     for shard in db.iter() {
         // The keys themselves, for their order and for reading them; the
         // visit is given the document's name (`key_bytes::text_of`).
@@ -1632,20 +1687,28 @@ pub fn backfill_from_db_progress(
                 Some(b) => b,
                 None => continue,
             };
+            if !w.data_type.fits(raw_bytes, w.dim) {
+                continue;
+            }
+            let idx = match &w.live {
+                LiveIndex::Flat(idx) => {
+                    // Decoded into its slot.
+                    idx.insert_with(key, w.dim, doc, |slot| {
+                        w.data_type.decode_into(raw_bytes, slot)
+                    });
+                    continue;
+                }
+                LiveIndex::Hnsw(idx) => idx,
+            };
             let Some(vec) = w.data_type.decode(raw_bytes, w.dim) else {
                 continue;
             };
-            match &w.live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                LiveIndex::Hnsw(idx) => {
-                    if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
-                        continue;
-                    }
-                    // Linked by the helpers, as a write's is: the walk holds
-                    // the key's order, so what it read is the key's latest.
-                    backlog::write(idx, key, vec, &w.metric, doc);
-                }
+            if w.loaded && holds_vector(idx, key, &vec, &w.metric) {
+                continue;
             }
+            // Linked by the helpers, as a write's is: the walk holds the
+            // key's order, so what it read is the key's latest.
+            backlog::write(idx, key, vec, &w.metric, doc);
         }
 
         if text_fields.is_empty() {
@@ -1818,22 +1881,8 @@ pub fn drop_all_dicts(dict_store: &DictStore) {
     *g = AHashMap::new();
 }
 
-#[derive(Debug, Default)]
-pub struct VectorIndex {
-    pub vectors: RwLock<AHashMap<String, Vec<f32>>>,
-}
-
-impl VectorIndex {
-    pub fn new() -> Self {
-        Self {
-            vectors: RwLock::new(AHashMap::new()),
-        }
-    }
-
-    pub fn insert(&self, key: String, vec: Vec<f32>) {
-        self.vectors.write().insert(key, vec);
-    }
-}
+/// A FLAT index's vectors: see [`flat`].
+pub use flat::VectorIndex;
 
 /// One node in the HNSW graph: its key, its document id, and its links
 /// above layer 0. Its vector, its layer-0 links and whether it is live are
@@ -2236,6 +2285,25 @@ pub fn register_index_schemas(
     }
 }
 
+/// The order of the documents of each index, from a snapshot (its document
+/// order section): index name, then the documents' keys, first written
+/// first. The walk that puts them in gives them that order. After
+/// [`register_index_schemas`].
+pub fn restore_document_orders(index_store: &IndexStore, orders: Vec<(String, postings::KeyList)>) {
+    if orders.is_empty() {
+        return;
+    }
+    let idx = index_store.read();
+    for (name, keys) in orders {
+        if let Some(def) = idx.get(&name)
+            && !is_alias(&name, def)
+            && def.gives_ids()
+        {
+            def.postings.write().set_loaded_order(keys);
+        }
+    }
+}
+
 // ── Documents ─────────────────────────────────────────────────────────────────
 //
 // An index is `ON HASH` or `ON JSON`. Everything that reads a document for
@@ -2501,7 +2569,11 @@ pub fn maybe_index_json(
     doc: &crate::json_tree::Value,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Json, |_| true);
         return;
     }
     let store = index_store.read();
@@ -2514,7 +2586,13 @@ pub fn maybe_index_json(
             continue;
         }
         let fields = schema_names(project_json(&def.fields, doc));
-        index_fields(def, &crate::key_bytes::text_of(key), &fields, Write::Whole);
+        index_fields(
+            def,
+            &crate::key_bytes::text_of(key),
+            &fields,
+            Write::Whole,
+            &[],
+        );
     }
 }
 
@@ -2531,13 +2609,16 @@ pub fn reindex_json_key(
     key: &(impl AsRef<[u8]> + ?Sized),
 ) {
     let key = key.as_ref();
-    if indexing_deferred()
-        || index_store.none()
+    if index_store.none()
         || !index_store
             .read()
             .values()
             .any(|def| matches!(def.on, IndexOn::Json))
     {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Json, |_| true);
         return;
     }
     let Some(db_ref) = store.get(db) else {
@@ -2567,8 +2648,35 @@ pub fn reindex_key(
     key: &(impl AsRef<[u8]> + ?Sized),
     how: Write,
 ) {
-    let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    reindex_key_naming(index_store, store, db, key.as_ref(), how, &[]);
+}
+
+/// [`reindex_key`] after a command that wrote the fields `named` of the hash
+/// (`HDEL`, `HINCRBY`, a field that expired): one of an index's makes the
+/// document the last written in its order (see [`moves`]).
+pub fn reindex_key_naming(
+    index_store: &IndexStore,
+    store: &crate::store::Store,
+    db: usize,
+    key: &[u8],
+    how: Write,
+    named: &[&[u8]],
+) {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        // A key that holds nothing now (the old name of a `RENAME`) was
+        // not written.
+        let there = store
+            .get(db)
+            .is_some_and(|d| crate::store::get_shard(d, key).read().peek(key).is_some());
+        if there {
+            note_replayed(index_store, db, key, IndexOn::Hash, |def| {
+                moves(def, &[], how, named)
+            });
+            note_replayed(index_store, db, key, IndexOn::Json, |_| how == Write::Whole);
+        }
         return;
     }
     let indexes = index_store.read();
@@ -2601,7 +2709,7 @@ pub fn reindex_key(
                         ))
                     })
                     .collect();
-                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how, named);
             }
             (IndexOn::Hash, Some(crate::types::KiviDBValue::HashEx(hash))) => {
                 let pairs: Vec<(String, Arc<[u8]>)> = hash
@@ -2615,11 +2723,11 @@ pub fn reindex_key(
                         ))
                     })
                     .collect();
-                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &pairs, how, named);
             }
             (IndexOn::Json, Some(crate::types::KiviDBValue::Json(doc))) => {
                 let fields = schema_names(project_json(&def.fields, &doc.read()));
-                index_fields(def, &crate::key_bytes::text_of(key), &fields, how);
+                index_fields(def, &crate::key_bytes::text_of(key), &fields, how, named);
             }
             _ => unindex_from(def, &crate::key_bytes::text_of(key)),
         }
@@ -2652,7 +2760,13 @@ pub fn maybe_index(
     how: Write,
 ) {
     let key = key.as_ref();
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
+        return;
+    }
+    if indexing_deferred() {
+        note_replayed(index_store, db, key, IndexOn::Hash, |def| {
+            moves(def, fields, how, &[])
+        });
         return;
     }
     let store = index_store.read();
@@ -2665,7 +2779,116 @@ pub fn maybe_index(
         {
             continue;
         }
-        index_fields(def, &crate::key_bytes::text_of(key), fields, how);
+        index_fields(def, &crate::key_bytes::text_of(key), fields, how, &[]);
+    }
+}
+
+thread_local! {
+    /// The numbers the document under the old name of a `RENAME` had, by
+    /// its indexes' postings ([`renaming`]), for [`renamed`] to give the
+    /// document under the new name. Set and taken by one command on its
+    /// thread.
+    static RENAMING: std::cell::RefCell<Vec<(postings::SharedPostings, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A `RENAME` is about to take the document at `from` (database `db`) out:
+/// the number it has in each index is kept for [`renamed`]. Called by the
+/// command, which holds the order of both keys, before it moves the value.
+pub fn renaming(index_store: &IndexStore, db: usize, from: &[u8]) {
+    RENAMING.with(|numbers| numbers.borrow_mut().clear());
+    if indexing_deferred() || index_store.none() {
+        return;
+    }
+    let text = crate::key_bytes::text_of(from);
+    let store = index_store.read();
+    let mut numbers = Vec::new();
+    for (name, def) in store.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.gives_ids() || !def.covers(from) {
+            continue;
+        }
+        if let Some(number) = def.postings.read().number_of(&text) {
+            numbers.push((Arc::clone(&def.postings), number));
+        }
+    }
+    RENAMING.with(|kept| *kept.borrow_mut() = numbers);
+}
+
+/// `from` was renamed to `to` in database `db` (`RENAME`): each index of
+/// the new key gives its document the number the old key's had there
+/// ([`renaming`]), so that it keeps its place in the index's order; in a
+/// replay that puts indexing off, the walk after it does so.
+pub fn renamed(index_store: &IndexStore, db: usize, from: &[u8], to: &[u8]) {
+    let numbers = RENAMING.with(|kept| std::mem::take(&mut *kept.borrow_mut()));
+    if index_store.none() {
+        return;
+    }
+    let (from, to_text) = (
+        crate::key_bytes::text_of(from),
+        crate::key_bytes::text_of(to),
+    );
+    let deferred = indexing_deferred();
+    let store = index_store.read();
+    for (name, def) in store.iter() {
+        if is_alias(name, def) || def.db_index != db || !def.gives_ids() || !def.covers(to) {
+            continue;
+        }
+        if deferred {
+            let mut postings = def.postings.write();
+            postings.replayed_rename(&from, &to_text);
+            def.postings.done(postings);
+        } else if let Some((_, number)) = numbers
+            .iter()
+            .find(|(postings, _)| Arc::ptr_eq(postings, &def.postings))
+        {
+            let mut postings = def.postings.write();
+            postings.carry(&to_text, *number);
+            def.postings.done(postings);
+        }
+    }
+}
+
+/// Whether a write makes the document the last written in `def`'s order of
+/// its documents (see `postings::KeyOrder`), as in Redis: one put under its
+/// key whole, or one that names a field of the index (`fields` written, or
+/// `named` by the command), even with the value it had. A write of other
+/// fields of a hash leaves it where it is.
+fn moves(def: &IndexDef, fields: &[(String, Arc<[u8]>)], how: Write, named: &[&[u8]]) -> bool {
+    match how {
+        Write::Whole => true,
+        Write::Fields => fields
+            .iter()
+            .any(|(name, _)| def.fields.iter().any(|f| f.name == *name)),
+        Write::Refresh => named
+            .iter()
+            .any(|name| def.fields.iter().any(|f| f.name.as_bytes() == *name)),
+    }
+}
+
+/// A replay that puts indexing off wrote the document at `key` (of an index
+/// `on`): each index of it that the write `moves` in notes it, for the walk
+/// after the replay to put the documents in in the order of their writes.
+fn note_replayed(
+    index_store: &IndexStore,
+    db: usize,
+    key: &[u8],
+    on: IndexOn,
+    moves: impl Fn(&IndexDef) -> bool,
+) {
+    let store = index_store.read();
+    for (name, def) in store.iter() {
+        if is_alias(name, def)
+            || def.on != on
+            || def.db_index != db
+            || !def.gives_ids()
+            || !def.covers(key)
+            || !moves(def)
+        {
+            continue;
+        }
+        def.postings
+            .write()
+            .replayed(&crate::key_bytes::text_of(key));
     }
 }
 
@@ -2713,7 +2936,7 @@ pub fn maybe_index_pairs(
     pairs: &[[&[u8]; 2]],
     how: Write,
 ) {
-    if indexing_deferred() || index_store.none() {
+    if index_store.none() {
         return;
     }
     // A document an index left out (a GEO field that held no point), given
@@ -2735,8 +2958,15 @@ pub fn maybe_index_pairs(
 }
 
 /// Index `fields` of the document at `key` in `def`: the words of its TEXT
-/// fields, its TAG and NUMERIC values, and its vectors.
-fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: Write) {
+/// fields, its TAG and NUMERIC values, and its vectors. `named`: the fields
+/// a [`Write::Refresh`] names (see [`moves`]).
+fn index_fields(
+    def: &IndexDef,
+    key: &str,
+    fields: &[(String, Arc<[u8]>)],
+    how: Write,
+    named: &[&[u8]],
+) {
     #[cfg(test)]
     crate::test_hooks::at("index_fields: fields read");
     let whole = how != Write::Fields;
@@ -2811,7 +3041,8 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
     // lock, at once or when the queue is applied (see `postings::WithId`).
     let doc = if def.gives_ids() {
         let words = def.text_write(changes, restemmed, language);
-        def.postings.write_fields(key, fields, whole, words)
+        let moves = moves(def, fields, how, named);
+        def.postings.write_fields(key, fields, whole, moves, words)
     } else {
         def.docs.add(key);
         postings::NO_DOC
@@ -2836,31 +3067,38 @@ fn index_fields(def: &IndexDef, key: &str, fields: &[(String, Arc<[u8]>)], how: 
             let Some(live) = def.indexes.get(&f.name) else {
                 continue;
             };
-            let vec = fields
+            let blob = fields
                 .iter()
                 .find(|(n, _)| n == &f.name)
-                .and_then(|(_, b)| data_type.decode(b, dim));
-            let Some(vec) = vec else {
+                .map(|(_, b)| &**b)
+                .filter(|b| data_type.fits(b, dim));
+            let Some(blob) = blob else {
                 // The document holds no vector there (any more).
                 if whole {
                     unindex_vector(live, key);
                 }
                 continue;
             };
-            match live {
-                LiveIndex::Flat(idx) => idx.insert(key.to_string(), vec),
-                LiveIndex::Hnsw(idx) => {
-                    if how == Write::Refresh
-                        && (idx.backlog.holds(key) || idx.key_to_id.read().contains_key(key))
-                    {
-                        continue;
-                    }
-                    // Once per command, whatever it writes to how many
-                    // indexes; the walks over the keys do not come here.
-                    backlog::count_write();
-                    backlog::write(idx, key, vec, &metric, doc);
+            let idx = match live {
+                LiveIndex::Flat(idx) => {
+                    // Decoded into its slot.
+                    idx.insert_with(key, dim, doc, |slot| data_type.decode_into(blob, slot));
+                    continue;
                 }
+                LiveIndex::Hnsw(idx) => idx,
+            };
+            let Some(vec) = data_type.decode(blob, dim) else {
+                continue;
+            };
+            if how == Write::Refresh
+                && (idx.backlog.holds(key) || idx.key_to_id.read().contains_key(key))
+            {
+                continue;
             }
+            // Once per command, whatever it writes to how many indexes; the
+            // walks over the keys do not come here.
+            backlog::count_write();
+            backlog::write(idx, key, vec, &metric, doc);
         }
     }
 }
@@ -2906,9 +3144,7 @@ fn restem(
 /// FLAT index, at once; from a graph, by deleting its node in place.
 fn unindex_vector(live: &LiveIndex, key: &str) {
     match live {
-        LiveIndex::Flat(idx) => {
-            idx.vectors.write().remove(key);
-        }
+        LiveIndex::Flat(idx) => idx.remove(key),
         LiveIndex::Hnsw(idx) => {
             idx.unlink(key);
             if let Some(shadow) = idx.shadow() {
@@ -3311,6 +3547,10 @@ impl<'a> PreparedQuery<'a> {
         Self { metric, vector }
     }
 
+    pub fn metric(&self) -> &DistanceMetric {
+        self.metric
+    }
+
     /// The query as it is measured: of unit length for a cosine.
     pub fn vector(&self) -> &[f32] {
         &self.vector
@@ -3380,36 +3620,11 @@ pub fn knn_flat(
     k: usize,
     metric: &DistanceMetric,
 ) -> Vec<KnnResult> {
-    // Collect all distances first, then partial-sort.
-    // Avoids the heap tie-breaking problem entirely.
-    let vectors = index.vectors.read();
+    // The blocks read in order, the nearest `k` kept as they come: see
+    // `flat`. Which of equal distances are kept, and their order, follow
+    // the slots; before the slots, a hash map's order decided.
     let prepared = PreparedQuery::new(metric, query);
-
-    let mut scored: Vec<(f32, &str)> = vectors
-        .iter()
-        .filter(|(_, vec)| vec.len() == query.len())
-        .map(|(key, vec)| (prepared.to_raw(vec), key.as_str()))
-        .collect();
-
-    // partial_sort_unstable would be ideal but isn't in std.
-    // select_nth_unstable partitions so that element k is in its sorted position
-    // and everything before it is <= it — O(n) average, no full sort needed.
-    // This is the standard competitive KNN trick for FLAT search.
-    if scored.len() > k {
-        scored.select_nth_unstable_by(k, |a, b| a.0.total_cmp(&b.0));
-        scored.truncate(k);
-    }
-
-    // Now sort the kept k results ascending by distance
-    scored.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-
-    scored
-        .into_iter()
-        .map(|(score, key)| KnnResult {
-            key: key.to_string(),
-            score,
-        })
-        .collect()
+    index.nearest(&prepared, k, None).0
 }
 
 /// Algorithm 4 from the HNSW paper — heuristic neighbor selection.

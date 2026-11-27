@@ -428,3 +428,127 @@ fn a_replay_of_the_aof_matches_after_writes_that_fail() {
     let mut c = s.conn();
     assert_eq!(state(&mut c), before);
 }
+
+// ── Bitmap commands that write nothing ──────────────────────────────────────
+
+/// Strings kept in an entry, in a slab and in an allocation of their own.
+const BITMAPS: [(&str, usize); 3] = [("b-entry", 100), ("b-slab", 16 << 10), ("b-own", 64 << 10)];
+
+/// On each of `BITMAPS`, the bitmap commands that write nothing, a
+/// `BITFIELD` that fails after a `SET`, and three that write. Returns the
+/// writes, in order.
+fn bitmap_commands(c: &mut Conn) -> Vec<Vec<String>> {
+    let mut writes = Vec::new();
+    for (key, len) in BITMAPS {
+        // 'U' is 0x55: the first bit of each byte clear, the second set.
+        c.ok(&["SET", key, &"U".repeat(len)]);
+        let last = ((len - 1) * 8).to_string();
+        let second = ((len - 1) * 8 + 1).to_string();
+        let nothing: [&[&str]; 5] = [
+            &["SETBIT", key, &last, "0"],
+            &["SETBIT", key, &second, "1"],
+            &["BITFIELD", key, "GET", "u8", &last],
+            &["BITFIELD_RO", key, "GET", "u8", &last],
+            &[
+                "BITFIELD", key, "OVERFLOW", "FAIL", "INCRBY", "u8", &last, "200",
+            ],
+        ];
+        let before = changes(c);
+        for cmd in nothing {
+            assert!(!matches!(c.cmd(cmd), V::Error(_)), "{cmd:?}");
+        }
+        let r = c.cmd(&["BITFIELD", key, "SET", "u8", "0", "1", "GET"]);
+        assert_eq!(r.error(), "ERR syntax error");
+        assert_eq!(changes(c), before, "{key}: nothing written");
+        let write: [&[&str]; 3] = [
+            &["SETBIT", key, &last, "1"],
+            &[
+                "BITFIELD", key, "SET", "u8", "0", "1", "OVERFLOW", "FAIL", "INCRBY", "u8", "0",
+                "255",
+            ],
+            &[
+                "BITFIELD", key, "OVERFLOW", "FAIL", "INCRBY", "u8", "8", "255", "SET", "u8", "8",
+                "2",
+            ],
+        ];
+        for cmd in write {
+            assert!(!matches!(c.cmd(cmd), V::Error(_)), "{cmd:?}");
+            writes.push(cmd.iter().map(|s| s.to_string()).collect());
+        }
+        assert_eq!(changes(c), before + 3, "{key}: one change a write");
+    }
+    writes
+}
+
+/// `rdb_changes_since_last_save`: the writes counted as changes.
+fn changes(c: &mut Conn) -> u64 {
+    let info = c.cmd(&["INFO", "persistence"]).text().unwrap();
+    let line = info
+        .lines()
+        .find_map(|line| line.strip_prefix("rdb_changes_since_last_save:"))
+        .expect("rdb_changes_since_last_save");
+    line.trim().parse().unwrap()
+}
+
+/// `BITMAPS`' bytes, as `c`'s server has them.
+fn bitmaps(c: &mut Conn) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for (key, len) in BITMAPS {
+        let V::Bulk(bytes) = c.cmd(&["GET", key]) else {
+            panic!("GET {key}");
+        };
+        assert_eq!(bytes.len(), len, "{key}");
+        out.push(bytes);
+    }
+    out
+}
+
+fn check_bitmaps(c: &mut Conn) {
+    for ((key, len), bytes) in BITMAPS.iter().zip(bitmaps(c)) {
+        assert_eq!((bytes[0], bytes[1], bytes[len - 1]), (1, 2, 0xD5), "{key}");
+        assert!(bytes[2..len - 1].iter().all(|&b| b == 0x55), "{key}");
+    }
+}
+
+#[test]
+fn a_replica_matches_its_master_after_bitmap_commands_that_write_nothing() {
+    let master = Server::start(&[]);
+    let replica = Server::replica_of(&master);
+    let mut m = master.conn();
+    let mut r = replica.conn();
+    bitmap_commands(&mut m);
+    let mark = now_ms().to_string();
+    m.ok(&["SET", "caught-up", &mark]);
+    wait_for("the replica to catch up", || {
+        r.cmd(&["GET", "caught-up"]).text().as_deref() == Some(mark.as_str())
+    });
+    check_bitmaps(&mut m);
+    assert_eq!(bitmaps(&mut r), bitmaps(&mut m));
+}
+
+#[test]
+fn the_aof_has_only_the_bitmap_commands_that_write() {
+    let mut s = Server::start(&["--aof"]);
+    let mut c = s.conn();
+    let writes = bitmap_commands(&mut c);
+    check_bitmaps(&mut c);
+    c.ok(&["SET", "logged", "1"]);
+    wait_for("the AOF", || {
+        s.aof()
+            .iter()
+            .any(|r| r.len() >= 2 && r[0] == "SET" && r[1] == "logged")
+    });
+    let logged: Vec<Vec<String>> = s
+        .aof()
+        .into_iter()
+        .filter(|r| {
+            r[0].to_ascii_uppercase().starts_with("BIT") || r[0].eq_ignore_ascii_case("SETBIT")
+        })
+        .collect();
+    assert_eq!(logged, writes);
+
+    let before = bitmaps(&mut c);
+    s.restart();
+    let mut c = s.conn();
+    assert_eq!(bitmaps(&mut c), before);
+}

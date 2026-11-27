@@ -397,11 +397,16 @@ jobs:
       # be are covered now that transactions run alone
       # (docs/EXEC_ATOMICITY.md).
       - name: e2e command surface — RESP2
+        # A run takes about four minutes. The limit is on the step, not
+        # only on the job, so that the server log below is still printed
+        # when a run does not finish.
+        timeout-minutes: 15
         run: |
           cd tests/e2e
           KIVI_EXTERNAL=1 KIVI_PORT=6380 KIVI_RESP=2 pytest modules/ -q
 
       - name: e2e command surface — RESP3
+        timeout-minutes: 15
         run: |
           cd tests/e2e
           KIVI_EXTERNAL=1 KIVI_PORT=6380 KIVI_RESP=3 pytest modules/ -q
