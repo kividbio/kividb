@@ -65,6 +65,7 @@ The ones that behave differently:
 | Directive | In KiviDB |
 |---|---|
 | `io-threads` | Accepted, no effect: commands run on every core. `--threads` sets the worker count (default: half the CPUs available to the process, rounded up, at least 2 where there are 2 or more). |
+| `daemonize` | `no` is accepted quietly; `yes` is accepted with a warning and has no effect. KiviDB always runs in the foreground — use systemd, Docker, or a process supervisor to run it in the background. |
 | `save <points>` | Accepted with a warning, no effect. KiviDB doesn't snapshot on a schedule. Use `appendonly yes`, or `BGSAVE`. |
 | `appendfsync` | `always` and `everysec` as in Redis. `no` is taken as `everysec`, with a warning. |
 | `dbfilename`, `appendfilename` | Fixed: `dump.kdb` and `appendonly.aof`. KiviDB reads a Redis `dump.rdb` if there is no `dump.kdb`. `CONFIG GET dbfilename` answers `dump.kdb`, with `CONFIG GET dir` the place to find it after a `SAVE`. |
