@@ -1161,7 +1161,9 @@ where
     // `aof::note_logged_command`).
     let mut aof_refused_from: Option<u64> = None;
     let dirty_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut combined = Vec::with_capacity(8192);
+    // The replies of a turn. It grows with them and keeps that size, so a
+    // connection that has sent nothing holds none.
+    let mut combined = Vec::new();
     // Negotiated RESP protocol version, updated by HELLO. Kept as local connection
     // state (not read from client_registry per command) so execute_command's
     // per-command null-encoding check doesn't hit the shared client_registry lock
@@ -1216,6 +1218,8 @@ where
                 buffer = Vec::with_capacity(READ_SIZE);
                 private_query_buffer = false;
                 query_buffer.update(0, buffer.capacity(), private_query_buffer);
+                // The replies' buffer too, to what is still in it.
+                combined.shrink_to(READ_SIZE);
             }
             // First, so any room past `READ_SIZE` takes the capped read below.
             if buffer.capacity() - buffer.len() < READ_SIZE {
@@ -1308,6 +1312,9 @@ where
                                 true
                             };
                             if resized {
+                                // A quiet client keeps no reply buffer
+                                // either: what it is sent next grows one.
+                                combined.shrink_to(0);
                                 read_start = 0;
                                 // Exactly a read's room: doubling would undo the trim.
                                 buffer.reserve_exact(READ_SIZE);

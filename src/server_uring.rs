@@ -1177,6 +1177,15 @@ const READ_BUFFER: usize = 32 * 1024;
 /// capacity left. Below it, another `READ_BUFFER`-sized chunk is reserved
 /// first, so a read never lands in a sliver of free space.
 const READ_MIN: usize = 8 * 1024;
+/// The room a connection's reads start with, and what its read buffer goes
+/// back to once its reads have been small for a while (`SHORT_READS` in a
+/// row under it, with nothing left to parse): a read is always in flight,
+/// with its buffer in the kernel, so an idle connection holds this much for
+/// reading. A read that fills it makes the next one `READ_BUFFER`'s room.
+const READ_SIZE: usize = 4 * 1024;
+/// Reads in a row under `READ_SIZE` before a grown, empty read buffer goes
+/// back to `READ_SIZE`, and the reply buffers with it.
+const SHORT_READS: u32 = 4;
 
 /// A connection's subscriptions, made at its first SUBSCRIBE, with the task
 /// that writes its messages. On this thread: the stream is not `Send`. It
@@ -1330,7 +1339,14 @@ pub async fn handle_client(
     };
 
     // ── Connection state ─────────────────────────────────────────────────
-    let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_BUFFER);
+    // Small to start with, as a connection that is opened and left idle
+    // holds it: see `READ_SIZE`.
+    let mut parse_buf: Vec<u8> = Vec::with_capacity(READ_SIZE);
+    // Whether the next read is given `READ_SIZE`'s room rather than
+    // `READ_BUFFER`'s; and the reads in a row that brought less than
+    // `READ_SIZE`.
+    let mut read_small = true;
+    let mut short_reads = 0u32;
     let mut private_query_buffer = false;
     let mut last_query_buffer_activity = Instant::now();
     let query_buffer_idle_resize_after =
@@ -1340,8 +1356,10 @@ pub async fn handle_client(
     let mut parse_start = 0usize;
     // How far the request still arriving has been read.
     let mut progress = resp::parse::Progress::default();
-    let mut out_buf: Vec<u8> = Vec::with_capacity(65536);
-    let mut spare_buf: Vec<u8> = Vec::with_capacity(65536);
+    // The reply buffers grow with the replies they are given, and keep that
+    // size: a connection that has sent nothing holds none.
+    let mut out_buf: Vec<u8> = Vec::new();
+    let mut spare_buf: Vec<u8> = Vec::new();
     // Push channel for out-of-band invalidation messages (CLIENT TRACKING).
     let (push_tx, mut push_rx) =
         tokio::sync::mpsc::channel::<Vec<u8>>(crate::client_registry::PUSH_QUEUE_FRAMES);
@@ -1663,15 +1681,33 @@ pub async fn handle_client(
                 (unparsed, n)
             }
         } else {
-            if parse_buf.capacity().saturating_sub(parse_buf.len()) < READ_MIN {
+            let spare = parse_buf.capacity() - parse_buf.len();
+            if read_small {
+                if spare < READ_SIZE / 4 {
+                    parse_buf.reserve(READ_SIZE);
+                }
+            } else if spare < READ_MIN {
                 parse_buf.reserve(READ_BUFFER);
             }
             let unparsed = parse_buf.len();
+            let room = parse_buf.capacity() - unparsed;
             let (res, buffer) = stream.read(parse_buf.slice(unparsed..)).await;
             parse_buf = buffer.into_inner();
             match res {
                 Ok(0) => break,
-                Ok(n) => (unparsed, n),
+                Ok(n) => {
+                    // A full read means more is waiting: the next has
+                    // `READ_BUFFER`'s room.
+                    if n == room {
+                        read_small = false;
+                        short_reads = 0;
+                    } else if n < READ_SIZE {
+                        short_reads = short_reads.saturating_add(1);
+                    } else {
+                        short_reads = 0;
+                    }
+                    (unparsed, n)
+                }
                 // cleanup runs below via the break path
                 Err(_) => break,
             }
@@ -3852,6 +3888,20 @@ pub async fn handle_client(
             if parse_buf.capacity() > BIG_BUFFER {
                 parse_buf = Vec::with_capacity(READ_BUFFER);
                 query_buffer_peak = 0;
+            }
+            // Only small requests lately, and nothing of them left: the
+            // read buffer goes back to `READ_SIZE`, and the reply buffers
+            // to what this turn's replies need, so a connection that went
+            // quiet after a burst does not keep the burst's buffers in its
+            // reads. Once, when its reads turn small: a connection whose
+            // buffers are small already does no more than the comparison.
+            if short_reads >= SHORT_READS && parse_buf.capacity() > READ_SIZE {
+                parse_buf = Vec::with_capacity(READ_SIZE);
+                read_small = true;
+                private_query_buffer = false;
+                query_buffer_peak = 0;
+                out_buf.shrink_to(READ_SIZE);
+                spare_buf.shrink_to(0);
             }
         } else if parse_start > 0 && parse_start > parse_buf.len() / 2 {
             let remaining = parse_buf.len() - parse_start;
