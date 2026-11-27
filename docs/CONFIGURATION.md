@@ -139,6 +139,16 @@ open-file limit to `maxclients` plus what it keeps for itself (32 files, or on i
 warning. Cluster bus links, a replica's link to its master and files written while saving
 are not counted in that; leave room for them in a large cluster.
 
+An idle connection holds about 12 KB of `used_memory` on either I/O model (10,000 idle
+connections on an Azure `Standard_D4s_v5`: 11.4 KB on Tokio, 12.2 KB on io_uring, where a
+read is always in flight; Redis 8.10.3 2.8 KB once its clients cron has trimmed them). Its read
+buffer starts at 4 KiB and its reply buffers start empty; a read buffer grown for a burst goes
+back to 4 KiB once the connection's requests are small again, with the reply buffers, and on
+Tokio also once the connection has been quiet for `query-buffer-idle-resize-after` (2 s). On
+io_uring a buffer grown for one large request is kept while the connection sends nothing more:
+the read waiting for its next request holds it. Suite `55-idle-connection-memory` under
+`benchmarks/1.3.0/regressions/` measures it.
+
 Small collections are kept in one block of memory up to Redis's limits, which are set as in
 Redis, in the file or with `CONFIG SET`, and reported by `CONFIG GET` and `OBJECT ENCODING`:
 `set-max-intset-entries` (512), `set-max-listpack-entries` (128) and `set-max-listpack-value`
