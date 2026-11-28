@@ -1323,7 +1323,8 @@ fn transactions_use_the_connections_shape() {
 }
 
 /// A script reads `FT.SEARCH` as RESP2, whatever the setting says; one that
-/// asks for RESP3 gets the map.
+/// asks for RESP3 gets the map, whose names are simple strings (tables to the
+/// script, as in Redis).
 #[cfg(feature = "lua")]
 #[test]
 fn scripts_keep_their_own_protocol() {
@@ -1341,7 +1342,8 @@ fn scripts_keep_their_own_protocol() {
     other.ok(&["CONFIG", "SET", "search-resp3-reply", "valkey"]);
     let script3 = "redis.setresp(3); local r = redis.call('FT.SEARCH', 'idx', \
                    '*=>[KNN 3 @v $B AS dist]', 'RETURN', '1', 'dist', 'PARAMS', '2', 'B', \
-                   ARGV[1], 'DIALECT', '2'); return r.map['total_results']";
+                   ARGV[1], 'DIALECT', '2'); \r
+                   for k, v in pairs(r.map) do if k.ok == 'total_results' then return v end end";
     let total = c.raw(&[b"EVAL", script3.as_bytes(), b"0", &blob]);
     assert_eq!(total, b":3\r\n", "{}", show(&total));
 }
