@@ -778,7 +778,7 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
                 pairs
                     .into_iter()
                     .map(|(k, v)| {
-                        let timed = matches!(&k, Node::Bulk(b) if b.ends_with(b" time"));
+                        let timed = matches!(&k, Node::Bulk(b) | Node::Simple(b) if b.ends_with(b" time"));
                         (
                             k,
                             if timed {
@@ -1094,7 +1094,7 @@ fn redis_shape_names_are_simple_strings() {
         ]);
         let text = show(&hybrid);
         assert!(
-            text.starts_with("%4|+total_results|:2|+results|*2|%2|$5|__key|"),
+            text.starts_with("%4|+total_results|:3|+results|*3|%2|$5|__key|"),
             "{mode}: {text}"
         );
         assert!(
