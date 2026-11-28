@@ -713,6 +713,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `query-buffer-idle-resize-after`. A pool of many idle connections counts
   that much less against `maxmemory`.
 
+- **`daemonize yes` in a configuration file is accepted (#1075).** A file
+  brought from Redis with `daemonize yes` starts the server, which reports
+  that the line has no effect: KiviDB runs in the foreground, under systemd,
+  Docker or a process supervisor. `daemonize no` is read quietly.
+
 - **A script's error reply begins `ERR`, as in Redis (#1054).** Redis
   makes `ERR` and the message of whatever a script raises with `error`.
   `error('MYERR bad')` replied `-MYERR bad`, and now replies
