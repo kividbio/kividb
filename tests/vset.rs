@@ -166,6 +166,17 @@ fn free_port() -> u16 {
 }
 
 fn start_server(port: u16) {
+    start_server_with_replicaof(port, None);
+}
+
+fn start_replica(port: u16, master_port: u16) {
+    start_server_with_replicaof(
+        port,
+        Some(vec!["127.0.0.1".to_string(), master_port.to_string()]),
+    );
+}
+
+fn start_server_with_replicaof(port: u16, replicaof: Option<Vec<String>>) {
     thread::spawn(move || {
         let config = kividb::config::Config {
             port,
@@ -176,7 +187,7 @@ fn start_server(port: u16) {
             maxmemory: 0,
             loglevel: "error".to_string(),
             io_model: kividb::config::IoModel::Tokio,
-            replicaof: None,
+            replicaof,
             replica_announced_port: 0,
             requirepass: "".to_string(),
             aclfile: "".to_string(),
@@ -1922,4 +1933,393 @@ fn vadd_refuses_another_m_than_the_sets() {
             .as_int(),
         1
     );
+}
+
+// ── VSIM FILTER complex predicates ───────────────────────────────────────────
+
+#[test]
+fn test_vsim_filter_complex_predicates() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(
+        c.cmds(&[
+            "VADD",
+            "items",
+            "VALUES",
+            "3",
+            "1",
+            "0",
+            "0",
+            "alpha",
+            "SETATTR",
+            r#"{"color":"red","size":3,"tags":["a","b"],"ok":true,"none":null}"#,
+        ])
+        .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&[
+            "VADD",
+            "items",
+            "VALUES",
+            "3",
+            "0.9",
+            "0.1",
+            "0",
+            "beta",
+            "SETATTR",
+            r#"{"color":"green","size":2,"tags":["b","c"],"ok":false,"none":1}"#,
+        ])
+        .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&[
+            "VADD",
+            "items",
+            "VALUES",
+            "3",
+            "0.8",
+            "0.2",
+            "0",
+            "gamma",
+            "SETATTR",
+            r#"{"color":"blue","size":5,"tags":["c"],"ok":true}"#,
+        ])
+        .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["VADD", "items", "VALUES", "3", "0.7", "0.3", "0", "plain"])
+            .as_int(),
+        1
+    );
+
+    let filter = |c: &mut Conn, expr: &str| -> Vec<String> {
+        c.cmds(&[
+            "VSIM", "items", "VALUES", "3", "1", "0", "0", "COUNT", "10", "FILTER", expr,
+        ])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect()
+    };
+
+    // Compound boolean logic with parentheses, &&, ||, !, not
+    assert_eq!(
+        filter(&mut c, r#"(.color == "red" || .color == "blue") && .ok && !(.size > 4)"#),
+        vec!["alpha"]
+    );
+    assert_eq!(
+        filter(&mut c, r#"not .ok or .none == null"#),
+        vec!["alpha", "beta"]
+    );
+
+    // Membership (`in` on tuple and array attribute) and substring `in`
+    assert_eq!(
+        filter(&mut c, r#".color in ["red", "green"] and "b" in .tags"#),
+        vec!["alpha", "beta"]
+    );
+    assert_eq!(filter(&mut c, r#""ee" in .color"#), vec!["beta"]);
+
+    // Arithmetic and right-associative power
+    assert_eq!(filter(&mut c, ".size * 2 + 1 == 7"), vec!["alpha"]);
+    assert_eq!(filter(&mut c, ".size ** 2 == 25"), vec!["gamma"]);
+    assert_eq!(filter(&mut c, "2 ** 3 ** 2 == 512 and .size == 3"), vec!["alpha"]);
+
+    // Numeric/string equality and missing field short-circuiting to false
+    assert_eq!(filter(&mut c, r#".size == "3""#), vec!["alpha"]);
+    assert!(filter(&mut c, ".missing == 0 or 1").is_empty());
+
+    // Constant truthy filter includes elements without attributes
+    assert_eq!(filter(&mut c, "1"), vec!["alpha", "beta", "gamma", "plain"]);
+
+    // Invalid filter expressions
+    for bad in [".a ==", "== 1", "1 2", r#""unclosed"#] {
+        let err = c.cmds(&[
+            "VSIM", "items", "VALUES", "3", "1", "0", "0", "FILTER", bad,
+        ]);
+        assert!(err.is_error(), "expected syntax error for {bad:?}: {err:?}");
+    }
+}
+
+// ── VRANGE boundary edge-cases ───────────────────────────────────────────────
+
+#[test]
+fn test_vrange_boundary_edge_cases() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    let names = |reply: RespValue| -> Vec<String> {
+        reply
+            .as_array()
+            .iter()
+            .map(|v| v.as_str().to_string())
+            .collect()
+    };
+
+    // Emptied set: VADD then VREM all elements
+    assert_eq!(
+        c.cmds(&["VADD", "empty_vs", "VALUES", "2", "1", "0", "x"])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        c.cmds(&["VADD", "empty_vs", "VALUES", "2", "0", "1", "y"])
+            .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["VREM", "empty_vs", "x", "y"]).as_int(), 2);
+    assert!(names(c.cmds(&["VRANGE", "empty_vs", "-", "+"])).is_empty());
+
+    // Single-element set
+    assert_eq!(
+        c.cmds(&["VADD", "one", "VALUES", "2", "1", "0", "only"])
+            .as_int(),
+        1
+    );
+    assert_eq!(names(c.cmds(&["VRANGE", "one", "-", "+"])), vec!["only"]);
+    assert_eq!(
+        names(c.cmds(&["VRANGE", "one", "[only", "[only"])),
+        vec!["only"]
+    );
+    assert!(names(c.cmds(&["VRANGE", "one", "(only", "+"])).is_empty());
+    assert!(names(c.cmds(&["VRANGE", "one", "-", "(only"])).is_empty());
+
+    // Reversed / contradictory bounds and count edge-cases
+    for elem in ["a", "b", "c", "d"] {
+        assert_eq!(
+            c.cmds(&["VADD", "vs", "VALUES", "2", "1", "0", elem])
+                .as_int(),
+            1
+        );
+    }
+    assert!(names(c.cmds(&["VRANGE", "vs", "[d", "[b"])).is_empty());
+    assert!(names(c.cmds(&["VRANGE", "vs", "+", "-"])).is_empty());
+    assert!(names(c.cmds(&["VRANGE", "vs", "(b", "[b"])).is_empty());
+    assert!(names(c.cmds(&["VRANGE", "vs", "[b", "(b"])).is_empty());
+
+    // count = 0 and count > cardinality, plus bare bounds (treated as inclusive)
+    assert!(names(c.cmds(&["VRANGE", "vs", "-", "+", "0"])).is_empty());
+    assert_eq!(
+        names(c.cmds(&["VRANGE", "vs", "-", "+", "100"])),
+        vec!["a", "b", "c", "d"]
+    );
+    assert_eq!(
+        names(c.cmds(&["VRANGE", "vs", "b", "c"])),
+        vec!["b", "c"]
+    );
+
+    // Wrong arity and WRONGTYPE
+    assert!(c.cmds(&["VRANGE", "vs", "-"]).is_error());
+    c.cmds(&["SET", "strkey", "val"]);
+    assert!(c.cmds(&["VRANGE", "strkey", "-", "+"]).is_error());
+}
+
+// ── Replication propagation of VADD / VREM ───────────────────────────────────
+
+#[test]
+fn test_vadd_vrem_replication_propagation() {
+    let master_port = free_port();
+    let replica_port = free_port();
+    start_server(master_port);
+    start_replica(replica_port, master_port);
+
+    let mut master = Conn::connect(master_port);
+    let mut replica = Conn::connect(replica_port);
+
+    // Wait for replica to finish initial sync.
+    let mut synced = false;
+    for _ in 0..100 {
+        let info = replica.cmds(&["INFO", "replication"]);
+        if info.as_str().contains("master_link_status:up") {
+            synced = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(synced, "replica did not sync with master in time");
+
+    // Propagate VADD (including SETATTR, Q8, and element updates).
+    assert_eq!(
+        master
+            .cmds(&[
+                "VADD",
+                "rep_vs",
+                "VALUES",
+                "3",
+                "1",
+                "0",
+                "0",
+                "e1",
+                "Q8",
+                "SETATTR",
+                r#"{"tag":"first"}"#,
+            ])
+            .as_int(),
+        1
+    );
+    assert_eq!(
+        master
+            .cmds(&[
+                "VADD",
+                "rep_vs",
+                "VALUES",
+                "3",
+                "0",
+                "1",
+                "0",
+                "e2",
+                "SETATTR",
+                r#"{"tag":"second"}"#,
+            ])
+            .as_int(),
+        1
+    );
+    // Update existing element e1
+    assert_eq!(
+        master
+            .cmds(&[
+                "VADD",
+                "rep_vs",
+                "VALUES",
+                "3",
+                "0.8",
+                "0.6",
+                "0",
+                "e1",
+                "SETATTR",
+                r#"{"tag":"updated"}"#,
+            ])
+            .as_int(),
+        0
+    );
+
+    let mut add_propagated = false;
+    for _ in 0..100 {
+        if replica.cmds(&["VCARD", "rep_vs"]).as_int() == 2
+            && replica
+                .cmds(&["VGETATTR", "rep_vs", "e1"])
+                .as_str()
+                == r#"{"tag":"updated"}"#
+        {
+            add_propagated = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(add_propagated, "VADD did not propagate to replica");
+
+    let rep_range: Vec<String> = replica
+        .cmds(&["VRANGE", "rep_vs", "-", "+"])
+        .as_array()
+        .iter()
+        .map(|v| v.as_str().to_string())
+        .collect();
+    assert_eq!(rep_range, vec!["e1", "e2"]);
+    assert_eq!(replica.cmds(&["VEMB", "rep_vs", "e2"]).as_array().len(), 3);
+    assert_eq!(
+        replica
+            .cmds(&["VSIM", "rep_vs", "VALUES", "3", "0", "1", "0", "COUNT", "1"])
+            .as_array()[0]
+            .as_str(),
+        "e2"
+    );
+
+    // Propagate VREM (partial removal, then final element removal deleting the key).
+    assert_eq!(master.cmds(&["VREM", "rep_vs", "e1"]).as_int(), 1);
+    let mut rem_partial = false;
+    for _ in 0..100 {
+        if replica.cmds(&["VCARD", "rep_vs"]).as_int() == 1
+            && replica.cmds(&["VISMEMBER", "rep_vs", "e1"]).as_int() == 0
+        {
+            rem_partial = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(rem_partial, "partial VREM did not propagate to replica");
+
+    assert_eq!(master.cmds(&["VREM", "rep_vs", "e2"]).as_int(), 1);
+    let mut rem_all = false;
+    for _ in 0..100 {
+        if replica.cmds(&["EXISTS", "rep_vs"]).as_int() == 0 {
+            rem_all = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(rem_all, "final VREM key deletion did not propagate to replica");
+}
+
+// ── EXPIRE / PERSIST interaction ─────────────────────────────────────────────
+
+#[test]
+fn test_vset_expire_and_persist() {
+    let port = free_port();
+    start_server(port);
+    let mut c = Conn::connect(port);
+
+    assert_eq!(
+        c.cmds(&[
+            "VADD",
+            "ttl_vs",
+            "VALUES",
+            "2",
+            "1",
+            "0",
+            "a",
+            "SETATTR",
+            r#"{"k":1}"#,
+        ])
+        .as_int(),
+        1
+    );
+
+    // EXPIRE sets TTL; operations still succeed before expiry.
+    assert_eq!(c.cmds(&["EXPIRE", "ttl_vs", "60"]).as_int(), 1);
+    let ttl = c.cmds(&["TTL", "ttl_vs"]).as_int();
+    assert!(ttl > 0 && ttl <= 60, "unexpected ttl: {ttl}");
+    assert_eq!(c.cmds(&["VCARD", "ttl_vs"]).as_int(), 1);
+    assert_eq!(
+        c.cmds(&["VADD", "ttl_vs", "VALUES", "2", "0", "1", "b"])
+            .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["VCARD", "ttl_vs"]).as_int(), 2);
+
+    // PERSIST removes the TTL and keeps the key alive past a short deadline.
+    assert_eq!(c.cmds(&["PEXPIRE", "ttl_vs", "120"]).as_int(), 1);
+    assert_eq!(c.cmds(&["PERSIST", "ttl_vs"]).as_int(), 1);
+    assert_eq!(c.cmds(&["TTL", "ttl_vs"]).as_int(), -1);
+    assert_eq!(c.cmds(&["PERSIST", "ttl_vs"]).as_int(), 0);
+    thread::sleep(Duration::from_millis(160));
+    assert_eq!(c.cmds(&["VCARD", "ttl_vs"]).as_int(), 2);
+
+    // Short PEXPIRE causes the vector set to expire and disappear across commands.
+    assert_eq!(c.cmds(&["PEXPIRE", "ttl_vs", "60"]).as_int(), 1);
+    thread::sleep(Duration::from_millis(150));
+
+    assert_eq!(c.cmds(&["EXISTS", "ttl_vs"]).as_int(), 0);
+    assert_eq!(c.cmds(&["VCARD", "ttl_vs"]).as_int(), 0);
+    assert_eq!(c.cmds(&["VISMEMBER", "ttl_vs", "a"]).as_int(), 0);
+    assert!(c.cmds(&["VGETATTR", "ttl_vs", "a"]).is_nil());
+    assert!(c.cmds(&["VRANGE", "ttl_vs", "-", "+"]).as_array().is_empty());
+    assert!(
+        c.cmds(&["VSIM", "ttl_vs", "VALUES", "2", "1", "0"])
+            .as_array()
+            .is_empty()
+    );
+
+    // Re-creating the expired key with a different dimension succeeds.
+    assert_eq!(
+        c.cmds(&["VADD", "ttl_vs", "VALUES", "3", "1", "0", "0", "fresh"])
+            .as_int(),
+        1
+    );
+    assert_eq!(c.cmds(&["VDIM", "ttl_vs"]).as_int(), 3);
+    assert_eq!(c.cmds(&["VCARD", "ttl_vs"]).as_int(), 1);
 }

@@ -996,12 +996,13 @@ fn vrandmember(ctx: &mut Ctx) -> Option<Vec<u8>> {
 // and refuses to unify them. A named fn with `'a` ties input to output
 // explicitly, making the borrow checker happy.
 
-fn parse_lex_bound(s: &[u8]) -> (Option<&[u8]>, bool) {
+fn parse_lex_bound(s: &[u8], is_start: bool) -> (Option<&[u8]>, bool, bool) {
     match s {
-        b"-" | b"+" => (None, true),
-        [b'[', rest @ ..] => (Some(rest), true),
-        [b'(', rest @ ..] => (Some(rest), false),
-        s => (Some(s), true), // bare string: treat as inclusive
+        b"-" => (None, true, !is_start),
+        b"+" => (None, true, is_start),
+        [b'[', rest @ ..] => (Some(rest), true, false),
+        [b'(', rest @ ..] => (Some(rest), false, false),
+        s => (Some(s), true, false), // bare string: treat as inclusive
     }
 }
 
@@ -1021,8 +1022,8 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
         .and_then(|b| std::str::from_utf8(b).ok())
         .and_then(|s| s.parse().ok());
 
-    let (start_str, start_inc) = parse_lex_bound(start_raw);
-    let (end_str, end_inc) = parse_lex_bound(end_raw);
+    let (start_str, start_inc, start_empty) = parse_lex_bound(start_raw, true);
+    let (end_str, end_inc, end_empty) = parse_lex_bound(end_raw, false);
 
     let db_ref = &ctx.store[*ctx.selected_db];
     let shard = store::get_shard(db_ref, key);
@@ -1037,6 +1038,9 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
             names.sort_unstable();
 
             let matches_start = |name: &[u8]| -> bool {
+                if start_empty {
+                    return false;
+                }
                 match start_str {
                     None => true,
                     Some(s) => {
@@ -1049,6 +1053,9 @@ fn vrange(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 }
             };
             let matches_end = |name: &[u8]| -> bool {
+                if end_empty {
+                    return false;
+                }
                 match end_str {
                     None => true,
                     Some(s) => {
