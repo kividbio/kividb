@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       image:
-        description: "KiviDB image to test (default: docker.io/kividb/kividb at the latest release). It is started empty: the suite begins with FLUSHALL"
+        description: "KiviDB image to test (default: none, the server is built from the branch the run is started on). It is started empty: the suite begins with FLUSHALL"
         required: false
         default: ""
       clients:
@@ -48,17 +48,28 @@ jobs:
         with:
           dotnet-version: 8.0.x
 
+      # No image named: the server is this checkout, built here.
+      - uses: dtolnay/rust-toolchain@stable
+        if: ${{ inputs.image == '' }}
+      - uses: Swatinem/rust-cache@v2
+        if: ${{ inputs.image == '' }}
+      - name: Build KiviDB
+        if: ${{ inputs.image == '' }}
+        run: cargo build --release --bin kividb
+
       - name: Start Redis and KiviDB
         env:
-          GH_TOKEN: ${{ github.token }}
           INPUT_IMAGE: ${{ inputs.image }}
         run: |
           image=$INPUT_IMAGE
-          if [ -z "$image" ]; then
-            image=docker.io/kividb/kividb:$(gh api repos/kividbio/kividb/releases/latest --jq .tag_name)
-          fi
           docker run -d --name redis --network host "$REDIS_IMAGE" --port 6379 --save "" --appendonly no
-          docker run -d --name kividb --network host "$image" --port 6380 --protected-mode no
+          if [ -z "$image" ]; then
+            image="built from $GITHUB_REF_NAME at ${GITHUB_SHA::8}"
+            mkdir -p "$RUNNER_TEMP/kividb-data"
+            nohup target/release/kividb --port 6380 --protected-mode no --dir "$RUNNER_TEMP/kividb-data"               > "$RUNNER_TEMP/kividb.log" 2>&1 &
+          else
+            docker run -d --name kividb --network host "$image" --port 6380 --protected-mode no
+          fi
           for port in 6379 6380; do
             for _ in $(seq 1 30); do
               (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null && break
