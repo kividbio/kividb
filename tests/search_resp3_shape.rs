@@ -778,8 +778,7 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
                 pairs
                     .into_iter()
                     .map(|(k, v)| {
-                        let timed =
-                            matches!(&k, Node::Simple(b) if b.ends_with(b" time"));
+                        let timed = matches!(&k, Node::Simple(b) if b.ends_with(b" time"));
                         (
                             k,
                             if timed {
@@ -823,7 +822,10 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
         let keys: Vec<&Node> = top.iter().map(|(k, _)| k).collect();
         assert_eq!(
             keys,
-            [&Node::Simple(b"Results".to_vec()), &Node::Simple(b"Profile".to_vec())]
+            [
+                &Node::Simple(b"Results".to_vec()),
+                &Node::Simple(b"Profile".to_vec())
+            ]
         );
         let Node::Map(profile) = &top[1].1 else {
             panic!("{}", show(reply))
@@ -1139,17 +1141,38 @@ fn redis_shape_names_are_simple_strings() {
     // count and flat rows, FT.PROFILE the array of the search's reply and a
     // flat list of simple-string names.
     let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
-    assert!(show(&config).starts_with("%1|$7|TIMEOUT|$"), "{}", show(&config));
+    assert!(
+        show(&config).starts_with("%1|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
     let blob = vector(0.0, 0.0);
     let hybrid = c.raw(&[
-        b"FT.HYBRID", b"idx", b"SEARCH", b"@t:{a}", b"VSIM", b"@v", b"$B", b"PARAMS", b"2",
-        b"B", &blob,
+        b"FT.HYBRID",
+        b"idx",
+        b"SEARCH",
+        b"@t:{a}",
+        b"VSIM",
+        b"@v",
+        b"$B",
+        b"PARAMS",
+        b"2",
+        b"B",
+        &blob,
     ]);
     assert!(is_array(&hybrid), "{}", show(&hybrid));
-    assert!(!show(&hybrid).contains("total_results"), "{}", show(&hybrid));
+    assert!(
+        !show(&hybrid).contains("total_results"),
+        "{}",
+        show(&hybrid)
+    );
     let profile = c.cmd(&["FT.PROFILE", "idx", "SEARCH", "QUERY", "*"]);
     assert!(show(&profile).starts_with("*2|*"), "{}", show(&profile));
-    assert!(show(&profile).contains("|+parse.time|$"), "{}", show(&profile));
+    assert!(
+        show(&profile).contains("|+parse.time|$"),
+        "{}",
+        show(&profile)
+    );
     assert!(!show(&profile).contains("+Results"), "{}", show(&profile));
     let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
     assert_eq!(show(&reply), "*2|:1|$3|d:3|");
@@ -1174,11 +1197,19 @@ fn redis_shape_names_are_simple_strings() {
     let mut c = prepared(&server, "3");
     c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
     let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
-    assert!(show(&config).starts_with("%1|$7|TIMEOUT|$"), "{}", show(&config));
+    assert!(
+        show(&config).starts_with("%1|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
     let server = Server::start(&[]);
     let mut c = prepared(&server, "2");
     let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
-    assert!(show(&config).starts_with("*1|*2|$7|TIMEOUT|$"), "{}", show(&config));
+    assert!(
+        show(&config).starts_with("*1|*2|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
     let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
     assert_eq!(show(&reply), "*2|:1|$3|d:3|");
     let reply = c.cmd(&["FT.AGGREGATE", "idx", "@n:[3 3]", "LOAD", "1", "@n"]);
