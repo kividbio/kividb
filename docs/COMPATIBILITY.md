@@ -35,7 +35,7 @@ other files:
   KiviDB, and must get the same replies back, of the same kinds (a map, a set, a double), except for
   the cases listed in `scripts/client_smoke/reported.json`: valkey-glide 2.6 cannot read Redis 8's
   RESP3 search replies, and reads KiviDB's (`search-resp3-reply auto`). The Client smoke suite
-  workflow runs it by hand, against the latest release's image unless it is given another; the
+  workflow runs it by hand, against a server built from the branch it is started on unless it is given an image; the
   clients are pinned to exact versions.
 - BullMQ's and Sidekiq's own test suites, and kill-and-restart soaks
   (`scripts/client_compat/`).
