@@ -3926,15 +3926,15 @@ fn test_ft_hybrid_resp3_maps() {
         &v,
     ];
     let raw = raw_replies(port, &[vec![b"HELLO", b"3"], hybrid], "execution_time\r\n");
-    let reply = &raw[raw.find("%4\r\n$13\r\ntotal_results").expect(&raw)..];
+    let reply = &raw[raw.find("%4\r\n+total_results").expect(&raw)..];
     assert!(
         reply.starts_with(
-            "%4\r\n$13\r\ntotal_results\r\n:1\r\n$7\r\nresults\r\n*1\r\n%2\r\n$5\r\n__key\r\n$3\r\nd:1\r\n$7\r\n__score\r\n"
+            "%4\r\n+total_results\r\n:1\r\n+results\r\n*1\r\n%2\r\n$5\r\n__key\r\n$3\r\nd:1\r\n$7\r\n__score\r\n"
         ),
         "{reply}"
     );
     assert!(
-        reply.contains("$8\r\nwarnings\r\n*0\r\n$14\r\nexecution_time\r\n,"),
+        reply.contains("+warnings\r\n*0\r\n+execution_time\r\n,"),
         "{reply}"
     );
 }

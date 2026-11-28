@@ -3181,19 +3181,23 @@ fn encode_page(
             .iter()
             .map(|hit| {
                 let mut entry = vec![
-                    resp_bulk_str("id"),
+                    resp_simple("id"),
                     resp_bulk(&crate::key_bytes::bytes_of(&hit.key)),
                 ];
                 if args.withscores {
-                    entry.push(resp_bulk_str("score"));
+                    entry.push(resp_simple("score"));
                     entry.push(resp3_score(hit.score));
                 }
+                if args.withpayloads {
+                    entry.push(resp_simple("payload"));
+                    entry.push(resp_null_for(3));
+                }
                 if args.withsortkeys {
-                    entry.push(resp_bulk_str("sortkey"));
+                    entry.push(resp_simple("sortkey"));
                     entry.push(sort_key_reply(hit));
                 }
                 if !nocontent {
-                    entry.push(resp_bulk_str("extra_attributes"));
+                    entry.push(resp_simple("extra_attributes"));
                     entry.push(resp_map_for(
                         3,
                         fields_of(hit)
@@ -3202,7 +3206,7 @@ fn encode_page(
                             .collect(),
                     ));
                 }
-                entry.push(resp_bulk_str("values"));
+                entry.push(resp_simple("values"));
                 entry.push(resp_array(vec![]));
                 resp_map_for(3, entry)
             })
@@ -3210,17 +3214,17 @@ fn encode_page(
         return resp_map_for(
             3,
             vec![
-                resp_bulk_str("attributes"),
+                resp_simple("attributes"),
                 resp_array(vec![]),
-                resp_bulk_str("format"),
-                resp_bulk_str("STRING"),
-                resp_bulk_str("results"),
+                resp_simple("format"),
+                resp_simple("STRING"),
+                resp_simple("results"),
                 resp_array(results),
-                resp_bulk_str("total_results"),
+                resp_simple("total_results"),
                 resp_integer(total as i64),
-                resp_bulk_str("warning"),
+                resp_simple("warning"),
                 resp_array(if timed_out {
-                    vec![resp_bulk_str("Timeout limit was reached")]
+                    vec![resp_simple("Timeout limit was reached")]
                 } else {
                     vec![]
                 }),
@@ -3397,6 +3401,17 @@ pub(crate) fn simple_names(items: Vec<Vec<u8>>, valkey: bool) -> Vec<Vec<u8>> {
 #[inline]
 pub(crate) fn reply_name(name: &str, valkey: bool) -> Vec<u8> {
     if valkey && !name.contains(['\r', '\n']) {
+        resp_simple(name)
+    } else {
+        resp_bulk_str(name)
+    }
+}
+
+/// A fixed name in the map of a reply that Redis sends as a RESP3 map: a
+/// simple string over RESP3, as Redis writes it, a bulk string over RESP2.
+#[inline]
+pub(crate) fn map_name(resp: u8, name: &str) -> Vec<u8> {
+    if resp >= 3 {
         resp_simple(name)
     } else {
         resp_bulk_str(name)

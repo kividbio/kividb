@@ -2229,8 +2229,13 @@ fn search_replies_inside_a_script_follow_setresp() {
         (format!("return type({search}.map)"), nil),
         (format!("return {search}[1]"), b":2\r\n"),
         (format!("redis.setresp(3) return type({search}.map)"), table),
+        // The names of the reply are simple strings, as Redis sends them: a
+        // script sees each as the table `{ok='total_results'}`.
         (
-            format!("redis.setresp(3) return {search}.map.total_results"),
+            format!(
+                "redis.setresp(3) for k, v in pairs({search}.map) do \
+                 if k.ok == 'total_results' then return v end end"
+            ),
             b":2\r\n",
         ),
         (format!("return type({aggregate}.map)"), nil),
