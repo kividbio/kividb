@@ -816,7 +816,7 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
     }
     // The search inside is a map too.
     assert!(
-        show(&want[0]).contains("$7|results|*3|%"),
+        show(&want[0]).contains("+results|*3|%"),
         "{}",
         show(&want[0])
     );
@@ -921,7 +921,13 @@ fn assert_redis_types(name: &str, reply: &[u8], ids: bool) {
     let simple = |n: &Node, want: &str| {
         assert_eq!(n, &Node::Simple(want.into()), "{name}: {}", show(reply));
     };
-    let names = ["attributes", "format", "results", "total_results", "warning"];
+    let names = [
+        "attributes",
+        "format",
+        "results",
+        "total_results",
+        "warning",
+    ];
     assert_eq!(top.len(), names.len(), "{name}: {}", show(reply));
     for ((key, _), want) in top.iter().zip(names) {
         simple(key, want);
@@ -967,9 +973,17 @@ fn redis_shape_names_are_simple_strings() {
         let mut c = prepared(&server, "3");
         for (name, ids, args) in [
             ("search", true, vec!["FT.SEARCH", "idx", "*"]),
-            ("nocontent", true, vec!["FT.SEARCH", "idx", "*", "NOCONTENT"]),
+            (
+                "nocontent",
+                true,
+                vec!["FT.SEARCH", "idx", "*", "NOCONTENT"],
+            ),
             ("empty", true, vec!["FT.SEARCH", "idx", "@t:{zzz}"]),
-            ("return", true, vec!["FT.SEARCH", "idx", "@t:{a}", "RETURN", "1", "n"]),
+            (
+                "return",
+                true,
+                vec!["FT.SEARCH", "idx", "@t:{a}", "RETURN", "1", "n"],
+            ),
             (
                 "sortby",
                 true,
@@ -984,11 +998,24 @@ fn redis_shape_names_are_simple_strings() {
                 "groupby",
                 false,
                 vec![
-                    "FT.AGGREGATE", "idx", "*", "GROUPBY", "1", "@t", "REDUCE", "COUNT", "0",
-                    "AS", "c",
+                    "FT.AGGREGATE",
+                    "idx",
+                    "*",
+                    "GROUPBY",
+                    "1",
+                    "@t",
+                    "REDUCE",
+                    "COUNT",
+                    "0",
+                    "AS",
+                    "c",
                 ],
             ),
-            ("aggregate empty", false, vec!["FT.AGGREGATE", "idx", "@t:{zzz}"]),
+            (
+                "aggregate empty",
+                false,
+                vec!["FT.AGGREGATE", "idx", "@t:{zzz}"],
+            ),
         ] {
             let reply = c.cmd(&args);
             assert_redis_types(name, &reply, ids);
@@ -996,17 +1023,33 @@ fn redis_shape_names_are_simple_strings() {
         // WITHSCORES, WITHPAYLOADS and WITHSORTKEYS add a name each, in the
         // order Redis lists them: id, score, payload, sortkey.
         let reply = c.cmd(&[
-            "FT.SEARCH", "idx", "@n:[1 3]", "WITHSCORES", "WITHPAYLOADS", "WITHSORTKEYS",
-            "SORTBY", "n", "NOCONTENT",
+            "FT.SEARCH",
+            "idx",
+            "@n:[1 3]",
+            "WITHSCORES",
+            "WITHPAYLOADS",
+            "WITHSORTKEYS",
+            "SORTBY",
+            "n",
+            "NOCONTENT",
         ]);
         let text = show(&reply);
         assert!(
-            text.contains("+id|$3|d:1|+score|,") && text.contains("|+payload|_||+sortkey|$2|#1|+values|*0|"),
+            text.contains("+id|$3|d:1|+score|,")
+                && text.contains("|+payload|_|+sortkey|$2|#1|+values|*0|"),
             "{mode}: {text}"
         );
         // A cursor's first reply and its reads.
         let first = c.cmd(&[
-            "FT.AGGREGATE", "idx", "*", "LOAD", "1", "@n", "WITHCURSOR", "COUNT", "1",
+            "FT.AGGREGATE",
+            "idx",
+            "*",
+            "LOAD",
+            "1",
+            "@n",
+            "WITHCURSOR",
+            "COUNT",
+            "1",
         ]);
         let Node::Array(parts) = parse(&first) else {
             panic!("{}", show(&first))
@@ -1030,18 +1073,34 @@ fn redis_shape_names_are_simple_strings() {
         assert_redis_types("cursor read", &body[..at], false);
         // The other replies whose names are fixed.
         let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
-        assert!(show(&config).starts_with("%1|+TIMEOUT|$"), "{}", show(&config));
+        assert!(
+            show(&config).starts_with("%1|+TIMEOUT|$"),
+            "{}",
+            show(&config)
+        );
         let blob = vector(0.0, 0.0);
         let hybrid = c.raw(&[
-            b"FT.HYBRID", b"idx", b"SEARCH", b"@t:{a}", b"VSIM", b"@v", b"$B", b"PARAMS", b"2",
-            b"B", &blob,
+            b"FT.HYBRID",
+            b"idx",
+            b"SEARCH",
+            b"@t:{a}",
+            b"VSIM",
+            b"@v",
+            b"$B",
+            b"PARAMS",
+            b"2",
+            b"B",
+            &blob,
         ]);
         let text = show(&hybrid);
         assert!(
             text.starts_with("%4|+total_results|:2|+results|*2|%2|$5|__key|"),
             "{mode}: {text}"
         );
-        assert!(text.contains("|+warnings|*0|+execution_time|,"), "{mode}: {text}");
+        assert!(
+            text.contains("|+warnings|*0|+execution_time|,"),
+            "{mode}: {text}"
+        );
     }
 
     // A script that asks for RESP3 reads the same reply: the names are the
@@ -1062,7 +1121,18 @@ fn redis_shape_names_are_simple_strings() {
     let mut c = prepared(&server, "3");
     let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
     assert_eq!(show(&reply), "*2|:1|$3|d:3|");
-    let reply = c.cmd(&["FT.AGGREGATE", "idx", "@n:[1 3]", "LOAD", "1", "@n", "SORTBY", "2", "@n", "ASC"]);
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        "@n:[1 3]",
+        "LOAD",
+        "1",
+        "@n",
+        "SORTBY",
+        "2",
+        "@n",
+        "ASC",
+    ]);
     assert!(
         show(&reply).starts_with("*4|:3|*2|+n|$1|1|*2|+n|$1|2|"),
         "{}",
