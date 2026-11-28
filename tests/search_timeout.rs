@@ -37,6 +37,7 @@ fn free_port() -> u16 {
 #[derive(Debug)]
 enum V {
     Str(String),
+    Simple(String),
     Err(String),
     Int(i64),
     Arr(Vec<V>),
@@ -47,12 +48,12 @@ enum V {
 impl V {
     fn s(&self) -> &str {
         match self {
-            V::Str(s) | V::Err(s) => s,
+            V::Str(s) | V::Simple(s) | V::Err(s) => s,
             other => panic!("not a string: {other:?}"),
         }
     }
     fn is_ok(&self) -> bool {
-        matches!(self, V::Str(s) if s == "OK")
+        matches!(self, V::Simple(s) if s == "OK")
     }
     fn is_err(&self) -> bool {
         matches!(self, V::Err(_))
@@ -61,7 +62,7 @@ impl V {
         match self {
             V::Map(pairs) => pairs
                 .iter()
-                .find(|(k, _)| matches!(k, V::Str(k) if k == name))
+                .find(|(k, _)| matches!(k, V::Simple(k) | V::Str(k) if k == name))
                 .map(|(_, v)| v)
                 .unwrap_or_else(|| panic!("no {name} in {self:?}")),
             other => panic!("not a map: {other:?}"),
@@ -72,6 +73,13 @@ impl V {
             V::Arr(items) => items
                 .iter()
                 .any(|w| w.s().contains("Timeout limit was reached")),
+            other => panic!("not an array: {other:?}"),
+        }
+    }
+    /// Every item of `warning` is a simple string, as Redis writes it.
+    fn warning_is_simple(&self) -> bool {
+        match self.get("warning") {
+            V::Arr(items) => !items.is_empty() && items.iter().all(|w| matches!(w, V::Simple(_))),
             other => panic!("not an array: {other:?}"),
         }
     }
@@ -118,7 +126,7 @@ impl Conn {
         let line = line.trim_end_matches(['\r', '\n']);
         let (kind, rest) = line.split_at(1);
         match kind {
-            "+" => V::Str(rest.to_string()),
+            "+" => V::Simple(rest.to_string()),
             "-" => V::Err(rest.to_string()),
             ":" => V::Int(rest.parse().unwrap()),
             "_" => V::Nil,
@@ -224,6 +232,7 @@ fn search_timeout_is_the_limit_of_a_query_that_names_none() {
     n *= 5;
     let reply = search(&mut c);
     assert!(reply.warned(), "{reply:?}");
+    assert!(reply.warning_is_simple(), "{reply:?}");
     // The query's own TIMEOUT wins.
     let reply = c.cmd(&[
         "FT.SEARCH",
@@ -249,6 +258,7 @@ fn search_timeout_is_the_limit_of_a_query_that_names_none() {
         "0",
     ]);
     assert!(reply.warned(), "{reply:?}");
+    assert!(reply.warning_is_simple(), "{reply:?}");
 
     // `search-on-timeout fail`: an error.
     assert!(

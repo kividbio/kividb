@@ -779,7 +779,7 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
                     .into_iter()
                     .map(|(k, v)| {
                         let timed =
-                            matches!(&k, Node::Bulk(b) | Node::Simple(b) if b.ends_with(b" time"));
+                            matches!(&k, Node::Simple(b) if b.ends_with(b" time"));
                         (
                             k,
                             if timed {
@@ -814,6 +814,33 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
     let want = profiles(&mut c);
     for reply in &want {
         assert!(is_map(reply), "{}", show(reply));
+    }
+    // The keys of the profile are simple strings, as Redis writes them.
+    for reply in &want {
+        let Node::Map(top) = parse(reply) else {
+            panic!("{}", show(reply))
+        };
+        let keys: Vec<&Node> = top.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            [&Node::Simple(b"Results".to_vec()), &Node::Simple(b"Profile".to_vec())]
+        );
+        let Node::Map(profile) = &top[1].1 else {
+            panic!("{}", show(reply))
+        };
+        assert_eq!(profile.len(), 2, "{}", show(reply));
+        assert_eq!(profile[0].0, Node::Simple(b"Shards".to_vec()));
+        assert_eq!(profile[1].0, Node::Simple(b"Coordinator".to_vec()));
+        let Node::Array(shards) = &profile[0].1 else {
+            panic!("{}", show(reply))
+        };
+        let Node::Map(shard) = &shards[0] else {
+            panic!("{}", show(reply))
+        };
+        for (key, _) in shard {
+            assert!(matches!(key, Node::Simple(_)), "{key:?}");
+        }
+        assert!(shard.len() >= 6, "{}", show(reply));
     }
     // The search inside is a map too.
     assert!(
@@ -1108,6 +1135,22 @@ fn redis_shape_names_are_simple_strings() {
     // string.
     let server = Server::start(&["--search-resp3-reply", "valkey"]);
     let mut c = prepared(&server, "3");
+    // FT.CONFIG GET keeps its names as bulk strings there, FT.HYBRID is the
+    // count and flat rows, FT.PROFILE the array of the search's reply and a
+    // flat list of simple-string names.
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(show(&config).starts_with("%1|$7|TIMEOUT|$"), "{}", show(&config));
+    let blob = vector(0.0, 0.0);
+    let hybrid = c.raw(&[
+        b"FT.HYBRID", b"idx", b"SEARCH", b"@t:{a}", b"VSIM", b"@v", b"$B", b"PARAMS", b"2",
+        b"B", &blob,
+    ]);
+    assert!(is_array(&hybrid), "{}", show(&hybrid));
+    assert!(!show(&hybrid).contains("total_results"), "{}", show(&hybrid));
+    let profile = c.cmd(&["FT.PROFILE", "idx", "SEARCH", "QUERY", "*"]);
+    assert!(show(&profile).starts_with("*2|*"), "{}", show(&profile));
+    assert!(show(&profile).contains("|+parse.time|$"), "{}", show(&profile));
+    assert!(!show(&profile).contains("+Results"), "{}", show(&profile));
     let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
     assert_eq!(show(&reply), "*2|:1|$3|d:3|");
     let reply = c.cmd(&[
@@ -1128,7 +1171,14 @@ fn redis_shape_names_are_simple_strings() {
         show(&reply)
     );
     let server = Server::start(&[]);
+    let mut c = prepared(&server, "3");
+    c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(show(&config).starts_with("%1|$7|TIMEOUT|$"), "{}", show(&config));
+    let server = Server::start(&[]);
     let mut c = prepared(&server, "2");
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(show(&config).starts_with("*1|*2|$7|TIMEOUT|$"), "{}", show(&config));
     let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
     assert_eq!(show(&reply), "*2|:1|$3|d:3|");
     let reply = c.cmd(&["FT.AGGREGATE", "idx", "@n:[3 3]", "LOAD", "1", "@n"]);
@@ -1342,7 +1392,7 @@ fn scripts_keep_their_own_protocol() {
     other.ok(&["CONFIG", "SET", "search-resp3-reply", "valkey"]);
     let script3 = "redis.setresp(3); local r = redis.call('FT.SEARCH', 'idx', \
                    '*=>[KNN 3 @v $B AS dist]', 'RETURN', '1', 'dist', 'PARAMS', '2', 'B', \
-                   ARGV[1], 'DIALECT', '2'); \r
+                   ARGV[1], 'DIALECT', '2'); \
                    for k, v in pairs(r.map) do if k.ok == 'total_results' then return v end end";
     let total = c.raw(&[b"EVAL", script3.as_bytes(), b"0", &blob]);
     assert_eq!(total, b":3\r\n", "{}", show(&total));

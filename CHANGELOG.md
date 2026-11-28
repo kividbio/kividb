@@ -294,6 +294,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `total_results`, `warning`), the value `STRING` and a warning's text are simple strings, as
   Redis writes them, and so are the names in the replies of `FT.HYBRID` and `FT.PROFILE` and of
   `FT.CONFIG GET`; field names and values, which come from the data, are bulk strings.
+  Under `redis.setresp(3)` a script reads each of these names as a status reply (a table with
+  `ok`), as from Redis.
 
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in

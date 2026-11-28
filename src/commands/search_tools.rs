@@ -539,11 +539,22 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .filter(|(name, _)| crate::commands::helpers::glob_match(&pattern, name))
                 .collect();
             if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
+                // The Valkey shape keeps the names as bulk strings.
+                let valkey = crate::commands::search::valkey_shape(ctx);
                 return Some(resp_map_for(
                     3,
                     found
                         .iter()
-                        .flat_map(|(name, value)| [resp_simple(name), resp_bulk_str(value)])
+                        .flat_map(|(name, value)| {
+                            [
+                                if valkey {
+                                    resp_bulk_str(name)
+                                } else {
+                                    resp_simple(name)
+                                },
+                                resp_bulk_str(value),
+                            ]
+                        })
                         .collect(),
                 ));
             }
