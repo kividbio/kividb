@@ -944,16 +944,17 @@ fn run(ctx: &mut Ctx, started: Instant) -> Result<Vec<u8>, String> {
     } else {
         resp_bulk_str(&format!("{millis:.6}"))
     };
+    let name = |n: &str| crate::commands::search::map_name(resp, n);
     Ok(resp_map_for(
         resp,
         vec![
-            resp_bulk_str("total_results"),
+            name("total_results"),
             resp_integer(total as i64),
-            resp_bulk_str("results"),
+            name("results"),
             resp_array(results),
-            resp_bulk_str("warnings"),
+            name("warnings"),
             resp_array(warnings),
-            resp_bulk_str("execution_time"),
+            name("execution_time"),
             execution_time,
         ],
     ))

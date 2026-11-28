@@ -289,6 +289,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   command line, and with `CONFIG SET`, which acts on
   connections already open; it belongs to the node, so in a cluster set every node alike. RESP2
   replies, a script's, and what the masters of a cluster tell one another are the same in each.
+  In the Redis shape the fixed names of the `FT.SEARCH` and `FT.AGGREGATE` replies (`attributes`,
+  `format`, `results`, `id`, `score`, `payload`, `sortkey`, `extra_attributes`, `values`,
+  `total_results`, `warning`), the value `STRING` and a warning's text are simple strings, as
+  Redis writes them, and so are the names in the replies of `FT.HYBRID` and `FT.PROFILE` and of
+  `FT.CONFIG GET`; field names and values, which come from the data, are bulk strings.
+  Under `redis.setresp(3)` a script reads each of these names as a status reply (a table with
+  `ok`), as from Redis.
 
 - **`FT.SEARCH … INFIELDS n field …` (part of #1004).** The query's text
   clauses look only in the fields named (by the name `AS` gave them), as in

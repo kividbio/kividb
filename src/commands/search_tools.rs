@@ -56,7 +56,7 @@ pub(crate) fn rows_reply(
             .collect()
     };
     let warning = if timed_out {
-        vec![resp_bulk_str("Timeout limit was reached")]
+        vec![resp_simple("Timeout limit was reached")]
     } else {
         vec![]
     };
@@ -64,29 +64,29 @@ pub(crate) fn rows_reply(
         return resp_map_for(
             3,
             vec![
-                resp_bulk_str("attributes"),
+                resp_simple("attributes"),
                 resp_array(vec![]),
-                resp_bulk_str("format"),
-                resp_bulk_str("STRING"),
-                resp_bulk_str("results"),
+                resp_simple("format"),
+                resp_simple("STRING"),
+                resp_simple("results"),
                 resp_array(
                     rows.iter()
                         .map(|row| {
                             resp_map_for(
                                 3,
                                 vec![
-                                    resp_bulk_str("extra_attributes"),
+                                    resp_simple("extra_attributes"),
                                     resp_map_for(3, fields(row)),
-                                    resp_bulk_str("values"),
+                                    resp_simple("values"),
                                     resp_array(vec![]),
                                 ],
                             )
                         })
                         .collect(),
                 ),
-                resp_bulk_str("total_results"),
+                resp_simple("total_results"),
                 resp_integer(total as i64),
-                resp_bulk_str("warning"),
+                resp_simple("warning"),
                 resp_array(warning),
             ],
         );
@@ -539,11 +539,22 @@ pub(crate) fn ft_config(ctx: &mut Ctx) -> Option<Vec<u8>> {
                 .filter(|(name, _)| crate::commands::helpers::glob_match(&pattern, name))
                 .collect();
             if crate::commands::handler::effective_resp_for_reply(ctx) == 3 {
+                // The Valkey shape keeps the names as bulk strings.
+                let valkey = crate::commands::search::valkey_shape(ctx);
                 return Some(resp_map_for(
                     3,
                     found
                         .iter()
-                        .flat_map(|(name, value)| [resp_bulk_str(name), resp_bulk_str(value)])
+                        .flat_map(|(name, value)| {
+                            [
+                                if valkey {
+                                    resp_bulk_str(name)
+                                } else {
+                                    resp_simple(name)
+                                },
+                                resp_bulk_str(value),
+                            ]
+                        })
                         .collect(),
                 ));
             }
@@ -1098,31 +1109,33 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
         None => resp_array(vec![]),
     };
 
+    let effective_resp = crate::commands::handler::effective_resp_for_reply(ctx);
+    let name = |n: &str| crate::commands::search::map_name(effective_resp, n);
     let shard = resp_map_for(
         crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
-            resp_bulk_str("Total profile time"),
+            name("Total profile time"),
             millis(total + parsing),
-            resp_bulk_str("Parsing time"),
+            name("Parsing time"),
             millis(parsing),
-            resp_bulk_str("Pipeline creation time"),
+            name("Pipeline creation time"),
             resp_bulk_str("0"),
-            resp_bulk_str("Total GIL time"),
+            name("Total GIL time"),
             millis(total),
-            resp_bulk_str("Warning"),
+            name("Warning"),
             resp_bulk_str("None"),
-            resp_bulk_str("Iterators profile"),
+            name("Iterators profile"),
             iterators,
-            resp_bulk_str("Result processors profile"),
+            name("Result processors profile"),
             resp_array(processors),
         ],
     );
     let profile = resp_map_for(
         crate::commands::handler::effective_resp_for_reply(ctx),
         vec![
-            resp_bulk_str("Shards"),
+            name("Shards"),
             resp_array(vec![shard]),
-            resp_bulk_str("Coordinator"),
+            name("Coordinator"),
             resp_array(vec![]),
         ],
     );
@@ -1131,9 +1144,9 @@ pub(crate) fn ft_profile(ctx: &mut Ctx) -> Option<Vec<u8>> {
             resp_map_for(
                 3,
                 vec![
-                    resp_bulk_str("Results"),
+                    resp_simple("Results"),
                     reply,
-                    resp_bulk_str("Profile"),
+                    resp_simple("Profile"),
                     profile,
                 ],
             )

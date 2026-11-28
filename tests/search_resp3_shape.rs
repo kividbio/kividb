@@ -778,7 +778,7 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
                 pairs
                     .into_iter()
                     .map(|(k, v)| {
-                        let timed = matches!(&k, Node::Bulk(b) if b.ends_with(b" time"));
+                        let timed = matches!(&k, Node::Simple(b) if b.ends_with(b" time"));
                         (
                             k,
                             if timed {
@@ -814,9 +814,39 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
     for reply in &want {
         assert!(is_map(reply), "{}", show(reply));
     }
+    // The keys of the profile are simple strings, as Redis writes them.
+    for reply in &want {
+        let Node::Map(top) = parse(reply) else {
+            panic!("{}", show(reply))
+        };
+        let keys: Vec<&Node> = top.iter().map(|(k, _)| k).collect();
+        assert_eq!(
+            keys,
+            [
+                &Node::Simple(b"Results".to_vec()),
+                &Node::Simple(b"Profile".to_vec())
+            ]
+        );
+        let Node::Map(profile) = &top[1].1 else {
+            panic!("{}", show(reply))
+        };
+        assert_eq!(profile.len(), 2, "{}", show(reply));
+        assert_eq!(profile[0].0, Node::Simple(b"Shards".to_vec()));
+        assert_eq!(profile[1].0, Node::Simple(b"Coordinator".to_vec()));
+        let Node::Array(shards) = &profile[0].1 else {
+            panic!("{}", show(reply))
+        };
+        let Node::Map(shard) = &shards[0] else {
+            panic!("{}", show(reply))
+        };
+        for (key, _) in shard {
+            assert!(matches!(key, Node::Simple(_)), "{key:?}");
+        }
+        assert!(shard.len() >= 6, "{}", show(reply));
+    }
     // The search inside is a map too.
     assert!(
-        show(&want[0]).contains("$7|results|*3|%"),
+        show(&want[0]).contains("+results|*3|%"),
         "{}",
         show(&want[0])
     );
@@ -907,6 +937,283 @@ fn redis_shape_is_what_it_was() {
         assert!(is_map(&info), "{mode}: {}", show(&info));
         assert!(show(&info).contains("$10|index_name|$3|idx|"), "{mode}");
     }
+}
+
+/// The element types of the Redis shape, read from the raw bytes: the fixed
+/// names of a search or aggregate reply (`attributes`, `format`, `results`,
+/// `id`, `extra_attributes`, `values`, `total_results`, `warning`) and the
+/// value `STRING` are simple strings, as Redis writes them; what comes from
+/// the data (a document's key, its field names and values) is bulk strings.
+fn assert_redis_types(name: &str, reply: &[u8], ids: bool) {
+    let Node::Map(top) = parse(reply) else {
+        panic!("{name}: not a map: {}", show(reply))
+    };
+    let simple = |n: &Node, want: &str| {
+        assert_eq!(n, &Node::Simple(want.into()), "{name}: {}", show(reply));
+    };
+    let names = [
+        "attributes",
+        "format",
+        "results",
+        "total_results",
+        "warning",
+    ];
+    assert_eq!(top.len(), names.len(), "{name}: {}", show(reply));
+    for ((key, _), want) in top.iter().zip(names) {
+        simple(key, want);
+    }
+    simple(&top[1].1, "STRING");
+    assert!(matches!(top[3].1, Node::Int(_)), "{name}");
+    let Node::Array(rows) = &top[2].1 else {
+        panic!("{name}")
+    };
+    for row in rows {
+        let Node::Map(pairs) = row else {
+            panic!("{name}: {row:?}")
+        };
+        for (key, value) in pairs {
+            let Node::Simple(k) = key else {
+                panic!("{name}: {key:?}")
+            };
+            match k.as_slice() {
+                b"id" => assert!(ids && matches!(value, Node::Bulk(_)), "{name}: {value:?}"),
+                b"values" => assert_eq!(value, &Node::Array(vec![]), "{name}"),
+                b"extra_attributes" => {
+                    let Node::Map(fields) = value else {
+                        panic!("{name}: {value:?}")
+                    };
+                    for (field, v) in fields {
+                        assert!(matches!(field, Node::Bulk(_)), "{name}: {field:?}");
+                        assert!(matches!(v, Node::Bulk(_)), "{name}: {v:?}");
+                    }
+                }
+                other => panic!("{name}: {}", String::from_utf8_lossy(other)),
+            }
+        }
+    }
+}
+
+/// `redis` and `auto` for a client that is not GLIDE: the names of an
+/// `FT.SEARCH` and an `FT.AGGREGATE` reply (and of a cursor's) are simple
+/// strings; the valkey shape is the arrays of valkey-search, as before.
+#[test]
+fn redis_shape_names_are_simple_strings() {
+    for mode in ["redis", "auto"] {
+        let server = Server::start(&["--search-resp3-reply", mode]);
+        let mut c = prepared(&server, "3");
+        for (name, ids, args) in [
+            ("search", true, vec!["FT.SEARCH", "idx", "*"]),
+            (
+                "nocontent",
+                true,
+                vec!["FT.SEARCH", "idx", "*", "NOCONTENT"],
+            ),
+            ("empty", true, vec!["FT.SEARCH", "idx", "@t:{zzz}"]),
+            (
+                "return",
+                true,
+                vec!["FT.SEARCH", "idx", "@t:{a}", "RETURN", "1", "n"],
+            ),
+            (
+                "sortby",
+                true,
+                vec!["FT.SEARCH", "idx", "@n:[1 3]", "SORTBY", "n", "DESC"],
+            ),
+            (
+                "aggregate",
+                false,
+                vec!["FT.AGGREGATE", "idx", "*", "LOAD", "1", "@n"],
+            ),
+            (
+                "groupby",
+                false,
+                vec![
+                    "FT.AGGREGATE",
+                    "idx",
+                    "*",
+                    "GROUPBY",
+                    "1",
+                    "@t",
+                    "REDUCE",
+                    "COUNT",
+                    "0",
+                    "AS",
+                    "c",
+                ],
+            ),
+            (
+                "aggregate empty",
+                false,
+                vec!["FT.AGGREGATE", "idx", "@t:{zzz}"],
+            ),
+        ] {
+            let reply = c.cmd(&args);
+            assert_redis_types(name, &reply, ids);
+        }
+        // WITHSCORES, WITHPAYLOADS and WITHSORTKEYS add a name each, in the
+        // order Redis lists them: id, score, payload, sortkey.
+        let reply = c.cmd(&[
+            "FT.SEARCH",
+            "idx",
+            "@n:[1 3]",
+            "WITHSCORES",
+            "WITHPAYLOADS",
+            "WITHSORTKEYS",
+            "SORTBY",
+            "n",
+            "NOCONTENT",
+        ]);
+        let text = show(&reply);
+        assert!(
+            text.contains("+id|$3|d:1|+score|,")
+                && text.contains("|+payload|_|+sortkey|$2|#1|+values|*0|"),
+            "{mode}: {text}"
+        );
+        // A cursor's first reply and its reads.
+        let first = c.cmd(&[
+            "FT.AGGREGATE",
+            "idx",
+            "*",
+            "LOAD",
+            "1",
+            "@n",
+            "WITHCURSOR",
+            "COUNT",
+            "1",
+        ]);
+        let Node::Array(parts) = parse(&first) else {
+            panic!("{}", show(&first))
+        };
+        assert_eq!(parts.len(), 2, "{}", show(&first));
+        let mut at = 0;
+        let body = &first[first.windows(2).position(|w| w == b"\r\n").unwrap() + 2..];
+        let _ = parse_at(body, &mut at);
+        assert_redis_types("cursor", &body[..at], false);
+        let Node::Int(id) = parts[1] else {
+            panic!("{}", show(&first))
+        };
+        let read = c.cmd(&["FT.CURSOR", "READ", "idx", &id.to_string()]);
+        let Node::Array(parts) = parse(&read) else {
+            panic!("{}", show(&read))
+        };
+        assert_eq!(parts.len(), 2, "{}", show(&read));
+        let body = &read[read.windows(2).position(|w| w == b"\r\n").unwrap() + 2..];
+        let mut at = 0;
+        let _ = parse_at(body, &mut at);
+        assert_redis_types("cursor read", &body[..at], false);
+        // The other replies whose names are fixed.
+        let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+        assert!(
+            show(&config).starts_with("%1|+TIMEOUT|$"),
+            "{}",
+            show(&config)
+        );
+        let blob = vector(0.0, 0.0);
+        let hybrid = c.raw(&[
+            b"FT.HYBRID",
+            b"idx",
+            b"SEARCH",
+            b"@t:{a}",
+            b"VSIM",
+            b"@v",
+            b"$B",
+            b"PARAMS",
+            b"2",
+            b"B",
+            &blob,
+        ]);
+        let text = show(&hybrid);
+        assert!(
+            text.starts_with("%4|+total_results|:3|+results|*3|%2|$5|__key|"),
+            "{mode}: {text}"
+        );
+        assert!(
+            text.contains("|+warnings|*0|+execution_time|,"),
+            "{mode}: {text}"
+        );
+    }
+
+    // Valkey's shape is the RESP2 layout, and over RESP2 every name is a bulk
+    // string.
+    let server = Server::start(&["--search-resp3-reply", "valkey"]);
+    let mut c = prepared(&server, "3");
+    // FT.CONFIG GET keeps its names as bulk strings there, FT.HYBRID is the
+    // count and flat rows, FT.PROFILE the array of the search's reply and a
+    // flat list of simple-string names.
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(
+        show(&config).starts_with("%1|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
+    let blob = vector(0.0, 0.0);
+    let hybrid = c.raw(&[
+        b"FT.HYBRID",
+        b"idx",
+        b"SEARCH",
+        b"@t:{a}",
+        b"VSIM",
+        b"@v",
+        b"$B",
+        b"PARAMS",
+        b"2",
+        b"B",
+        &blob,
+    ]);
+    assert!(is_array(&hybrid), "{}", show(&hybrid));
+    assert!(
+        !show(&hybrid).contains("total_results"),
+        "{}",
+        show(&hybrid)
+    );
+    let profile = c.cmd(&["FT.PROFILE", "idx", "SEARCH", "QUERY", "*"]);
+    assert!(show(&profile).starts_with("*2|*"), "{}", show(&profile));
+    assert!(
+        show(&profile).contains("|+parse.time|$"),
+        "{}",
+        show(&profile)
+    );
+    assert!(!show(&profile).contains("+Results"), "{}", show(&profile));
+    let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
+    assert_eq!(show(&reply), "*2|:1|$3|d:3|");
+    let reply = c.cmd(&[
+        "FT.AGGREGATE",
+        "idx",
+        "@n:[1 3]",
+        "LOAD",
+        "1",
+        "@n",
+        "SORTBY",
+        "2",
+        "@n",
+        "ASC",
+    ]);
+    assert!(
+        show(&reply).starts_with("*4|:3|*2|+n|$1|1|*2|+n|$1|2|"),
+        "{}",
+        show(&reply)
+    );
+    let server = Server::start(&[]);
+    let mut c = prepared(&server, "3");
+    c.ok(&["CLIENT", "SETINFO", "LIB-NAME", "GlidePy"]);
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(
+        show(&config).starts_with("%1|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
+    let server = Server::start(&[]);
+    let mut c = prepared(&server, "2");
+    let config = c.cmd(&["FT.CONFIG", "GET", "TIMEOUT"]);
+    assert!(
+        show(&config).starts_with("*1|*2|$7|TIMEOUT|$"),
+        "{}",
+        show(&config)
+    );
+    let reply = c.cmd(&["FT.SEARCH", "idx", "@t:{b}", "NOCONTENT"]);
+    assert_eq!(show(&reply), "*2|:1|$3|d:3|");
+    let reply = c.cmd(&["FT.AGGREGATE", "idx", "@n:[3 3]", "LOAD", "1", "@n"]);
+    assert_eq!(show(&reply), "*2|:1|*2|$1|n|$1|3|");
 }
 
 /// Over RESP2 every mode answers alike.
@@ -1097,7 +1404,8 @@ fn transactions_use_the_connections_shape() {
 }
 
 /// A script reads `FT.SEARCH` as RESP2, whatever the setting says; one that
-/// asks for RESP3 gets the map.
+/// asks for RESP3 gets the map, whose names are simple strings (tables to the
+/// script, as in Redis).
 #[cfg(feature = "lua")]
 #[test]
 fn scripts_keep_their_own_protocol() {
@@ -1115,7 +1423,8 @@ fn scripts_keep_their_own_protocol() {
     other.ok(&["CONFIG", "SET", "search-resp3-reply", "valkey"]);
     let script3 = "redis.setresp(3); local r = redis.call('FT.SEARCH', 'idx', \
                    '*=>[KNN 3 @v $B AS dist]', 'RETURN', '1', 'dist', 'PARAMS', '2', 'B', \
-                   ARGV[1], 'DIALECT', '2'); return r.map['total_results']";
+                   ARGV[1], 'DIALECT', '2'); \
+                   for k, v in pairs(r.map) do if k.ok == 'total_results' then return v end end";
     let total = c.raw(&[b"EVAL", script3.as_bytes(), b"0", &blob]);
     assert_eq!(total, b":3\r\n", "{}", show(&total));
 }

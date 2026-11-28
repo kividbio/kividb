@@ -338,6 +338,12 @@ the replies of `FT.SEARCH`, `FT.AGGREGATE` (and its cursor), `FT.HYBRID`, `FT.IN
 | `redis` | Redis 8's for every connection |
 | `valkey` | valkey-search's for every connection |
 
+In Redis 8's reply the names that are fixed (`attributes`, `format`, `results`, `id`, `score`,
+`payload`, `sortkey`, `extra_attributes`, `values`, `total_results`, `warning`, and the value
+`STRING` of `FT.SEARCH` and `FT.AGGREGATE`; the names of `FT.HYBRID`, `FT.PROFILE` and
+`FT.CONFIG GET`) are simple strings, as Redis writes them. A document's key, its field names and
+values, and the values of a `GROUPBY` row are bulk strings.
+
 valkey-search answers a RESP3 connection with the arrays it answers RESP2 with, and
 valkey-glide converts that reply itself: it reads `[total, key, [field, value, ...], ...]` and
 refuses a map. In the valkey shape, then, `FT.SEARCH`, `FT.AGGREGATE`, `FT.CURSOR READ`,
