@@ -1,0 +1,8 @@
+[
+  {
+    "client": "valkey-glide",
+    "protocol": 3,
+    "cases": ["ft.search", "ft.search nocontent", "ft.search no results", "ft.aggregate"],
+    "why": "valkey-glide 2.6 cannot read Redis 8's RESP3 search replies (a map); KiviDB sends glide the shape it reads (search-resp3-reply auto)"
+  }
+]

@@ -1,0 +1,4 @@
+# The Python runners of scripts/client_smoke. requirements.txt is made from this file:
+#   pip-compile --generate-hashes --strip-extras requirements.in
+redis==8.2.0
+valkey-glide==2.6.0

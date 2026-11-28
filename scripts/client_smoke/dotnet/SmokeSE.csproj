@@ -1,0 +1,14 @@
+<!-- The StackExchange.Redis runner of scripts/client_smoke (run.py's contract). -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- packages.lock.json: every package and its hash; run.py restores in locked mode. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="StackExchange.Redis" Version="[3.4.35]" />
+  </ItemGroup>
+</Project>

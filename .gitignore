@@ -12,6 +12,7 @@
 !scripts/sentinel/requirements.txt
 !benchmarks/redis-exporter-compat/expected-metrics.txt
 !benchmarks/redis-exporter-compat/known-gaps.txt
+!scripts/client_smoke/requirements.txt
 ./*.py
 *.kdb
 # Test fixtures are committed.
