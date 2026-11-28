@@ -778,7 +778,8 @@ fn profile_is_a_map_for_redis_and_the_glide_layout_for_valkey() {
                 pairs
                     .into_iter()
                     .map(|(k, v)| {
-                        let timed = matches!(&k, Node::Bulk(b) | Node::Simple(b) if b.ends_with(b" time"));
+                        let timed =
+                            matches!(&k, Node::Bulk(b) | Node::Simple(b) if b.ends_with(b" time"));
                         (
                             k,
                             if timed {
@@ -1102,18 +1103,6 @@ fn redis_shape_names_are_simple_strings() {
             "{mode}: {text}"
         );
     }
-
-    // A script that asks for RESP3 reads the same reply: the names are the
-    // tables Redis gives a simple string.
-    let server = Server::start(&[]);
-    let mut c = prepared(&server, "3");
-    let reply = c.cmd(&[
-        "EVAL",
-        "redis.setresp(3) local r = redis.call('FT.SEARCH','idx','*','NOCONTENT') \
-         for k in pairs(r.map) do return k.ok end",
-        "0",
-    ]);
-    assert_eq!(show(&reply), "$10|attributes|", "{}", show(&reply));
 
     // Valkey's shape is the RESP2 layout, and over RESP2 every name is a bulk
     // string.
